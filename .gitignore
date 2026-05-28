@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+*.pkl.meta
+*.png
+*.csv
+logs/
+data/cache/
+.env
+*.log

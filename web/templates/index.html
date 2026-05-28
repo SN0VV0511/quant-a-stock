@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>量化盯盘系统</title>
+    <style>
+        :root {
+            --bg: #0a0e14; --bg2: #111720; --bg3: #1a2030;
+            --border: #2a3040; --text: #e0e6ed; --text2: #7a8599;
+            --accent: #4a9eff; --green: #00d26a; --red: #ff4757; --yellow: #ffa502;
+            --buy: rgba(0,210,106,0.12); --sell: rgba(255,71,87,0.12);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: "SF Mono", "Fira Code", "PingFang SC", monospace; background: var(--bg); color: var(--text); min-height: 100vh; font-size: 13px; }
+
+        /* Header */
+        .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; }
+        .header h1 { font-size: 16px; color: var(--accent); letter-spacing: 1px; }
+        .header-right { display: flex; align-items: center; gap: 12px; }
+        .status-pill { display: flex; align-items: center; gap: 6px; background: var(--bg3); padding: 4px 12px; border-radius: 20px; font-size: 11px; color: var(--text2); }
+        .dot { width: 6px; height: 6px; border-radius: 50%; }
+        .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+        .dot.off { background: var(--red); }
+        .dot.idle { background: var(--yellow); }
+
+        /* Layout */
+        .main { display: grid; grid-template-columns: 320px 1fr 320px; grid-template-rows: auto 1fr; gap: 8px; padding: 8px; height: calc(100vh - 48px); }
+        @media (max-width: 1100px) { .main { grid-template-columns: 1fr; grid-template-rows: auto auto auto auto; height: auto; } }
+
+        /* Cards */
+        .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+        .card-head { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--text2); display: flex; justify-content: space-between; align-items: center; }
+        .card-body { padding: 10px 12px; }
+
+        /* Stats row */
+        .stats-row { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+        @media (max-width: 1100px) { .stats-row { grid-template-columns: repeat(3, 1fr); } }
+        .stat { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+        .stat .label { font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+        .stat .val { font-size: 20px; font-weight: 700; }
+        .stat .sub { font-size: 11px; color: var(--text2); margin-top: 2px; }
+        .c-g { color: var(--green); } .c-r { color: var(--red); } .c-n { color: var(--text); }
+
+        /* Tables */
+        table { width: 100%; border-collapse: collapse; }
+        th { padding: 6px 8px; text-align: left; font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+        td { padding: 7px 8px; font-size: 12px; border-top: 1px solid rgba(42,48,64,0.5); font-variant-numeric: tabular-nums; }
+        tr:hover td { background: rgba(74,158,255,0.04); }
+
+        /* Log panel */
+        .log-panel { grid-column: 2 / 3; display: flex; flex-direction: column; min-height: 0; }
+        .log-content { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 11px; line-height: 1.6; font-family: "SF Mono", "Fira Code", monospace; color: var(--text2); }
+        .log-content .log-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .log-content .log-time { color: #555e70; }
+        .log-content .log-info { color: var(--accent); }
+        .log-content .log-warn { color: var(--yellow); }
+        .log-content .log-error { color: var(--red); }
+        .log-content .log-buy { color: var(--green); font-weight: 600; }
+        .log-content .log-sell { color: var(--red); font-weight: 600; }
+        .log-content .log-thread { color: #9b7dff; }
+
+        /* Candidate list */
+        .cand-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid rgba(42,48,64,0.4); }
+        .cand-item:last-child { border-bottom: none; }
+        .cand-rank { font-weight: 700; color: var(--accent); min-width: 24px; text-align: center; font-size: 11px; }
+        .cand-info { flex: 1; margin-left: 8px; }
+        .cand-name { font-size: 12px; font-weight: 500; }
+        .cand-code { font-size: 10px; color: var(--text2); }
+        .cand-price { text-align: right; font-size: 12px; }
+        .cand-mom { font-size: 10px; }
+
+        /* Trade list */
+        .trade-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(42,48,64,0.3); font-size: 11px; }
+        .trade-item:last-child { border-bottom: none; }
+        .trade-badge { padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+        .badge-buy { background: var(--buy); color: var(--green); }
+        .badge-sell { background: var(--sell); color: var(--red); }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+        /* Pulse animation */
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .pulse { animation: pulse 2s ease-in-out infinite; }
+
+        /* Refresh indicator */
+        .refresh-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: 0; transition: opacity 0.2s; }
+        .refresh-dot.active { opacity: 1; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>⚡ 量化盯盘系统</h1>
+        <div class="header-right">
+            <div class="refresh-dot" id="refresh-dot"></div>
+            <div class="status-pill">
+                <span class="dot" id="dot-live"></span>
+                <span id="txt-live">检测中</span>
+            </div>
+            <div class="status-pill">
+                <span class="dot" id="dot-watch"></span>
+                <span>盯盘线</span>
+            </div>
+            <div class="status-pill">
+                <span class="dot" id="dot-scan"></span>
+                <span>扫描线</span>
+            </div>
+            <span id="clock" style="font-size:11px;color:var(--text2);">--:--:--</span>
+        </div>
+    </div>
+
+    <div class="main">
+        <!-- 核心指标 -->
+        <div class="stats-row">
+            <div class="stat">
+                <div class="label">总市值</div>
+                <div class="val" id="s-total">--</div>
+                <div class="sub" id="s-pnl">--</div>
+            </div>
+            <div class="stat">
+                <div class="label">可用现金</div>
+                <div class="val" id="s-cash">--</div>
+                <div class="sub" id="s-cash-ratio">--</div>
+            </div>
+            <div class="stat">
+                <div class="label">持仓仓位</div>
+                <div class="val" id="s-pos-ratio">--</div>
+                <div class="sub" id="s-pos-count">--</div>
+            </div>
+            <div class="stat">
+                <div class="label">今日交易</div>
+                <div class="val" id="s-trade-count">--</div>
+                <div class="sub" id="s-last-trade">--</div>
+            </div>
+            <div class="stat">
+                <div class="label">候选股</div>
+                <div class="val" id="s-cand-count">--</div>
+                <div class="sub" id="s-scan-time">--</div>
+            </div>
+        </div>
+
+        <!-- 左：候选股 -->
+        <div class="card">
+            <div class="card-head">
+                <span>🔍 候选股 Top20</span>
+                <span id="cand-time" style="font-size:10px;">--</span>
+            </div>
+            <div class="card-body" style="padding:4px 8px; overflow-y:auto; max-height:calc(100vh - 200px);" id="cand-list">
+                <div style="text-align:center;color:var(--text2);padding:20px;">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 中：实时日志 -->
+        <div class="card log-panel">
+            <div class="card-head">
+                <span>📋 实时日志</span>
+                <div style="display:flex;gap:6px;">
+                    <button onclick="logLines=100;loadLogs()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:10px;">100行</button>
+                    <button onclick="logLines=300;loadLogs()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:10px;">300行</button>
+                    <button onclick="logAutoScroll=!logAutoScroll;this.style.color=logAutoScroll?'var(--green)':'var(--text2)'" style="background:var(--bg3);border:1px solid var(--border);color:var(--green);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:10px;">自动滚动</button>
+                </div>
+            </div>
+            <div class="log-content" id="log-content">
+                <div style="text-align:center;padding:20px;">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 右：持仓 + 交易记录 -->
+        <div style="display:flex;flex-direction:column;gap:8px;min-height:0;">
+            <!-- 持仓 -->
+            <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
+                <div class="card-head">
+                    <span>💼 持仓</span>
+                    <span id="pos-count" style="font-size:10px;">--</span>
+                </div>
+                <div class="card-body" style="flex:1;overflow-y:auto;padding:4px 8px;" id="pos-list">
+                    <div style="text-align:center;color:var(--text2);padding:10px;">加载中...</div>
+                </div>
+            </div>
+            <!-- 交易记录 -->
+            <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
+                <div class="card-head">
+                    <span>🔄 操作记录</span>
+                    <span id="trade-count" style="font-size:10px;">--</span>
+                </div>
+                <div class="card-body" style="flex:1;overflow-y:auto;padding:4px 8px;" id="trade-list">
+                    <div style="text-align:center;color:var(--text2);padding:10px;">加载中...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    let logLines = 100;
+    let logAutoScroll = true;
+    let lastLogCount = 0;
+    let refreshTimer = null;
+
+    function fmt(n, d=2) { return n == null || isNaN(n) ? '--' : Number(n).toLocaleString('zh-CN', {minimumFractionDigits: d, maximumFractionDigits: d}); }
+    function fmtPct(n) { return n == null || isNaN(n) ? '--' : (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%'; }
+    function pnlC(n) { return n > 0 ? 'c-g' : n < 0 ? 'c-r' : 'c-n'; }
+    function flash() { const d = document.getElementById('refresh-dot'); d.classList.add('active'); setTimeout(() => d.classList.remove('active'), 300); }
+
+    // Clock
+    setInterval(() => { document.getElementById('clock').textContent = new Date().toLocaleTimeString('zh-CN'); }, 1000);
+
+    // Status
+    async function loadStatus() {
+        try {
+            const r = await fetch('/api/status');
+            const d = await r.json();
+            const setDot = (id, on) => { const el = document.getElementById(id); el.className = 'dot ' + (on ? 'on' : 'off'); };
+            setDot('dot-live', d.live_runner);
+            setDot('dot-watch', d.watch_thread);
+            setDot('dot-scan', d.scan_thread);
+            document.getElementById('txt-live').textContent = d.live_runner ? '运行中' : '已停止';
+        } catch (e) {}
+    }
+
+    // Portfolio
+    async function loadPortfolio() {
+        try {
+            const r = await fetch('/api/portfolio');
+            const d = await r.json();
+            document.getElementById('s-total').textContent = '¥' + fmt(d.total_value, 0);
+            document.getElementById('s-total').className = 'val ' + pnlC(d.pnl);
+            document.getElementById('s-pnl').textContent = fmtPct(d.pnl_pct) + ' (' + fmt(d.pnl, 0) + '元)';
+            document.getElementById('s-pnl').className = 'sub ' + pnlC(d.pnl);
+            document.getElementById('s-cash').textContent = '¥' + fmt(d.cash, 0);
+            document.getElementById('s-cash-ratio').textContent = '现金占比 ' + ((1 - d.position_ratio) * 100).toFixed(1) + '%';
+            document.getElementById('s-pos-ratio').textContent = (d.position_ratio * 100).toFixed(1) + '%';
+            document.getElementById('s-pos-count').textContent = d.position_count + ' 只持仓';
+            document.getElementById('pos-count').textContent = d.position_count + ' 只';
+
+            const el = document.getElementById('pos-list');
+            if (!d.positions || d.positions.length === 0) {
+                el.innerHTML = '<div style="text-align:center;color:var(--text2);padding:10px;">空仓</div>';
+            } else {
+                el.innerHTML = d.positions.map(p => `
+                    <div class="cand-item">
+                        <div class="cand-info">
+                            <div class="cand-name">${p.name || p.code}</div>
+                            <div class="cand-code">${p.shares}股 · 成本¥${fmt(p.avg_cost,3)}</div>
+                        </div>
+                        <div class="cand-price">
+                            <div>¥${fmt(p.current_price,3)}</div>
+                            <div class="cand-mom ${pnlC(p.profit_pct)}">${fmtPct(p.profit_pct)}</div>
+                        </div>
+                    </div>`).join('');
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    // Trades
+    async function loadTrades() {
+        try {
+            const r = await fetch('/api/trades');
+            const d = await r.json();
+            const trades = (d.trades || []).slice().reverse();
+            document.getElementById('trade-count').textContent = trades.length + ' 条';
+            document.getElementById('s-trade-count').textContent = trades.filter(t => t.date === new Date().toISOString().slice(0,10).replace(/-/g,'')).length;
+            if (trades.length > 0) {
+                const last = trades[0];
+                document.getElementById('s-last-trade').textContent = last.time + ' ' + (last.action === 'buy' ? '买入' : '卖出') + ' ' + last.code;
+            }
+
+            const el = document.getElementById('trade-list');
+            if (trades.length === 0) {
+                el.innerHTML = '<div style="text-align:center;color:var(--text2);padding:10px;">暂无交易</div>';
+            } else {
+                el.innerHTML = trades.slice(0, 30).map(t => `
+                    <div class="trade-item">
+                        <span style="color:var(--text2);font-size:10px;min-width:40px;">${t.time || ''}</span>
+                        <span class="trade-badge ${t.action === 'buy' ? 'badge-buy' : 'badge-sell'}">${t.action === 'buy' ? '买' : '卖'}</span>
+                        <span style="flex:1;">${t.code}</span>
+                        <span>${t.shares}股</span>
+                        <span style="min-width:60px;text-align:right;">¥${fmt(t.price, 3)}</span>
+                    </div>`).join('');
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    // Scan / Candidates
+    async function loadCandidates() {
+        try {
+            const r = await fetch('/api/candidates');
+            const d = await r.json();
+            const stocks = d.candidates || [];
+            document.getElementById('cand-time').textContent = d.updated_at || '';
+            document.getElementById('s-cand-count').textContent = stocks.length + ' 只';
+            document.getElementById('s-scan-time').textContent = d.updated_at ? '更新: ' + d.updated_at : '';
+
+            const el = document.getElementById('cand-list');
+            if (stocks.length === 0) {
+                el.innerHTML = '<div style="text-align:center;color:var(--text2);padding:20px;">等待扫描...</div>';
+                return;
+            }
+            el.innerHTML = stocks.map(s => `
+                <div class="cand-item">
+                    <span class="cand-rank">${s.rank}</span>
+                    <div class="cand-info">
+                        <div class="cand-name">${s.name}</div>
+                        <div class="cand-code">${s.code} · 得分 ${s.score.toFixed(4)}</div>
+                    </div>
+                    <div class="cand-price">
+                        <div>${s.current_price ? '¥' + fmt(s.current_price, 2) : '--'}</div>
+                        <div class="cand-mom ${pnlC(s.momentum)}">${fmtPct(s.momentum)}</div>
+                    </div>
+                </div>`).join('');
+        } catch (e) { console.error(e); }
+    }
+
+    // Logs
+    async function loadLogs() {
+        try {
+            const r = await fetch('/api/logs?lines=' + logLines + '&file=live_today');
+            const d = await r.json();
+            const el = document.getElementById('log-content');
+            const logs = d.logs || [];
+
+            if (logs.length === lastLogCount) return; // 没变化不更新DOM
+            lastLogCount = logs.length;
+
+            el.innerHTML = logs.map(line => {
+                let cls = '';
+                if (line.includes('买入') || line.includes('[买入]')) cls = 'log-buy';
+                else if (line.includes('卖出') || line.includes('[卖出]') || line.includes('止损')) cls = 'log-sell';
+                else if (line.includes('[ERROR]') || line.includes('失败')) cls = 'log-error';
+                else if (line.includes('[WARNING]') || line.includes('警告')) cls = 'log-warn';
+                else if (line.includes('[INFO]')) cls = 'log-info';
+                if (line.includes('盯盘线') || line.includes('扫描线')) cls = 'log-thread';
+                // 高亮时间戳
+                const safe = line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+                return `<div class="log-line ${cls}">${safe}</div>`;
+            }).join('');
+
+            if (logAutoScroll) {
+                el.scrollTop = el.scrollHeight;
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    // Main loop
+    function refresh() {
+        flash();
+        loadStatus();
+        loadPortfolio();
+        loadTrades();
+        loadCandidates();
+        loadLogs();
+    }
+
+    refresh();
+    // 5秒刷新一次
+    refreshTimer = setInterval(refresh, 5000);
+    </script>
+</body>
+</html>
