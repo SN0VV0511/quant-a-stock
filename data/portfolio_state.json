@@ -1,5 +1,16 @@
 {
   "cash": 10000.0,
   "positions": {},
-  "updated_at": "2026-05-27 15:01:01"
+  "updated_at": "2026-05-28 15:00:53",
+  "trades": [],
+  "daily_snapshots": {
+    "20260528": {
+      "cash": 10000.0,
+      "positions_value": 0.0,
+      "total_value": 10000.0,
+      "position_count": 0
+    }
+  },
+  "created_at": "20260528 18:12:08",
+  "peak_value": 10000.0
 }

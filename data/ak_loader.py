@@ -1,6 +1,6 @@
 """
 沪深 A 股股票数据加载器
-- 股票列表: BaoStock
+- 股票列表: BaoStock（不可用时回退到缓存文件）
 - 实时行情: 腾讯接口（2026 年实时数据）
 - 历史数据: BaoStock
 """
@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import socket
+import subprocess
 import threading
 import logging
 import urllib.request
@@ -36,6 +37,41 @@ logger = logging.getLogger(__name__)
 socket.setdefaulttimeout(30)
 
 
+_BS_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bs_worker.py")
+
+
+def _run_bs_with_subprocess(command, *args, timeout=30):
+    """用 subprocess 执行 BaoStock 查询，绕过 GIL 导致的 threading 超时失效。
+
+    Returns:
+        dict: 子进程返回的 JSON（含 error_code / rows），异常或超时返回 None。
+    """
+    cmd = [sys.executable, _BS_WORKER, command, *args]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        stdout, stderr = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            err_msg = stderr.decode("utf-8", errors="replace").strip()
+            logger.warning("bs_worker %s 失败 (rc=%s): %s", command, proc.returncode, err_msg)
+            return None
+        return json.loads(stdout.decode("utf-8"))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        logger.warning("bs_worker %s 超时 (%ds)，已 kill", command, timeout)
+        return None
+    except Exception as e:
+        logger.warning("bs_worker %s 异常: %s", command, e)
+        try:
+            proc.kill()
+            proc.communicate()
+        except Exception:
+            pass
+        return None
+
+
 def _require_baostock():
     """确保 BaoStock 依赖已安装。"""
     if bs is None:
@@ -54,6 +90,7 @@ class AKDataLoader:
         self._stock_list_cache = None
         self._stock_list_cache_time = 0
         self._bs_logged_in = False
+        self._bs_available = True
         self._bs_lock = threading.Lock()
 
     def _login(self):
@@ -67,31 +104,29 @@ class AKDataLoader:
                 raise
 
     def _ensure_login(self):
-        """确保 BaoStock 连接有效，已登录时用轻量查询验证，失败则重新登录，共重试 3 次。"""
+        """确保 BaoStock 连接有效，通过子进程验证，失败则重新登录，共重试 3 次。"""
+        if not self._bs_available:
+            raise ConnectionError("BaoStock 已标记为不可用，跳过登录")
         _require_baostock()
         for attempt in range(3):
             if self._bs_logged_in:
-                try:
-                    rs = bs.query_stock_basic("sh.600000")
-                    if rs.error_code == "0":
-                        return
-                    # 查询返回错误码，连接已失效
-                    logger.warning(f"BaoStock 连接已失效 (error_code={rs.error_code})，重新登录")
-                    self._bs_logged_in = False
-                except Exception as e:
-                    logger.warning(f"BaoStock 连接验证失败: {e}，重新登录")
-                    self._bs_logged_in = False
+                result = _run_bs_with_subprocess("query_stock_basic", "sh.600000")
+                if result is not None and result.get("error_code") == "0":
+                    return
+                logger.warning("BaoStock 连接已失效，重新登录")
+                self._bs_logged_in = False
 
-            try:
-                bs.login()
+            result = _run_bs_with_subprocess("login")
+            if result is not None and result.get("error_code") == "0":
                 self._bs_logged_in = True
                 return
-            except Exception as e:
-                wait = 2 * (attempt + 1)
-                logger.warning(f"BaoStock 登录失败 (第{attempt+1}次): {e}, {wait}s 后重试")
-                self._bs_logged_in = False
-                if attempt < 2:
-                    time.sleep(wait)
+            wait = 2 * (attempt + 1)
+            logger.warning("BaoStock 登录失败 (第%d次), %ds 后重试", attempt + 1, wait)
+            self._bs_logged_in = False
+            if attempt < 2:
+                time.sleep(wait)
+        self._bs_available = False
+        logger.error("BaoStock 登录重试 3 次均失败，标记为不可用，后续调用将跳过 BaoStock")
         raise ConnectionError("BaoStock 登录重试 3 次均失败")
 
     def _logout(self):
@@ -102,28 +137,77 @@ class AKDataLoader:
     def close(self):
         self._logout()
 
+    def _get_stocks_from_cache(self):
+        """从 data/cache/hist_*.pkl 文件中提取股票代码作为备用列表。"""
+        stocks = []
+        try:
+            for fname in os.listdir(self.cache_dir):
+                if not fname.startswith("hist_") or not fname.endswith(".pkl"):
+                    continue
+                # 文件名格式: hist_{code}_{days}.pkl
+                parts = fname[len("hist_"):-len(".pkl")].rsplit("_", 1)
+                if not parts:
+                    continue
+                raw_code = parts[0]
+                if is_a_share_stock(raw_code):
+                    stocks.append({
+                        "code": normalize_a_share_code(raw_code),
+                        "bs_code": to_baostock_code(raw_code),
+                        "name": "",
+                    })
+        except Exception as e:
+            logger.warning(f"从缓存目录读取股票列表失败: {e}")
+        stocks.sort(key=lambda s: s["code"])
+        logger.info(f"从缓存文件中恢复股票列表: {len(stocks)} 只")
+        return stocks
+
     def get_all_stocks(self):
         """获取沪深 A 股股票列表（BaoStock）。
 
-        自动回退到最近有数据的日期（盘中/节假日场景）
+        BaoStock 不可用时自动回退到缓存文件中的股票列表。
         """
         now = time.time()
         if self._stock_list_cache and (now - self._stock_list_cache_time) < 3600:
             return self._stock_list_cache
 
-        self._ensure_login()
+        # BaoStock 已标记不可用，直接走缓存
+        if not self._bs_available:
+            stocks = self._get_stocks_from_cache()
+            self._stock_list_cache = stocks
+            self._stock_list_cache_time = now
+            return stocks
+
+        try:
+            self._ensure_login()
+        except ConnectionError:
+            stocks = self._get_stocks_from_cache()
+            self._stock_list_cache = stocks
+            self._stock_list_cache_time = now
+            return stocks
 
         # 尝试今天及前 5 天，BaoStock 盘中可能没数据
         rows = []
         for offset in range(6):
             day = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
-            rs = bs.query_all_stock(day=day)
-            rows = []
-            while rs.error_code == "0" and rs.next():
-                rows.append(rs.get_row_data())
+            result = _run_bs_with_subprocess("query_all_stock", day)
+            if result is None:
+                logger.warning("BaoStock query_all_stock(%s) 失败或超时", day)
+                continue
+            if result.get("error_code") != "0":
+                logger.warning("BaoStock query_all_stock(%s) 错误: %s", day, result.get("error_code"))
+                continue
+            rows = result.get("rows", [])
             if rows:
-                logger.info(f"股票列表使用日期: {day} ({len(rows)} 条)")
+                logger.info("股票列表使用日期: %s (%d 条)", day, len(rows))
                 break
+
+        # BaoStock 返回 0 条，回退到缓存
+        if not rows:
+            logger.warning("BaoStock 返回 0 条记录，回退到缓存文件中的股票列表")
+            stocks = self._get_stocks_from_cache()
+            self._stock_list_cache = stocks
+            self._stock_list_cache_time = now
+            return stocks
 
         stocks = []
         for row in rows:
@@ -263,6 +347,9 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
+        if not self._bs_available:
+            return None
+
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
 
@@ -270,48 +357,33 @@ class AKDataLoader:
             self._ensure_login()
 
             for attempt in range(3):
-                try:
-                    rs = bs.query_history_k_data_plus(
-                        bs_code,
-                        "date,open,high,low,close,volume,amount,preclose,pctChg",
-                        start_date=start,
-                        end_date=end,
-                        frequency="d",
-                        adjustflag="2",
-                    )
+                result = _run_bs_with_subprocess("query_history", bs_code, start, end)
 
-                    rows = []
-                    while rs.error_code == "0" and rs.next():
-                        rows.append(rs.get_row_data())
-
-                    if not rows:
-                        return None
-
-                    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"])
-                    for col in ["open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"]:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-                    if len(df) == 0 or df["close"].iloc[-1] <= 0:
-                        return None
-
-                    self._write_cache(cache_key, df)
-                    return df
-
-                except (ConnectionError, OSError, socket.timeout, socket.error) as e:
-                    logger.warning(f"get_stock_history({code}) 连接异常 (第{attempt+1}次): {e}")
+                if result is None:
+                    logger.warning("get_stock_history(%s) 超时或异常 (第%d次)", code, attempt + 1)
                     self._bs_logged_in = False
                     if attempt < 2:
                         time.sleep(2 * (attempt + 1))
-                        try:
-                            bs.login()
-                            self._bs_logged_in = True
-                        except Exception:
-                            pass
                         continue
                     return None
-                except Exception as e:
-                    logger.warning(f"get_stock_history({code}) 异常: {e}")
+
+                if result.get("error_code") != "0":
+                    logger.warning("get_stock_history(%s) BaoStock 错误: %s", code, result.get("error_code"))
                     return None
+
+                rows = result.get("rows", [])
+                if not rows:
+                    return None
+
+                df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"])
+                for col in ["open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+                if len(df) == 0 or df["close"].iloc[-1] <= 0:
+                    return None
+
+                self._write_cache(cache_key, df)
+                return df
 
             return None
 
