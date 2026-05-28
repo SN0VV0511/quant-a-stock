@@ -1,5 +1,5 @@
 """
-全 A 股数据加载器
+沪深 A 股股票数据加载器
 - 股票列表: BaoStock
 - 实时行情: 腾讯接口（2026 年实时数据）
 - 历史数据: BaoStock
@@ -16,17 +16,34 @@ import urllib.request
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import baostock as bs
 import pandas as pd
 import numpy as np
+
+from config.settings import (
+    is_a_share_stock,
+    normalize_a_share_code,
+    to_baostock_code,
+    to_tencent_code,
+)
+
+try:
+    import baostock as bs
+except ImportError:  # pragma: no cover - 运行环境可能未安装行情依赖
+    bs = None
 
 logger = logging.getLogger(__name__)
 
 socket.setdefaulttimeout(30)
 
 
+def _require_baostock():
+    """确保 BaoStock 依赖已安装。"""
+    if bs is None:
+        raise ImportError("缺少 baostock 依赖，请先执行: pip install -r requirements.txt")
+
+
 class AKDataLoader:
-    """全 A 股数据加载器"""
+    """沪深 A 股股票数据加载器。"""
 
     def __init__(self, cache_dir=None, cache_ttl=300):
         self.cache_dir = cache_dir or os.path.join(
@@ -40,6 +57,7 @@ class AKDataLoader:
         self._bs_lock = threading.Lock()
 
     def _login(self):
+        _require_baostock()
         if not self._bs_logged_in:
             try:
                 bs.login()
@@ -49,7 +67,8 @@ class AKDataLoader:
                 raise
 
     def _ensure_login(self):
-        """确保 BaoStock 连接有效，已登录时用轻量查询验证，失败则重新登录，共重试 3 次"""
+        """确保 BaoStock 连接有效，已登录时用轻量查询验证，失败则重新登录，共重试 3 次。"""
+        _require_baostock()
         for attempt in range(3):
             if self._bs_logged_in:
                 try:
@@ -76,7 +95,7 @@ class AKDataLoader:
         raise ConnectionError("BaoStock 登录重试 3 次均失败")
 
     def _logout(self):
-        if self._bs_logged_in:
+        if self._bs_logged_in and bs is not None:
             bs.logout()
             self._bs_logged_in = False
 
@@ -84,7 +103,8 @@ class AKDataLoader:
         self._logout()
 
     def get_all_stocks(self):
-        """获取全部 A 股列表（BaoStock）
+        """获取沪深 A 股股票列表（BaoStock）。
+
         自动回退到最近有数据的日期（盘中/节假日场景）
         """
         now = time.time()
@@ -114,29 +134,27 @@ class AKDataLoader:
             if stock_type != "1":
                 continue
 
-            raw_code = code.split(".")[-1] if "." in code else code
-
             if "ST" in name.upper() or "退" in name:
                 continue
-            if raw_code.startswith("8") or raw_code.startswith("4"):
+            if not is_a_share_stock(code):
                 continue
 
             stocks.append({
-                "code": raw_code,
-                "bs_code": code,
+                "code": normalize_a_share_code(code),
+                "bs_code": to_baostock_code(code),
                 "name": name,
             })
 
         self._stock_list_cache = stocks
         self._stock_list_cache_time = now
-        logger.info(f"获取全 A 股列表: {len(stocks)} 只")
+        logger.info(f"获取沪深 A 股股票列表: {len(stocks)} 只")
         return stocks
 
     def get_realtime_quotes(self, codes=None):
-        """获取实时行情（腾讯接口）
+        """获取沪深 A 股实时行情（腾讯接口）。
 
         Args:
-            codes: 股票代码列表，None 则获取全市场
+            codes: 股票代码列表，None 则获取沪深 A 股股票全市场。
 
         Returns:
             dict: code -> {price, open, high, low, prev_close, volume, amount, pct_change}
@@ -145,13 +163,30 @@ class AKDataLoader:
             stocks = self.get_all_stocks()
             codes = [s["code"] for s in stocks]
 
-        # 转换为腾讯格式
         tencent_codes = []
+        seen_codes = set()
+        invalid_codes = []
         for code in codes:
-            if code.startswith("6"):
-                tencent_codes.append(f"sh{code}")
-            else:
-                tencent_codes.append(f"sz{code}")
+            try:
+                raw_code = normalize_a_share_code(str(code))
+                tencent_code = to_tencent_code(str(code))
+            except ValueError:
+                invalid_codes.append(str(code))
+                continue
+            if raw_code in seen_codes:
+                continue
+            seen_codes.add(raw_code)
+            tencent_codes.append(tencent_code)
+
+        if invalid_codes:
+            preview = ", ".join(invalid_codes[:20])
+            if len(invalid_codes) > 20:
+                preview = f"{preview}, ..."
+            logger.warning("实时行情忽略非沪深 A 股股票代码: %s", preview)
+
+        if not tencent_codes:
+            logger.info("没有可请求的沪深 A 股实时行情代码")
+            return {}
 
         quotes = {}
 
@@ -215,13 +250,18 @@ class AKDataLoader:
         return quotes
 
     def get_stock_history(self, code, days=120):
-        """获取个股历史数据（BaoStock），捕获连接异常后重连再重试"""
-        cache_key = f"hist_{code}_{days}"
+        """获取沪深 A 股个股历史数据（BaoStock），捕获连接异常后重连再重试。"""
+        try:
+            raw_code = normalize_a_share_code(str(code))
+            bs_code = to_baostock_code(str(code))
+        except ValueError as exc:
+            logger.warning("历史行情忽略非沪深 A 股股票代码: %s", exc)
+            return None
+
+        cache_key = f"hist_{raw_code}_{days}"
         cached = self._read_cache(cache_key)
         if cached is not None:
             return cached
-
-        bs_code = f"sh.{code}" if code.startswith("6") else f"sz.{code}"
 
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
@@ -344,7 +384,7 @@ if __name__ == "__main__":
     loader = AKDataLoader()
 
     stocks = loader.get_all_stocks()
-    print(f"全 A 股: {len(stocks)} 只")
+    print(f"沪深 A 股股票: {len(stocks)} 只")
 
     # 测试实时行情（前 10 只）
     codes = [s["code"] for s in stocks[:10]]

@@ -9,12 +9,22 @@ import time
 import logging
 from datetime import datetime, timedelta
 
-import baostock as bs
 import pandas as pd
 
-from config.settings import CACHE_DIR, is_etf, is_chinext
+try:
+    import baostock as bs
+except ImportError:  # pragma: no cover - 运行环境可能未安装行情依赖
+    bs = None
+
+from config.settings import CACHE_DIR, is_etf, is_chinext, to_baostock_code
 
 logger = logging.getLogger(__name__)
+
+
+def _require_baostock():
+    """确保 BaoStock 依赖已安装。"""
+    if bs is None:
+        raise ImportError("缺少 baostock 依赖，请先执行: pip install -r requirements.txt")
 
 
 class DataLoader:
@@ -28,6 +38,7 @@ class DataLoader:
 
     def _login(self):
         """登录 BaoStock"""
+        _require_baostock()
         if not self._bs_logged_in:
             result = bs.login()
             if result.error_code != "0":
@@ -36,7 +47,7 @@ class DataLoader:
 
     def _logout(self):
         """登出 BaoStock"""
-        if self._bs_logged_in:
+        if self._bs_logged_in and bs is not None:
             bs.logout()
             self._bs_logged_in = False
 
@@ -101,7 +112,7 @@ class DataLoader:
         """获取股票/ETF 日线数据
 
         Args:
-            code: BaoStock 代码，如 sh.601988, sz.159915
+            code: 沪深 A 股股票代码，如 sh.601988、sz.000001、600519
             start_date: 开始日期 YYYY-MM-DD 或 YYYYMMDD
             end_date: 结束日期
             adjust_flag: 复权类型 "2"=前复权, "1"=后复权, "3"=不复权
@@ -117,7 +128,7 @@ class DataLoader:
         # BaoStock 需要 YYYY-MM-DD 格式
         start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
         end_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
-        code_bs = code.replace("sh", "sh.").replace("sz", "sz.") if "." not in code else code
+        code_bs = to_baostock_code(code)
 
         cache_key = {"start": start_date, "end": end_date, "adj": adjust_flag}
 
@@ -256,7 +267,7 @@ class DataLoader:
         Returns:
             dict: {code, code_name, ipoDate, outDate, type, status}
         """
-        code_bs = code.replace("sh", "sh.").replace("sz", "sz.") if "." not in code else code
+        code_bs = to_baostock_code(code)
 
         cache_path = os.path.join(self.cache_dir, f"basic_{code_bs}.json")
         if os.path.exists(cache_path):
@@ -293,7 +304,7 @@ class DataLoader:
         Returns:
             dict
         """
-        code_bs = code.replace("sh", "sh.").replace("sz", "sz.") if "." not in code else code
+        code_bs = to_baostock_code(code)
         self._login()
 
         rs = bs.query_stock_industry(code=code_bs)
@@ -316,7 +327,7 @@ class DataLoader:
         Returns:
             pd.DataFrame
         """
-        code_bs = code.replace("sh", "sh.").replace("sz", "sz.") if "." not in code else code
+        code_bs = to_baostock_code(code)
         self._login()
 
         rs = bs.query_profit_data(code=code_bs, year=year, quarter=quarter)
@@ -341,7 +352,7 @@ class DataLoader:
         Returns:
             pd.DataFrame
         """
-        code_bs = code.replace("sh", "sh.").replace("sz", "sz.") if "." not in code else code
+        code_bs = to_baostock_code(code)
         self._login()
 
         rs = bs.query_cash_flow_data(code=code_bs, year=year, quarter=quarter)
@@ -366,7 +377,7 @@ class DataLoader:
         Returns:
             pd.DataFrame
         """
-        code_bs = code.replace("sh", "sh.").replace("sz", "sz.") if "." not in code else code
+        code_bs = to_baostock_code(code)
         self._login()
 
         rs = bs.query_growth_data(code=code_bs, year=year, quarter=quarter)

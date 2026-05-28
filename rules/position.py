@@ -4,21 +4,26 @@ JSON 持久化，支持买入、卖出、T+1 检查、仓位限制等
 """
 
 import json
+import logging
 import os
 from datetime import datetime
 
 from config.settings import (
     STATE_FILE, INITIAL_CAPITAL, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
-    MAX_TOTAL_POSITION, LOT_SIZE, is_etf,
+    MAX_TOTAL_POSITION, LOT_SIZE, is_etf, TRADE_LOG_FILE, SNAPSHOT_LOG_FILE,
 )
 from rules.engine import TradingRules
+
+logger = logging.getLogger(__name__)
 
 
 class PositionManager:
     """持仓状态管理，JSON 持久化"""
 
-    def __init__(self, state_file=None):
+    def __init__(self, state_file=None, trade_log_file=None, snapshot_log_file=None):
         self.state_file = state_file or STATE_FILE
+        self.trade_log_file = trade_log_file or TRADE_LOG_FILE
+        self.snapshot_log_file = snapshot_log_file or SNAPSHOT_LOG_FILE
         self.rules = TradingRules()
         self.state = self._default_state()
         self.load()
@@ -28,7 +33,7 @@ class PositionManager:
         """默认状态"""
         return {
             "cash": INITIAL_CAPITAL,
-            "positions": {},       # code -> {name, shares, avg_cost, buy_date, strategy}
+            "positions": {},       # code -> {name, shares, avg_cost, buy_date, strategy, current_price}
             "trades": [],          # 交易记录
             "daily_snapshots": {}, # date -> {cash, positions_value, total_value}
             "created_at": datetime.now().strftime("%Y%m%d %H:%M:%S"),
@@ -101,11 +106,12 @@ class PositionManager:
         # 扣除现金
         self.state["cash"] = round(self.state["cash"] - total_cost, 2)
 
-        # 记录交易
-        self.state["trades"].append({
+        trade = {
             "date": date,
+            "time": datetime.now().strftime("%H:%M:%S"),
             "code": code,
             "name": name,
+            "action": "buy",
             "direction": "buy",
             "price": price,
             "shares": shares,
@@ -113,10 +119,12 @@ class PositionManager:
             "cost": cost_detail["total"],
             "actual_price": round(actual_price, 4),
             "strategy": strategy,
-        })
+        }
+        self.state["trades"].append(trade)
 
         self.state["updated_at"] = datetime.now().strftime("%Y%m%d %H:%M:%S")
         self.save()
+        self._append_trade_log(trade)
 
         return {
             "success": True,
@@ -171,11 +179,12 @@ class PositionManager:
         # 增加现金
         self.state["cash"] = round(self.state["cash"] + net_proceeds, 2)
 
-        # 记录交易
-        self.state["trades"].append({
+        trade = {
             "date": date,
+            "time": datetime.now().strftime("%H:%M:%S"),
             "code": code,
-            "name": pos["name"],
+            "name": pos.get("name", code),
+            "action": "sell",
             "direction": "sell",
             "price": price,
             "shares": shares,
@@ -184,10 +193,12 @@ class PositionManager:
             "actual_price": round(actual_price, 4),
             "profit": round(profit, 2),
             "strategy": strategy,
-        })
+        }
+        self.state["trades"].append(trade)
 
         self.state["updated_at"] = datetime.now().strftime("%Y%m%d %H:%M:%S")
         self.save()
+        self._append_trade_log(trade)
 
         return {
             "success": True,
@@ -209,9 +220,30 @@ class PositionManager:
         """获取所有持仓"""
         return dict(self.state["positions"])
 
+    def get_position_codes(self):
+        """获取全部持仓代码。"""
+        return list(self.state["positions"].keys())
+
+    def get_positions_snapshot(self):
+        """获取持仓快照副本。"""
+        return json.loads(json.dumps(self.state["positions"], ensure_ascii=False))
+
     def get_cash(self):
         """获取可用现金"""
         return self.state["cash"]
+
+    def update_prices(self, current_prices):
+        """更新持仓当前价格。
+
+        Args:
+            current_prices: dict {code: price}
+        """
+        if not current_prices:
+            return
+        for code, pos in self.state["positions"].items():
+            if code in current_prices:
+                pos["current_price"] = current_prices[code]
+        self.state["updated_at"] = datetime.now().strftime("%Y%m%d %H:%M:%S")
 
     def get_total_value(self, current_prices=None):
         """计算总市值
@@ -227,7 +259,7 @@ class PositionManager:
             if current_prices and code in current_prices:
                 price = current_prices[code]
             else:
-                price = pos["avg_cost"]
+                price = pos.get("current_price", pos["avg_cost"])
             positions_value += price * pos["shares"]
         return round(self.state["cash"] + positions_value, 2)
 
@@ -317,7 +349,7 @@ class PositionManager:
             if current_prices and code in current_prices:
                 price = current_prices[code]
             else:
-                price = pos["avg_cost"]
+                price = pos.get("current_price", pos["avg_cost"])
             positions_value += price * pos["shares"]
 
         self.state["daily_snapshots"][date] = {
@@ -332,6 +364,7 @@ class PositionManager:
             self.state["peak_value"] = total_value
 
         self.save()
+        self._append_snapshot_log(date, current_prices)
 
     def get_drawdown(self, current_value=None):
         """计算当前回撤
@@ -382,8 +415,10 @@ class PositionManager:
                 for key in self._default_state():
                     if key not in loaded:
                         loaded[key] = self._default_state()[key]
+                self._normalize_positions(loaded)
                 self.state = loaded
-            except (json.JSONDecodeError, IOError):
+            except (json.JSONDecodeError, IOError) as exc:
+                logger.warning("加载持仓状态失败，将使用默认状态: %s", exc)
                 self.state = self._default_state()
 
     def reset(self):
@@ -413,13 +448,13 @@ class PositionManager:
             if current_prices and code in current_prices:
                 cur_price = current_prices[code]
             else:
-                cur_price = pos["avg_cost"]
+                cur_price = pos.get("current_price", pos["avg_cost"])
             market_val = cur_price * pos["shares"]
             profit = (cur_price - pos["avg_cost"]) * pos["shares"]
             profit_pct = (cur_price - pos["avg_cost"]) / pos["avg_cost"] if pos["avg_cost"] > 0 else 0
             positions_summary.append({
                 "code": code,
-                "name": pos["name"],
+                "name": pos.get("name", code),
                 "shares": pos["shares"],
                 "avg_cost": pos["avg_cost"],
                 "current_price": cur_price,
@@ -439,3 +474,34 @@ class PositionManager:
             "position_count": len(self.state["positions"]),
             "positions": positions_summary,
         }
+
+    def _normalize_positions(self, state):
+        """兼容旧版实时脚本写出的持仓结构。"""
+        for code, pos in state.get("positions", {}).items():
+            pos.setdefault("name", code)
+            pos.setdefault("strategy", "legacy")
+            pos.setdefault("buy_date", datetime.now().strftime("%Y%m%d"))
+            pos.setdefault("current_price", pos.get("avg_cost", 0))
+
+    def _append_trade_log(self, trade):
+        """同步追加 Web 仪表盘读取的交易流水。"""
+        try:
+            os.makedirs(os.path.dirname(self.trade_log_file), exist_ok=True)
+            with open(self.trade_log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(trade, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            logger.warning("追加交易流水失败: %s", exc)
+
+    def _append_snapshot_log(self, date, current_prices=None):
+        """追加账户快照流水，便于一个月观察期复盘。"""
+        snapshot = {
+            "date": date,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "summary": self.summary(current_prices),
+        }
+        try:
+            os.makedirs(os.path.dirname(self.snapshot_log_file), exist_ok=True)
+            with open(self.snapshot_log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snapshot, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            logger.warning("追加账户快照失败: %s", exc)

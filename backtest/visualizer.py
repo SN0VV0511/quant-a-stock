@@ -1,16 +1,25 @@
 """
 可视化模块 - 生成回测图表
 """
-import matplotlib
-matplotlib.use("Agg")  # 无 GUI 模式
-import matplotlib.pyplot as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import os
+import tempfile
 
-# 中文字体
-plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
+
+def _load_matplotlib():
+    """延迟加载 Matplotlib，避免未安装可视化依赖时影响核心逻辑导入。"""
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "quant-a-stock-matplotlib"))
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # 无 GUI 模式
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError("缺少 matplotlib 依赖，请先执行: pip install -r requirements.txt") from exc
+
+    # 中文字体
+    plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    return plt, mdates
 
 
 def plot_backtest(result_df, summary, symbol="000001", save_path=None):
@@ -28,6 +37,7 @@ def plot_backtest(result_df, summary, symbol="000001", save_path=None):
         os.makedirs(reports_dir, exist_ok=True)
         save_path = os.path.join(reports_dir, f"backtest_{symbol}.png")
 
+    plt, mdates = _load_matplotlib()
     fig, axes = plt.subplots(3, 1, figsize=(14, 12), gridspec_kw={"height_ratios": [3, 1.5, 1]})
     fig.suptitle(f"A Stock Quantitative Backtest - {symbol}", fontsize=16, fontweight="bold")
 

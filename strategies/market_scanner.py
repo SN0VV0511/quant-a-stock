@@ -1,6 +1,6 @@
 """
-全市场扫描模块
-使用 AKDataLoader（腾讯实时 + BaoStock 历史），自动筛选动量排名靠前的股票
+沪深 A 股扫描模块
+使用 AKDataLoader（腾讯实时 + BaoStock 历史），自动筛选动量排名靠前的沪深 A 股股票
 """
 
 import logging
@@ -8,11 +8,13 @@ import logging
 import pandas as pd
 import numpy as np
 
+from config.settings import is_a_share_stock
+
 logger = logging.getLogger(__name__)
 
 
 class MarketScanner:
-    """全市场扫描器（基于 AKDataLoader）"""
+    """沪深 A 股股票扫描器（基于 AKDataLoader）。"""
 
     def __init__(self, loader=None):
         """
@@ -32,7 +34,7 @@ class MarketScanner:
             self.loader.close()
 
     def get_all_a_stocks(self):
-        """获取全 A 股列表（腾讯数据源）
+        """获取沪深 A 股股票列表。
 
         Returns:
             list of dict: [{code, name}]
@@ -43,7 +45,7 @@ class MarketScanner:
         """扫描股票池，按动量排名
 
         Args:
-            stock_list: 股票列表 [{code, name}]，None 则扫全 A 股
+            stock_list: 股票列表 [{code, name}]，None 则扫沪深 A 股股票
             top_n: 返回前 N 名
             momentum_period: 动量计算周期
 
@@ -53,7 +55,11 @@ class MarketScanner:
         if stock_list is None:
             stock_list = self.loader.get_all_stocks()
 
-        logger.info(f"开始扫描 {len(stock_list)} 只股票...")
+        stock_list = [
+            stock for stock in stock_list
+            if is_a_share_stock(str(stock.get("code", "")))
+        ]
+        logger.info(f"开始扫描 {len(stock_list)} 只沪深 A 股股票...")
 
         # 批量获取实时行情（腾讯接口，含最新价、涨跌幅、成交量）
         codes = [s["code"] for s in stock_list]

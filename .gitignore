@@ -1,4 +1,5 @@
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pkl
@@ -7,5 +8,9 @@ __pycache__/
 *.csv
 logs/
 data/cache/
+data/backups/
+data/paper_daemon.pid
+data/trade_events.jsonl
+data/portfolio_snapshots.jsonl
 .env
 *.log

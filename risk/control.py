@@ -9,8 +9,9 @@ from datetime import datetime
 from config.settings import (
     INITIAL_CAPITAL, MAX_TOTAL_POSITION, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     CASH_BUFFER, DAILY_LOSS_THRESHOLD, MAX_DRAWDOWN_THRESHOLD, LOT_SIZE,
-    is_etf, DEFAULT_UNIVERSE,
+    is_etf, is_a_share_stock, DEFAULT_UNIVERSE,
 )
+from trading.models import OrderIntent, RiskDecision
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +86,16 @@ class RiskController:
         code = order["code"]
         action = order["action"]
 
-        # 1. 标的白名单检查（扫描策略跳过白名单限制）
+        # 1. 标的范围检查：实时虚拟盘只允许沪深 A 股股票。
+        if not is_a_share_stock(code):
+            return False, f"标的 {code} 不是沪深 A 股股票"
+
+        # 2. 标的白名单检查（扫描策略跳过白名单限制）
         strategy_name = order.get("strategy", "")
-        if strategy_name != "全市场扫描" and code not in DEFAULT_UNIVERSE:
+        if "全市场扫描" not in strategy_name and code not in DEFAULT_UNIVERSE:
             return False, f"标的 {code} 不在白名单中"
 
-        # 2. 市场数据检查
+        # 3. 市场数据检查
         if market_data and code in market_data:
             md = market_data[code]
 
@@ -115,13 +120,13 @@ class RiskController:
                 if action == "sell" and not can_sell:
                     return False, f"标的 {code} {limit_type}，不可卖出"
 
-        # 3. T+1 检查（卖出时）
+        # 4. T+1 检查（卖出时）
         if action == "sell":
             can_sell, reason = portfolio.can_sell(code, order.get("date", datetime.now().strftime("%Y%m%d")))
             if not can_sell:
                 return False, reason
 
-        # 4. 持仓检查（卖出时）
+        # 5. 持仓检查（卖出时）
         if action == "sell":
             pos = portfolio.get_position(code)
             if not pos:
@@ -129,11 +134,11 @@ class RiskController:
             if order.get("shares", 0) > pos["shares"]:
                 order["shares"] = pos["shares"]
 
-        # 5. 价格合理性
+        # 6. 价格合理性
         if order.get("price", 0) <= 0:
             return False, f"价格异常: {order.get('price')}"
 
-        # 6. 资金检查
+        # 7. 资金检查
         approved, reason = self.check_capital_allocation(order, portfolio)
         if not approved:
             return False, reason
@@ -317,3 +322,51 @@ class RiskController:
                 })
 
         return approved_orders, rejected_orders
+
+    def check_order_intent(self, intent: OrderIntent, portfolio, market_data=None) -> RiskDecision:
+        """审批标准订单意图。
+
+        Args:
+            intent: 标准订单意图。
+            portfolio: 持仓管理器。
+            market_data: 行情风控数据。
+
+        Returns:
+            RiskDecision: 风控审批结果。
+        """
+        order = intent.to_order_dict()
+        ok, reason = self.pre_trade_check(order, portfolio, market_data)
+        return RiskDecision(order=intent, approved=ok, reason=reason)
+
+    def filter_order_intents(self, intents, portfolio, market_data=None):
+        """批量审批标准订单意图。
+
+        Returns:
+            tuple: (approved_intents, rejected_decisions)
+        """
+        should_reduce, reduce_reason = self.should_reduce_position(portfolio)
+        rejected = []
+        approved = []
+
+        for intent in intents:
+            if should_reduce and intent.action == "buy":
+                rejected.append(RiskDecision(order=intent, approved=False, reason=reduce_reason))
+                continue
+
+            exceeded, drawdown = self.check_max_drawdown(portfolio)
+            if exceeded and intent.action == "buy":
+                rejected.append(RiskDecision(
+                    order=intent,
+                    approved=False,
+                    reason=f"回撤过大 {drawdown:.2%}，暂停开仓",
+                ))
+                continue
+
+            order = intent.to_order_dict()
+            ok, reason = self.pre_trade_check(order, portfolio, market_data)
+            if ok:
+                approved.append(OrderIntent.from_order_dict(order))
+            else:
+                rejected.append(RiskDecision(order=intent, approved=False, reason=reason))
+
+        return approved, rejected

@@ -1,18 +1,53 @@
 """
 数据加载模块 - 用 BaoStock 获取 A 股行情数据（免费、稳定、无封 IP 问题）
 """
-import baostock as bs
-import pandas as pd
+import logging
 import os
 import sys
 
+import pandas as pd
+
+try:
+    import baostock as bs
+except ImportError:  # pragma: no cover - 运行环境可能未安装行情依赖
+    bs = None
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
-    from config.settings import DEFAULT_STOCK, BACKTEST_START, BACKTEST_END
+    from config.settings import (
+        DEFAULT_STOCK,
+        BACKTEST_START,
+        BACKTEST_END,
+        normalize_a_share_code,
+        to_baostock_code,
+    )
 except ImportError:
     DEFAULT_STOCK = "600519"
     BACKTEST_START = "20250101"
     BACKTEST_END = "20260523"
+
+    def normalize_a_share_code(code):
+        """配置模块不可用时的最小代码归一化兜底。"""
+        normalized = str(code).strip().lower().replace(".", "")
+        if normalized.startswith(("sh", "sz")):
+            normalized = normalized[2:]
+        if not normalized.isdigit() or len(normalized) != 6:
+            raise ValueError(f"无效证券代码: {code}")
+        return normalized
+
+    def to_baostock_code(code):
+        """配置模块不可用时的最小 BaoStock 代码兜底。"""
+        raw = normalize_a_share_code(code)
+        market = "sh" if raw.startswith(("600", "601", "603", "605", "688", "689")) else "sz"
+        return f"{market}.{raw}"
+
+logger = logging.getLogger(__name__)
+
+
+def _require_baostock():
+    """确保 BaoStock 依赖已安装。"""
+    if bs is None:
+        raise ImportError("缺少 baostock 依赖，请先执行: pip install -r requirements.txt")
 
 
 def get_stock_data(symbol=None, start_date=None, end_date=None, adjust="1"):
@@ -32,18 +67,16 @@ def get_stock_data(symbol=None, start_date=None, end_date=None, adjust="1"):
     start_date = start_date or BACKTEST_START
     end_date = end_date or BACKTEST_END
 
-    # baostock 格式：sh.600519 / sz.000001
-    if symbol.startswith("6") or symbol.startswith("9"):
-        bs_code = f"sh.{symbol}"
-    else:
-        bs_code = f"sz.{symbol}"
+    raw_symbol = normalize_a_share_code(symbol)
+    bs_code = to_baostock_code(symbol)
 
     start_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
     end_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
 
-    print(f"📥 正在获取 {symbol} 行情数据 ({start_fmt} ~ {end_fmt}) ...")
+    logger.info("正在获取 %s 行情数据 (%s ~ %s)", raw_symbol, start_fmt, end_fmt)
 
     # 登录
+    _require_baostock()
     lg = bs.login()
     if lg.error_code != "0":
         raise Exception(f"BaoStock 登录失败: {lg.error_msg}")
@@ -84,17 +117,15 @@ def get_stock_data(symbol=None, start_date=None, end_date=None, adjust="1"):
     df["pct_change"] = df["close"].pct_change() * 100
     df["change"] = df["close"].diff()
 
-    print(f"✅ 获取成功，共 {len(df)} 条数据")
+    logger.info("获取 %s 行情成功，共 %s 条数据", raw_symbol, len(df))
     return df
 
 
 def get_stock_info(symbol=None):
     """获取股票基本信息"""
+    _require_baostock()
     symbol = symbol or DEFAULT_STOCK
-    if symbol.startswith("6") or symbol.startswith("9"):
-        bs_code = f"sh.{symbol}"
-    else:
-        bs_code = f"sz.{symbol}"
+    bs_code = to_baostock_code(symbol)
 
     lg = bs.login()
     rs = bs.query_stock_basic(code=bs_code)

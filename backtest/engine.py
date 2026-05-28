@@ -30,7 +30,7 @@ class BacktestEngine:
         self.risk_ctrl = RiskController()
         self.results = None
 
-    def run(self, strategy, data_loader, start_date, end_date,
+    def run(self, strategy, data_loader=None, start_date=None, end_date=None,
             universe=None, benchmark_code="sh000300"):
         """运行回测
 
@@ -45,6 +45,12 @@ class BacktestEngine:
         Returns:
             dict: 回测结果
         """
+        if isinstance(strategy, pd.DataFrame):
+            return self._run_signal_dataframe(strategy)
+
+        if data_loader is None or start_date is None or end_date is None:
+            raise ValueError("事件驱动回测需要提供 strategy、data_loader、start_date、end_date")
+
         start_date = start_date.replace("-", "")
         end_date = end_date.replace("-", "")
 
@@ -227,6 +233,88 @@ class BacktestEngine:
         # 计算回测指标
         self.results = self._calculate_metrics(daily_values, all_trades, risk_events)
         return self.results
+
+    def _run_signal_dataframe(self, df):
+        """兼容旧版入口：基于已计算 signal 列的单标的 DataFrame 回测。
+
+        Args:
+            df: 包含 close、signal 列的 DataFrame。
+
+        Returns:
+            tuple: (result_df, summary)
+        """
+        required = {"close", "signal"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"回测数据缺少必要列: {sorted(missing)}")
+
+        result = df.copy().reset_index(drop=True)
+        cash = float(self.initial_capital)
+        shares = 0
+        buy_count = 0
+        sell_count = 0
+        total_cost = 0.0
+        values = []
+
+        for idx, row in result.iterrows():
+            price = float(row["close"])
+            signal = int(row.get("signal", 0))
+            if price <= 0:
+                values.append(cash + shares * price)
+                continue
+
+            if signal == 1 and shares == 0:
+                buy_shares = self.rules.calc_lot_size(price, cash, total_value=cash)
+                if buy_shares > 0:
+                    amount = price * buy_shares
+                    cost_detail = self.rules.calc_total_cost(amount, "buy", False)
+                    total_cash_needed = amount + cost_detail["total"]
+                    if total_cash_needed <= cash:
+                        cash = round(cash - total_cash_needed, 2)
+                        shares = buy_shares
+                        buy_count += 1
+                        total_cost += cost_detail["total"]
+            elif signal == -1 and shares > 0:
+                amount = price * shares
+                cost_detail = self.rules.calc_total_cost(amount, "sell", False)
+                proceeds = cost_detail["actual_amount"] - cost_detail["commission"] - cost_detail["stamp_tax"] - cost_detail["transfer_fee"]
+                cash = round(cash + proceeds, 2)
+                shares = 0
+                sell_count += 1
+                total_cost += cost_detail["total"]
+
+            total_value = round(cash + shares * price, 2)
+            values.append(total_value)
+            result.loc[idx, "cash"] = cash
+            result.loc[idx, "shares"] = shares
+            result.loc[idx, "total_value"] = total_value
+
+        if not values:
+            raise ValueError("回测数据为空")
+
+        result["total_value"] = result["total_value"].ffill().fillna(self.initial_capital)
+        result["daily_return"] = result["total_value"].pct_change().fillna(0.0)
+        running_max = result["total_value"].cummax()
+        result["drawdown"] = (result["total_value"] - running_max) / running_max
+        final_value = float(result["total_value"].iloc[-1])
+        first_close = float(result["close"].iloc[0])
+        last_close = float(result["close"].iloc[-1])
+        strategy_return = (final_value - self.initial_capital) / self.initial_capital
+        benchmark_return = (last_close - first_close) / first_close if first_close > 0 else 0.0
+        drawdown = (running_max - result["total_value"]) / running_max
+        max_drawdown = float(drawdown.max()) if not drawdown.empty else 0.0
+
+        summary = {
+            "初始资金": f"¥{self.initial_capital:,.2f}",
+            "期末资金": f"¥{final_value:,.2f}",
+            "策略收益": f"{strategy_return * 100:.2f}%",
+            "基准收益": f"{benchmark_return * 100:.2f}%",
+            "最大回撤": f"{max_drawdown * 100:.2f}%",
+            "买入次数": f"{buy_count} 次",
+            "卖出次数": f"{sell_count} 次",
+            "总交易成本": f"¥{total_cost:,.2f}",
+        }
+        return result, summary
 
     def _signals_to_orders(self, signals, current_positions):
         """将信号转换为订单"""

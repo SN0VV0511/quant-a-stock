@@ -5,20 +5,25 @@
 
 import os
 import sys
+import argparse
 import json
 import time
 import logging
 import threading
+from dataclasses import asdict
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (
     INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR,
+    normalize_a_share_code,
 )
 from data.ak_loader import AKDataLoader
+from scripts.paper_status import build_status
 
 logger = logging.getLogger(__name__)
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
@@ -26,15 +31,16 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templat
 # 日志文件路径
 LIVE_LOG = os.path.join(LOG_DIR, "live.log")
 LIVE_TODAY_LOG = os.path.join(LOG_DIR, "live_today.log")
+ROOT_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, "r") as f:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("读取账户状态失败: %s", exc)
     return {"cash": INITIAL_CAPITAL, "positions": {}, "updated_at": ""}
 
 
@@ -42,22 +48,47 @@ def load_trade_log():
     trades = []
     if os.path.exists(TRADE_LOG_FILE):
         try:
-            with open(TRADE_LOG_FILE, "r") as f:
+            with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         trades.append(json.loads(line))
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("读取交易流水失败: %s", exc)
+    state = load_state()
+    state_trades = state.get("trades", [])
+    if state_trades:
+        known = {
+            (
+                t.get("date"),
+                t.get("time"),
+                t.get("code"),
+                t.get("action") or t.get("direction"),
+                t.get("shares"),
+                t.get("price"),
+            )
+            for t in trades
+        }
+        for trade in state_trades:
+            key = (
+                trade.get("date"),
+                trade.get("time"),
+                trade.get("code"),
+                trade.get("action") or trade.get("direction"),
+                trade.get("shares"),
+                trade.get("price"),
+            )
+            if key not in known:
+                trades.append(trade)
     return trades
 
 
 def normalize_code(code):
-    if code.startswith("sh.") or code.startswith("sz."):
-        return code[3:]
-    if code.startswith("sh") or code.startswith("sz"):
-        return code[2:]
-    return code
+    try:
+        return normalize_a_share_code(code)
+    except ValueError:
+        logger.warning("仪表盘忽略无法归一化的非沪深 A 股代码: %s", code)
+        return str(code).strip().lower()
 
 
 def get_realtime_prices(codes):
@@ -67,6 +98,7 @@ def get_realtime_prices(codes):
         prices_raw = loader.get_realtime_batch(raw_codes)
         return {c: prices_raw.get(normalize_code(c), 0) for c in codes}
     except Exception:
+        logger.warning("获取实时价格失败", exc_info=True)
         return {}
 
 
@@ -111,6 +143,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "/api/reports": lambda: self._json_response(self._api_reports()),
             "/api/logs": lambda: self._json_response(self._api_logs(params)),
             "/api/status": lambda: self._json_response(self._api_status()),
+            "/api/observation": lambda: self._json_response(self._api_observation()),
             "/api/candidates": lambda: self._json_response(self._api_candidates()),
         }
 
@@ -319,6 +352,10 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+    def _api_observation(self):
+        """虚拟盘观察期统一状态。"""
+        return asdict(build_status(ROOT_DIR, log_lines=30))
+
     def _api_reports(self):
         return {"reports": load_reports()}
 
@@ -358,13 +395,24 @@ class QuantHandler(SimpleHTTPRequestHandler):
         pass
 
 
-def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
-    server = HTTPServer(("0.0.0.0", port), QuantHandler)
-    print(f"🚀 量化系统仪表盘 v2: http://0.0.0.0:{port}")
+def _parse_args(argv=None):
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="A 股虚拟盘 Web 仪表盘")
+    parser.add_argument("port", nargs="?", type=int, default=8888, help="监听端口，默认 8888")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    """启动 Web 仪表盘。"""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    args = _parse_args(argv)
+    server = HTTPServer(("0.0.0.0", args.port), QuantHandler)
+    logger.info("量化系统仪表盘 v2: http://0.0.0.0:%s", args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        logger.info("收到中断信号，关闭 Web 仪表盘")
+    finally:
         server.server_close()
 
 

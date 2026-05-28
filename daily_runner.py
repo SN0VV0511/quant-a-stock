@@ -145,7 +145,7 @@ class DailyRunner:
                 current_dt = dt.strptime(date_str, "%Y%m%d")
                 if current_dt.weekday() == 0:  # 周一
                     logger.info("周一扫描日，执行全市场扫描...")
-                    scan_results = self.scanner.scan(date=date_str, top_n=5)
+                    scan_results = self.scanner.scan(top_n=5)
                     if scan_results:
                         logger.info(f"扫描选出 {len(scan_results)} 只股票")
                         # 卖出不在扫描结果中的持仓
@@ -178,7 +178,7 @@ class DailyRunner:
                         logger.warning("扫描无结果")
                 else:
                     # 非周一，检查止损
-                    scan_results = self.scanner.scan(date=date_str, top_n=5)
+                    scan_results = self.scanner.scan(top_n=5)
                     if scan_results:
                         scan_codes = {r["code"] for r in scan_results}
                         for code, pos in list(current_positions.items()):
