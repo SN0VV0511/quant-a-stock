@@ -49,10 +49,20 @@ class AKDataLoader:
                 raise
 
     def _ensure_login(self):
-        """确保 BaoStock 连接有效，循环 3 次重试登录，失败间隔递增"""
-        if self._bs_logged_in:
-            return
+        """确保 BaoStock 连接有效，已登录时用轻量查询验证，失败则重新登录，共重试 3 次"""
         for attempt in range(3):
+            if self._bs_logged_in:
+                try:
+                    rs = bs.query_stock_basic("sh.600000")
+                    if rs.error_code == "0":
+                        return
+                    # 查询返回错误码，连接已失效
+                    logger.warning(f"BaoStock 连接已失效 (error_code={rs.error_code})，重新登录")
+                    self._bs_logged_in = False
+                except Exception as e:
+                    logger.warning(f"BaoStock 连接验证失败: {e}，重新登录")
+                    self._bs_logged_in = False
+
             try:
                 bs.login()
                 self._bs_logged_in = True
@@ -60,6 +70,7 @@ class AKDataLoader:
             except Exception as e:
                 wait = 2 * (attempt + 1)
                 logger.warning(f"BaoStock 登录失败 (第{attempt+1}次): {e}, {wait}s 后重试")
+                self._bs_logged_in = False
                 if attempt < 2:
                     time.sleep(wait)
         raise ConnectionError("BaoStock 登录重试 3 次均失败")
