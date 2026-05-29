@@ -76,7 +76,8 @@ class SharedState:
         self.top_stocks: list[dict[str, Any]] = []
         self.candidate_codes: list[str] = []
         self.candidate_hist: dict[str, pd.DataFrame] = {}
-        self.rejected_stocks: dict[str, float] = {}  # code -> cooldown_until timestamp
+        self.rejected_stocks: dict[str, float] = {}  # 代码 -> 冷却结束时间戳
+        self.rejected_exits: dict[str, float] = {}
         self.last_scan_time: datetime | None = None
         self.scanning = False
 
@@ -85,7 +86,7 @@ class SharedState:
         with self._lock:
             self.top_stocks = stocks
             self.candidate_codes = [s["code"] for s in stocks]
-            self.rejected_stocks.clear()  # Reset cooldown on new scan
+            self.rejected_stocks.clear()  # 新一轮扫描后重新评估候选买入
             self.last_scan_time = datetime.now()
 
     def update_hist(self, code: str, df: pd.DataFrame) -> None:
@@ -117,6 +118,16 @@ class SharedState:
         """设置扫描状态。"""
         with self._lock:
             self.scanning = value
+
+    def is_exit_cooling_down(self, code: str) -> bool:
+        """判断卖出拒单是否仍处于冷却期。"""
+        with self._lock:
+            return time.time() < self.rejected_exits.get(code, 0)
+
+    def set_exit_cooldown(self, code: str, seconds: int = 300) -> None:
+        """设置卖出拒单冷却，避免同一持仓在盯盘循环中重复刷屏。"""
+        with self._lock:
+            self.rejected_exits[code] = time.time() + seconds
 
 
 def normalize_code(code: str) -> str:
@@ -258,7 +269,17 @@ def watch_thread(
             prices, _, market_data = _get_current_quotes(loader, watch_codes)
             broker.portfolio.update_prices(prices)
 
-            _handle_position_exits(broker, positions, prices, loader, risk_ctrl, market_data, recorder, combo=combo)
+            _handle_position_exits(
+                broker,
+                positions,
+                prices,
+                loader,
+                risk_ctrl,
+                market_data,
+                recorder,
+                shared=shared,
+                combo=combo,
+            )
             _handle_candidate_entries(broker, shared, prices, loader, combo, risk_ctrl, market_data, recorder)
 
             if now.minute != last_snapshot_minute and now.minute % 5 == 0:
@@ -282,11 +303,15 @@ def _handle_position_exits(
     risk_ctrl: RiskController,
     market_data: dict[str, dict[str, Any]],
     recorder: EventRecorder,
-    combo: ComboSignalStrategy = None,
+    shared: SharedState | None = None,
+    combo: ComboSignalStrategy | None = None,
 ) -> None:
     """处理持仓止损/止盈。"""
     today = datetime.now().strftime("%Y%m%d")
     for code, pos in positions.items():
+        if shared is not None and shared.is_exit_cooling_down(code):
+            continue
+
         current = prices.get(code) or pos.get("current_price") or pos.get("avg_cost", 0)
         avg_cost = float(pos.get("avg_cost", 0) or 0)
         shares = int(pos.get("shares", 0) or 0)
@@ -313,10 +338,14 @@ def _handle_position_exits(
                             reason=sig.get("reason", "策略信号"),
                             source="watch_thread",
                         )
-                        _submit_order(order, broker, risk_ctrl, market_data, recorder)
+                        _submit_exit_order(
+                            order, broker, risk_ctrl, market_data, recorder, shared
+                        )
                         continue
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "持仓卖出策略信号检查失败: %s %s", code, exc, exc_info=True
+                )
 
         if pnl_pct <= -0.07:
             order = OrderIntent(
@@ -330,7 +359,7 @@ def _handle_position_exits(
                 reason=f"盘中止损，亏损 {pnl_pct:.2%}",
                 source="watch_thread",
             )
-            _submit_order(order, broker, risk_ctrl, market_data, recorder)
+            _submit_exit_order(order, broker, risk_ctrl, market_data, recorder, shared)
             continue
 
         if pnl_pct >= 0.10:
@@ -350,7 +379,24 @@ def _handle_position_exits(
                     reason=f"盘中止盈，盈利 {pnl_pct:.2%} 且跌破 MA20",
                     source="watch_thread",
                 )
-                _submit_order(order, broker, risk_ctrl, market_data, recorder)
+                _submit_exit_order(
+                    order, broker, risk_ctrl, market_data, recorder, shared
+                )
+
+
+def _submit_exit_order(
+    order: OrderIntent,
+    broker: PaperBrokerAdapter,
+    risk_ctrl: RiskController,
+    market_data: dict[str, dict[str, Any]],
+    recorder: EventRecorder,
+    shared: SharedState | None,
+) -> ExecutionReport | None:
+    """提交卖出订单，并在风控拒绝时进入冷却期。"""
+    report = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+    if report is None and shared is not None:
+        shared.set_exit_cooldown(order.code)
+    return report
 
 
 def _handle_candidate_entries(
