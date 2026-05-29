@@ -10,7 +10,7 @@ import os
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ==================== 资金配置 ====================
-INITIAL_CAPITAL = 10000.0  # 初始资金（元）
+INITIAL_CAPITAL = 50000.0  # 初始资金（元）
 
 # ==================== 默认回测配置 ====================
 DEFAULT_STOCK = "000001"

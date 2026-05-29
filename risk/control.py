@@ -90,9 +90,9 @@ class RiskController:
         if not is_a_share_stock(code):
             return False, f"标的 {code} 不是沪深 A 股股票"
 
-        # 2. 标的白名单检查（扫描策略跳过白名单限制）
+        # 2. 标的白名单检查（扫描策略跳过白名单限制；卖出不限制）
         strategy_name = order.get("strategy", "")
-        if "全市场扫描" not in strategy_name and code not in DEFAULT_UNIVERSE:
+        if action == "buy" and "全市场扫描" not in strategy_name and code not in DEFAULT_UNIVERSE:
             return False, f"标的 {code} 不在白名单中"
 
         # 3. 市场数据检查

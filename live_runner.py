@@ -76,6 +76,7 @@ class SharedState:
         self.top_stocks: list[dict[str, Any]] = []
         self.candidate_codes: list[str] = []
         self.candidate_hist: dict[str, pd.DataFrame] = {}
+        self.rejected_stocks: dict[str, float] = {}  # code -> cooldown_until timestamp
         self.last_scan_time: datetime | None = None
         self.scanning = False
 
@@ -84,6 +85,7 @@ class SharedState:
         with self._lock:
             self.top_stocks = stocks
             self.candidate_codes = [s["code"] for s in stocks]
+            self.rejected_stocks.clear()  # Reset cooldown on new scan
             self.last_scan_time = datetime.now()
 
     def update_hist(self, code: str, df: pd.DataFrame) -> None:
@@ -256,7 +258,7 @@ def watch_thread(
             prices, _, market_data = _get_current_quotes(loader, watch_codes)
             broker.portfolio.update_prices(prices)
 
-            _handle_position_exits(broker, positions, prices, loader, risk_ctrl, market_data, recorder)
+            _handle_position_exits(broker, positions, prices, loader, risk_ctrl, market_data, recorder, combo=combo)
             _handle_candidate_entries(broker, shared, prices, loader, combo, risk_ctrl, market_data, recorder)
 
             if now.minute != last_snapshot_minute and now.minute % 5 == 0:
@@ -280,6 +282,7 @@ def _handle_position_exits(
     risk_ctrl: RiskController,
     market_data: dict[str, dict[str, Any]],
     recorder: EventRecorder,
+    combo: ComboSignalStrategy = None,
 ) -> None:
     """处理持仓止损/止盈。"""
     today = datetime.now().strftime("%Y%m%d")
@@ -291,6 +294,30 @@ def _handle_position_exits(
             continue
 
         pnl_pct = (current - avg_cost) / avg_cost
+
+        # 策略信号检查（RSI超买/死叉等）
+        if combo is not None:
+            try:
+                hist = loader.get_stock_data(normalize_code(code), days=60)
+                if hist is not None and len(hist) > 25:
+                    sig = combo.check_realtime(hist)
+                    if sig.get("signal") == "sell":
+                        order = OrderIntent(
+                            code=code,
+                            name=str(pos.get("name", code)),
+                            action="sell",
+                            price=float(current),
+                            shares=shares,
+                            date=today,
+                            strategy="策略卖出",
+                            reason=sig.get("reason", "策略信号"),
+                            source="watch_thread",
+                        )
+                        _submit_order(order, broker, risk_ctrl, market_data, recorder)
+                        continue
+            except Exception:
+                pass
+
         if pnl_pct <= -0.07:
             order = OrderIntent(
                 code=code,
@@ -346,6 +373,12 @@ def _handle_candidate_entries(
         if normalize_code(code) in position_norms:
             continue
 
+        # Check cooldown for risk-rejected stocks (5 min)
+        now_ts = time.time()
+        cooldown_until = shared.rejected_stocks.get(code, 0)
+        if now_ts < cooldown_until:
+            continue
+
         hist = shared.get_hist(code)
         if hist is None or len(hist) < 25:
             hist = loader.get_stock_data(normalize_code(code), days=60)
@@ -397,7 +430,10 @@ def _handle_candidate_entries(
             source="watch_thread",
             metadata={"rsi": result.get("rsi"), "cash_buffer": CASH_BUFFER},
         )
-        _submit_order(order, broker, risk_ctrl, market_data, recorder)
+        result_code = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+        if result_code is None:
+            # Risk rejected — cooldown for 5 minutes
+            shared.rejected_stocks[code] = time.time() + 300
 
 
 def scan_thread(
@@ -450,7 +486,7 @@ def _do_scan(
         recorder.record("scan_completed", {"top_n": top_n, "stocks": stocks})
 
         logger.info("扫描完成，候选股 %s 只:", len(stocks))
-        for stock in stocks[:10]:
+        for stock in stocks:
             logger.info(
                 "  #%s %s(%s) 动量=%+.2f%% 得分=%.4f",
                 stock["rank"],
@@ -544,7 +580,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--broker", default=BROKER_MODE, choices=["paper", "qmt"], help="交易通道，默认读取 BROKER_MODE")
     parser.add_argument("--watch-interval", type=int, default=LIVE_WATCH_INTERVAL_SECONDS, help="盯盘刷新秒数")
     parser.add_argument("--scan-interval", type=int, default=LIVE_SCAN_INTERVAL_SECONDS, help="扫描间隔秒数")
-    parser.add_argument("--top-n", type=int, default=20, help="候选股数量")
+    parser.add_argument("--top-n", type=int, default=30, help="候选股数量")
     parser.add_argument("--ignore-calendar", action="store_true", help="忽略交易日判断，便于联调")
     return parser.parse_args()
 

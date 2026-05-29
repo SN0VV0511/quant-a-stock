@@ -81,7 +81,7 @@ def _require_baostock():
 class AKDataLoader:
     """沪深 A 股股票数据加载器。"""
 
-    def __init__(self, cache_dir=None, cache_ttl=300):
+    def __init__(self, cache_dir=None, cache_ttl=3600):
         self.cache_dir = cache_dir or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cache"
         )
@@ -92,6 +92,8 @@ class AKDataLoader:
         self._bs_logged_in = False
         self._bs_available = True
         self._bs_lock = threading.Lock()
+        self._bs_last_verified = 0  # timestamp of last successful verification
+        self._bs_verify_interval = 300  # re-verify at most every 5 minutes
 
     def _login(self):
         _require_baostock()
@@ -108,10 +110,15 @@ class AKDataLoader:
         if not self._bs_available:
             raise ConnectionError("BaoStock 已标记为不可用，跳过登录")
         _require_baostock()
+        # Skip re-verification if recently verified
+        now = time.time()
+        if self._bs_logged_in and (now - self._bs_last_verified) < self._bs_verify_interval:
+            return
         for attempt in range(3):
             if self._bs_logged_in:
                 result = _run_bs_with_subprocess("query_stock_basic", "sh.600000")
                 if result is not None and result.get("error_code") == "0":
+                    self._bs_last_verified = time.time()
                     return
                 logger.warning("BaoStock 连接已失效，重新登录")
                 self._bs_logged_in = False
@@ -119,6 +126,7 @@ class AKDataLoader:
             result = _run_bs_with_subprocess("login")
             if result is not None and result.get("error_code") == "0":
                 self._bs_logged_in = True
+                self._bs_last_verified = time.time()
                 return
             wait = 2 * (attempt + 1)
             logger.warning("BaoStock 登录失败 (第%d次), %ds 后重试", attempt + 1, wait)
@@ -353,39 +361,38 @@ class AKDataLoader:
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
 
-        with self._bs_lock:
-            self._ensure_login()
+        self._ensure_login()
 
-            for attempt in range(3):
-                result = _run_bs_with_subprocess("query_history", bs_code, start, end)
+        for attempt in range(3):
+            result = _run_bs_with_subprocess("query_history", bs_code, start, end)
 
-                if result is None:
-                    logger.warning("get_stock_history(%s) 超时或异常 (第%d次)", code, attempt + 1)
-                    self._bs_logged_in = False
-                    if attempt < 2:
-                        time.sleep(2 * (attempt + 1))
-                        continue
-                    return None
+            if result is None:
+                logger.warning("get_stock_history(%s) 超时或异常 (第%d次)", code, attempt + 1)
+                self._bs_logged_in = False
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                return None
 
-                if result.get("error_code") != "0":
-                    logger.warning("get_stock_history(%s) BaoStock 错误: %s", code, result.get("error_code"))
-                    return None
+            if result.get("error_code") != "0":
+                logger.warning("get_stock_history(%s) BaoStock 错误: %s", code, result.get("error_code"))
+                return None
 
-                rows = result.get("rows", [])
-                if not rows:
-                    return None
+            rows = result.get("rows", [])
+            if not rows:
+                return None
 
-                df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"])
-                for col in ["open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"])
+            for col in ["open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-                if len(df) == 0 or df["close"].iloc[-1] <= 0:
-                    return None
+            if len(df) == 0 or df["close"].iloc[-1] <= 0:
+                return None
 
-                self._write_cache(cache_key, df)
-                return df
+            self._write_cache(cache_key, df)
+            return df
 
-            return None
+        return None
 
     def get_batch_history(self, codes, days=120, max_batch=5000):
         """批量获取历史数据（ThreadPoolExecutor 并发加载）"""

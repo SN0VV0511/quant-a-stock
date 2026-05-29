@@ -236,13 +236,13 @@ class QuantHandler(SimpleHTTPRequestHandler):
             scan_time = ""
             for line in lines:
                 if "扫描完成，候选股" in line:
-                    # 提取时间
+                    # 新一轮扫描，重置候选列表
+                    stocks = []
                     parts = line.split(" [INFO] ")
                     if parts:
                         scan_time = parts[0].strip()
                 if "#" in line and "动量=" in line and "得分=" in line:
                     try:
-                        # 解析: #1 华电辽能(600396) 动量=+462.39% 得分=2.3897
                         import re
                         m = re.search(r'#(\d+)\s+(.+?)\((\d+)\)\s+动量=([+\-][\d.]+)%\s+得分=([\d.]+)', line)
                         if m:
