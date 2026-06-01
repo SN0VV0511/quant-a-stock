@@ -4,360 +4,473 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>量化盯盘系统</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
             --bg: #0a0e14; --bg2: #111720; --bg3: #1a2030;
-            --border: #2a3040; --text: #e0e6ed; --text2: #7a8599;
-            --accent: #4a9eff; --green: #00d26a; --red: #ff4757; --yellow: #ffa502;
-            --buy: rgba(0,210,106,0.12); --sell: rgba(255,71,87,0.12);
+            --border: #2a3040; --text: #e6ecf3; --text2: #8b97ab; --text3: #5a6478;
+            --accent: #4a9eff; --accent2: #9b7dff;
+            --green: #00d26a; --red: #ff4d61; --yellow: #ffb028;
+            --buy: rgba(0,210,106,0.14); --sell: rgba(255,77,97,0.14);
+            --radius: 10px; --gap: 10px;
+            --mono: "Fira Code", "SF Mono", "PingFang SC", monospace;
+            --sans: "Fira Sans", "PingFang SC", system-ui, sans-serif;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: "SF Mono", "Fira Code", "PingFang SC", monospace; background: var(--bg); color: var(--text); min-height: 100vh; font-size: 13px; }
+        html { scroll-behavior: smooth; }
+        body { font-family: var(--sans); background: var(--bg); color: var(--text); min-height: 100dvh; font-size: 14px; -webkit-font-smoothing: antialiased; }
+
+        /* Focus accessibility */
+        :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+        button { font-family: inherit; }
+
+        /* Icons */
+        .icon { width: 1em; height: 1em; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vertical-align: -0.125em; flex-shrink: 0; }
+        .icon-lg { width: 18px; height: 18px; }
 
         /* Header */
-        .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; }
-        .header h1 { font-size: 16px; color: var(--accent); letter-spacing: 1px; }
-        .header-right { display: flex; align-items: center; gap: 12px; }
-        .status-pill { display: flex; align-items: center; gap: 6px; background: var(--bg3); padding: 4px 12px; border-radius: 20px; font-size: 11px; color: var(--text2); }
-        .dot { width: 6px; height: 6px; border-radius: 50%; }
+        .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 100; flex-wrap: wrap; }
+        .brand { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 700; color: var(--accent); letter-spacing: 0.5px; }
+        .brand .icon { width: 20px; height: 20px; }
+        .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .status-pill { display: inline-flex; align-items: center; gap: 6px; background: var(--bg3); padding: 5px 10px; border-radius: 16px; font-size: 12px; color: var(--text2); }
+        .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
         .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
         .dot.off { background: var(--red); }
         .dot.idle { background: var(--yellow); }
+        .clock { font-family: var(--mono); font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; }
+        .refresh-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); opacity: 0; transition: opacity .25s; }
+        .refresh-dot.active { opacity: 1; }
 
-        /* Layout */
-        .main { display: grid; grid-template-columns: 320px 1fr 320px; grid-template-rows: auto 1fr; gap: 8px; padding: 8px; height: calc(100vh - 48px); }
-        @media (max-width: 1100px) { .main { grid-template-columns: 1fr; grid-template-rows: auto auto auto auto; height: auto; } }
+        /* Layout grid */
+        .wrap { padding: var(--gap); display: grid; grid-template-columns: repeat(12, 1fr); gap: var(--gap); max-width: 1600px; margin: 0 auto; }
+        .col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; } .col-5 { grid-column: span 5; }
+        .col-6 { grid-column: span 6; } .col-7 { grid-column: span 7; } .col-8 { grid-column: span 8; } .col-12 { grid-column: span 12; }
+        @media (max-width: 1180px) { .col-3,.col-4,.col-5,.col-7,.col-8 { grid-column: span 6; } }
+        @media (max-width: 720px) { .wrap { grid-template-columns: 1fr; } [class^="col-"] { grid-column: 1 / -1; } }
+
+        /* Stats */
+        .stats { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(6, 1fr); gap: var(--gap); }
+        @media (max-width: 1180px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+        @media (max-width: 480px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+        .stat { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+        .stat .label { font-size: 11px; color: var(--text2); letter-spacing: 0.5px; margin-bottom: 5px; }
+        .stat .val { font-size: 22px; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+        .stat .sub { font-size: 11px; color: var(--text2); margin-top: 3px; font-variant-numeric: tabular-nums; }
+        .c-g { color: var(--green); } .c-r { color: var(--red); } .c-n { color: var(--text); } .c-a { color: var(--accent); }
 
         /* Cards */
-        .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-        .card-head { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--text2); display: flex; justify-content: space-between; align-items: center; }
-        .card-body { padding: 10px 12px; }
+        .card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; }
+        .card-head { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; color: var(--text); display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+        .card-head .title { display: flex; align-items: center; gap: 7px; }
+        .card-head .meta { font-size: 11px; color: var(--text2); font-weight: 400; font-variant-numeric: tabular-nums; }
+        .card-body { padding: 12px 14px; }
+        .scroll { overflow-y: auto; }
 
-        /* Stats row */
-        .stats-row { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
-        @media (max-width: 1100px) { .stats-row { grid-template-columns: repeat(3, 1fr); } }
-        .stat { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
-        .stat .label { font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
-        .stat .val { font-size: 20px; font-weight: 700; }
-        .stat .sub { font-size: 11px; color: var(--text2); margin-top: 2px; }
-        .c-g { color: var(--green); } .c-r { color: var(--red); } .c-n { color: var(--text); }
+        /* Buttons */
+        .btn { background: var(--bg3); border: 1px solid var(--border); color: var(--text2); padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 11px; transition: color .2s, border-color .2s, background .2s; }
+        .btn:hover { color: var(--text); border-color: var(--accent); }
+        .btn.active { color: var(--green); border-color: var(--green); }
 
-        /* Tables */
-        table { width: 100%; border-collapse: collapse; }
-        th { padding: 6px 8px; text-align: left; font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
-        td { padding: 7px 8px; font-size: 12px; border-top: 1px solid rgba(42,48,64,0.5); font-variant-numeric: tabular-nums; }
-        tr:hover td { background: rgba(74,158,255,0.04); }
-
-        /* Log panel */
-        .log-panel { grid-column: 2 / 3; display: flex; flex-direction: column; min-height: 0; }
-        .log-content { flex: 1; overflow: auto; padding: 8px 12px; font-size: 11px; line-height: 1.6; font-family: "SF Mono", "Fira Code", monospace; color: var(--text2); }
-        .log-content .log-line { white-space: pre; }
-        .log-content .log-time { color: #555e70; }
-        .log-content .log-info { color: var(--accent); }
-        .log-content .log-warn { color: var(--yellow); }
-        .log-content .log-error { color: var(--red); }
-        .log-content .log-buy { color: var(--green); font-weight: 600; }
-        .log-content .log-sell { color: var(--red); font-weight: 600; }
-        .log-content .log-thread { color: #9b7dff; }
-
-        /* Candidate list */
-        .cand-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid rgba(42,48,64,0.4); }
-        .cand-item:last-child { border-bottom: none; }
-        .cand-rank { font-weight: 700; color: var(--accent); min-width: 24px; text-align: center; font-size: 11px; }
-        .cand-info { flex: 1; margin-left: 8px; }
-        .cand-name { font-size: 12px; font-weight: 500; }
-        .cand-code { font-size: 10px; color: var(--text2); }
-        .cand-price { text-align: right; font-size: 12px; }
-        .cand-mom { font-size: 10px; }
-
-        /* Trade list */
-        .trade-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(42,48,64,0.3); font-size: 11px; }
-        .trade-item:last-child { border-bottom: none; }
-        .trade-badge { padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+        /* Lists */
+        .row-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid rgba(42,48,64,0.5); font-size: 13px; }
+        .row-item:last-child { border-bottom: none; }
+        .rank { font-weight: 700; color: var(--accent); min-width: 22px; text-align: center; font-size: 12px; font-family: var(--mono); }
+        .ri-main { flex: 1; min-width: 0; }
+        .ri-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .ri-sub { font-size: 11px; color: var(--text2); font-variant-numeric: tabular-nums; }
+        .ri-right { text-align: right; font-variant-numeric: tabular-nums; }
+        .ri-right .px { font-size: 13px; }
+        .ri-right .pct { font-size: 11px; }
+        .badge { padding: 1px 7px; border-radius: 5px; font-size: 11px; font-weight: 600; }
         .badge-buy { background: var(--buy); color: var(--green); }
         .badge-sell { background: var(--sell); color: var(--red); }
+        .empty { text-align: center; color: var(--text3); padding: 20px; font-size: 12px; }
+
+        /* Charts */
+        .chart-box { position: relative; width: 100%; }
+        canvas { max-width: 100%; }
+
+        /* Logs */
+        .log-content { flex: 1; overflow: auto; padding: 8px 12px; font-size: 11.5px; line-height: 1.65; font-family: var(--mono); color: var(--text2); }
+        .log-line { white-space: pre-wrap; word-break: break-all; }
+        .log-info { color: var(--accent); } .log-warn { color: var(--yellow); } .log-error { color: var(--red); }
+        .log-buy { color: var(--green); font-weight: 600; } .log-sell { color: var(--red); font-weight: 600; }
+        .log-thread { color: var(--accent2); }
+
+        /* Observation / health */
+        .kv { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; font-size: 12px; }
+        .kv .k { color: var(--text2); } .kv .v { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+        .pill-ok { color: var(--green); } .pill-bad { color: var(--red); }
+        .progress { height: 8px; background: var(--bg3); border-radius: 4px; overflow: hidden; margin-top: 6px; }
+        .progress > span { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width .4s; }
+        .alert { font-size: 11px; padding: 6px 8px; border-radius: 6px; margin-top: 6px; }
+        .alert-bad { background: var(--sell); color: var(--red); }
+        .alert-warn { background: rgba(255,176,40,0.12); color: var(--yellow); }
+
+        /* Backtest table */
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th { padding: 6px 8px; text-align: right; font-size: 11px; color: var(--text2); font-weight: 500; }
+        th:first-child, td:first-child { text-align: left; }
+        td { padding: 7px 8px; border-top: 1px solid rgba(42,48,64,0.5); font-variant-numeric: tabular-nums; font-family: var(--mono); }
 
         /* Scrollbar */
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text3); }
 
-        /* Pulse animation */
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-        .pulse { animation: pulse 2s ease-in-out infinite; }
-
-        /* Refresh indicator */
-        .refresh-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: 0; transition: opacity 0.2s; }
-        .refresh-dot.active { opacity: 1; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; scroll-behavior: auto !important; } }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>⚡ 量化盯盘系统</h1>
+    <!-- SVG icon sprite (Lucide) -->
+    <svg style="display:none" aria-hidden="true">
+        <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+        <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+        <symbol id="i-briefcase" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="7" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></symbol>
+        <symbol id="i-repeat" viewBox="0 0 24 24"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></symbol>
+        <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></symbol>
+        <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+        <symbol id="i-pie" viewBox="0 0 24 24"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></symbol>
+        <symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.31"/><path d="M14 9.3V2"/><path d="M8.5 2h7"/><path d="M14 9.3a6.5 6.5 0 1 1-4 0"/><path d="M5.52 16h12.96"/></symbol>
+        <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></symbol>
+    </svg>
+
+    <header class="header">
+        <div class="brand"><svg class="icon"><use href="#i-bolt"/></svg> 量化盯盘系统</div>
         <div class="header-right">
-            <div class="refresh-dot" id="refresh-dot"></div>
-            <div class="status-pill">
-                <span class="dot" id="dot-live"></span>
-                <span id="txt-live">检测中</span>
-            </div>
-            <div class="status-pill">
-                <span class="dot" id="dot-watch"></span>
-                <span>盯盘线</span>
-            </div>
-            <div class="status-pill">
-                <span class="dot" id="dot-scan"></span>
-                <span>扫描线</span>
-            </div>
-            <span id="clock" style="font-size:11px;color:var(--text2);">--:--:--</span>
+            <span class="refresh-dot" id="refresh-dot" aria-hidden="true"></span>
+            <span class="status-pill"><span class="dot" id="dot-live"></span><span id="txt-live">检测中</span></span>
+            <span class="status-pill"><span class="dot" id="dot-watch"></span>盯盘线</span>
+            <span class="status-pill"><span class="dot" id="dot-scan"></span>扫描线</span>
+            <span class="clock" id="clock" aria-label="当前时间">--:--:--</span>
         </div>
-    </div>
+    </header>
 
-    <div class="main">
-        <!-- 核心指标 -->
-        <div class="stats-row">
-            <div class="stat">
-                <div class="label">总市值</div>
-                <div class="val" id="s-total">--</div>
-                <div class="sub" id="s-pnl">--</div>
-            </div>
-            <div class="stat">
-                <div class="label">可用现金</div>
-                <div class="val" id="s-cash">--</div>
-                <div class="sub" id="s-cash-ratio">--</div>
-            </div>
-            <div class="stat">
-                <div class="label">持仓仓位</div>
-                <div class="val" id="s-pos-ratio">--</div>
-                <div class="sub" id="s-pos-count">--</div>
-            </div>
-            <div class="stat">
-                <div class="label">今日交易</div>
-                <div class="val" id="s-trade-count">--</div>
-                <div class="sub" id="s-last-trade">--</div>
-            </div>
-            <div class="stat">
-                <div class="label">候选股</div>
-                <div class="val" id="s-cand-count">--</div>
-                <div class="sub" id="s-scan-time">--</div>
+    <main class="wrap">
+        <!-- Stats -->
+        <section class="stats" aria-label="核心指标">
+            <div class="stat"><div class="label">总市值</div><div class="val" id="s-total">--</div><div class="sub" id="s-pnl">--</div></div>
+            <div class="stat"><div class="label">可用现金</div><div class="val" id="s-cash">--</div><div class="sub" id="s-cash-ratio">--</div></div>
+            <div class="stat"><div class="label">持仓仓位</div><div class="val" id="s-pos-ratio">--</div><div class="sub" id="s-pos-count">--</div></div>
+            <div class="stat"><div class="label">当前回撤</div><div class="val" id="s-dd">--</div><div class="sub" id="s-dd-sub">峰值回撤</div></div>
+            <div class="stat"><div class="label">今日交易</div><div class="val" id="s-trade-count">--</div><div class="sub" id="s-last-trade">--</div></div>
+            <div class="stat"><div class="label">候选股</div><div class="val" id="s-cand-count">--</div><div class="sub" id="s-scan-time">--</div></div>
+        </section>
+
+        <!-- Equity + drawdown -->
+        <div class="card col-8">
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-trend"/></svg>净值曲线 / 回撤</span><span class="meta" id="equity-meta">--</span></div>
+            <div class="card-body">
+                <div class="chart-box" style="height:200px"><canvas id="equityChart" aria-label="账户净值曲线"></canvas></div>
+                <div class="chart-box" style="height:90px;margin-top:6px"><canvas id="ddChart" aria-label="回撤曲线"></canvas></div>
+                <div class="empty" id="equity-empty" style="display:none">暂无净值数据(运行虚拟盘后生成快照)</div>
             </div>
         </div>
 
-        <!-- 左：候选股 -->
-        <div class="card">
+        <!-- Observation / health -->
+        <div class="card col-4">
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-shield"/></svg>观察期 / 健康检查</span><span class="meta" id="obs-health"></span></div>
+            <div class="card-body scroll" id="obs-body" style="max-height:312px"><div class="empty">加载中...</div></div>
+        </div>
+
+        <!-- Candidates -->
+        <div class="card col-4">
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-search"/></svg>候选股</span><span class="meta" id="cand-time">--</span></div>
+            <div class="card-body scroll" id="cand-list" style="max-height:360px;padding:6px 12px"><div class="empty">等待扫描...</div></div>
+        </div>
+
+        <!-- Logs -->
+        <div class="card col-4">
             <div class="card-head">
-                <span>🔍 候选股 Top30</span>
-                <span id="cand-time" style="font-size:10px;">--</span>
+                <span class="title"><svg class="icon icon-lg"><use href="#i-terminal"/></svg>实时日志</span>
+                <span style="display:flex;gap:6px">
+                    <button class="btn" id="btn-100" aria-label="显示100行" onclick="setLogLines(100,this)">100</button>
+                    <button class="btn" id="btn-300" aria-label="显示300行" onclick="setLogLines(300,this)">300</button>
+                    <button class="btn active" id="btn-auto" aria-label="切换自动滚动" onclick="toggleAutoScroll(this)">自动</button>
+                </span>
             </div>
-            <div class="card-body" style="padding:4px 8px; overflow-y:auto; max-height:calc(100vh - 200px);" id="cand-list">
-                <div style="text-align:center;color:var(--text2);padding:20px;">加载中...</div>
+            <div class="log-content" id="log-content" style="max-height:360px" role="log" aria-live="polite"><div class="empty">加载中...</div></div>
+        </div>
+
+        <!-- Positions + distribution -->
+        <div class="card col-4">
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-briefcase"/></svg>持仓分布</span><span class="meta" id="pos-count">--</span></div>
+            <div class="card-body">
+                <div class="chart-box" style="height:160px"><canvas id="posChart" aria-label="持仓分布饼图"></canvas></div>
+                <div class="scroll" id="pos-list" style="max-height:180px;margin-top:8px"><div class="empty">空仓</div></div>
             </div>
         </div>
 
-        <!-- 中：实时日志 -->
-        <div class="card log-panel">
-            <div class="card-head">
-                <span>📋 实时日志</span>
-                <div style="display:flex;gap:6px;">
-                    <button onclick="logLines=100;loadLogs()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:10px;">100行</button>
-                    <button onclick="logLines=300;loadLogs()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:10px;">300行</button>
-                    <button onclick="logAutoScroll=!logAutoScroll;this.style.color=logAutoScroll?'var(--green)':'var(--text2)'" style="background:var(--bg3);border:1px solid var(--border);color:var(--green);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:10px;">自动滚动</button>
-                </div>
-            </div>
-            <div class="log-content" id="log-content">
-                <div style="text-align:center;padding:20px;">加载中...</div>
-            </div>
+        <!-- Trades -->
+        <div class="card col-4">
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-repeat"/></svg>操作记录</span><span class="meta" id="trade-count">--</span></div>
+            <div class="card-body scroll" id="trade-list" style="max-height:360px;padding:6px 12px"><div class="empty">暂无交易</div></div>
         </div>
 
-        <!-- 右：持仓 + 交易记录 -->
-        <div style="display:flex;flex-direction:column;gap:8px;min-height:0;">
-            <!-- 持仓 -->
-            <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
-                <div class="card-head">
-                    <span>💼 持仓</span>
-                    <span id="pos-count" style="font-size:10px;">--</span>
+        <!-- Backtest A/B -->
+        <div class="card col-12">
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-flask"/></svg>策略回测对比</span><span class="meta" id="bt-meta">--</span></div>
+            <div class="card-body">
+                <div id="bt-content">
+                    <div class="wrap" style="padding:0;gap:var(--gap)">
+                        <div class="col-7" style="grid-column:span 7"><div class="chart-box" style="height:240px"><canvas id="btChart" aria-label="回测净值曲线"></canvas></div></div>
+                        <div class="col-5" style="grid-column:span 5"><div id="bt-table"></div></div>
+                    </div>
                 </div>
-                <div class="card-body" style="flex:1;overflow-y:auto;padding:4px 8px;" id="pos-list">
-                    <div style="text-align:center;color:var(--text2);padding:10px;">加载中...</div>
-                </div>
-            </div>
-            <!-- 交易记录 -->
-            <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;">
-                <div class="card-head">
-                    <span>🔄 操作记录</span>
-                    <span id="trade-count" style="font-size:10px;">--</span>
-                </div>
-                <div class="card-body" style="flex:1;overflow-y:auto;padding:4px 8px;" id="trade-list">
-                    <div style="text-align:center;color:var(--text2);padding:10px;">加载中...</div>
-                </div>
+                <div class="empty" id="bt-empty" style="display:none">暂无回测结果。运行 <code>python -m scripts.strategy_ab</code> 生成对比。</div>
             </div>
         </div>
-    </div>
+    </main>
 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script>
-    let logLines = 100;
-    let logAutoScroll = true;
-    let refreshTimer = null;
+    // ---------- helpers ----------
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const CHARTS_OK = typeof Chart !== 'undefined';
+    if (CHARTS_OK) {
+        Chart.defaults.color = '#8b97ab';
+        Chart.defaults.borderColor = 'rgba(42,48,64,0.6)';
+        Chart.defaults.font.family = "'Fira Code', monospace";
+        Chart.defaults.font.size = 10;
+        Chart.defaults.animation = reduceMotion ? false : { duration: 300 };
+        Chart.defaults.plugins.legend.labels.boxWidth = 10;
+        Chart.defaults.plugins.legend.labels.boxHeight = 10;
+    }
+    const $ = id => document.getElementById(id);
+    const fmt = (n, d=2) => (n == null || isNaN(n)) ? '--' : Number(n).toLocaleString('zh-CN', {minimumFractionDigits:d, maximumFractionDigits:d});
+    const fmtPct = n => (n == null || isNaN(n)) ? '--' : (n >= 0 ? '+' : '') + (n*100).toFixed(2) + '%';
+    const pnlC = n => n > 0 ? 'c-g' : n < 0 ? 'c-r' : 'c-n';
+    const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    const todayStr = () => new Date().toISOString().slice(0,10).replace(/-/g,'');
+    function flash(){ const d=$('refresh-dot'); d.classList.add('active'); setTimeout(()=>d.classList.remove('active'),300); }
 
-    function fmt(n, d=2) { return n == null || isNaN(n) ? '--' : Number(n).toLocaleString('zh-CN', {minimumFractionDigits: d, maximumFractionDigits: d}); }
-    function fmtPct(n) { return n == null || isNaN(n) ? '--' : (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%'; }
-    function pnlC(n) { return n > 0 ? 'c-g' : n < 0 ? 'c-r' : 'c-n'; }
-    function flash() { const d = document.getElementById('refresh-dot'); d.classList.add('active'); setTimeout(() => d.classList.remove('active'), 300); }
+    setInterval(()=>{ $('clock').textContent = new Date().toLocaleTimeString('zh-CN'); }, 1000);
 
-    // Clock
-    setInterval(() => { document.getElementById('clock').textContent = new Date().toLocaleTimeString('zh-CN'); }, 1000);
+    // ---------- charts ----------
+    let equityChart, ddChart, posChart, btChart;
+    const GRID = { grid: { color: 'rgba(42,48,64,0.4)' }, ticks: { maxTicksLimit: 6 } };
 
-    // Status
-    async function loadStatus() {
-        try {
-            const r = await fetch('/api/status');
-            const d = await r.json();
-            const setDot = (id, on) => { const el = document.getElementById(id); el.className = 'dot ' + (on ? 'on' : 'off'); };
-            setDot('dot-live', d.live_runner);
-            setDot('dot-watch', d.watch_thread);
-            setDot('dot-scan', d.scan_thread);
-            document.getElementById('txt-live').textContent = d.live_runner ? '运行中' : '已停止';
-        } catch (e) {}
+    function lineChart(ctx, labels, data, color, fill) {
+        return new Chart(ctx, {
+            type: 'line',
+            data: { labels, datasets: [{ data, borderColor: color, backgroundColor: fill || 'transparent',
+                fill: !!fill, borderWidth: 1.5, pointRadius: 0, tension: 0.25 }] },
+            options: { responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false }, tooltip: { intersect: false, mode: 'index' } },
+                scales: { x: { ...GRID, ticks: { ...GRID.ticks, color: '#5a6478' } }, y: GRID } }
+        });
     }
 
-    // Portfolio
-    async function loadPortfolio() {
+    // ---------- status ----------
+    async function loadStatus(){
         try {
-            const r = await fetch('/api/portfolio');
-            const d = await r.json();
-            document.getElementById('s-total').textContent = '¥' + fmt(d.total_value, 0);
-            document.getElementById('s-total').className = 'val ' + pnlC(d.pnl);
-            document.getElementById('s-pnl').textContent = fmtPct(d.pnl_pct) + ' (' + fmt(d.pnl, 0) + '元)';
-            document.getElementById('s-pnl').className = 'sub ' + pnlC(d.pnl);
-            document.getElementById('s-cash').textContent = '¥' + fmt(d.cash, 0);
-            document.getElementById('s-cash-ratio').textContent = '现金占比 ' + ((1 - d.position_ratio) * 100).toFixed(1) + '%';
-            document.getElementById('s-pos-ratio').textContent = (d.position_ratio * 100).toFixed(1) + '%';
-            document.getElementById('s-pos-count').textContent = d.position_count + ' 只持仓';
-            document.getElementById('pos-count').textContent = d.position_count + ' 只';
+            const d = await (await fetch('/api/status')).json();
+            const setDot=(id,on)=>{ $(id).className='dot '+(on?'on':'off'); };
+            setDot('dot-live', d.live_runner); setDot('dot-watch', d.watch_thread); setDot('dot-scan', d.scan_thread);
+            $('txt-live').textContent = d.live_runner ? '运行中' : '已停止';
+        } catch(e){}
+    }
 
-            const el = document.getElementById('pos-list');
-            if (!d.positions || d.positions.length === 0) {
-                el.innerHTML = '<div style="text-align:center;color:var(--text2);padding:10px;">空仓</div>';
-            } else {
-                el.innerHTML = d.positions.map(p => `
-                    <div class="cand-item">
-                        <div class="cand-info">
-                            <div class="cand-name">${p.name || p.code}</div>
-                            <div class="cand-code">${p.shares}股 · 成本¥${fmt(p.avg_cost,3)}</div>
-                        </div>
-                        <div class="cand-price">
-                            <div>¥${fmt(p.current_price,3)}</div>
-                            <div class="cand-mom ${pnlC(p.profit_pct)}">${fmtPct(p.profit_pct)}</div>
-                        </div>
+    // ---------- portfolio ----------
+    async function loadPortfolio(){
+        try {
+            const d = await (await fetch('/api/portfolio')).json();
+            $('s-total').textContent = '¥'+fmt(d.total_value,0); $('s-total').className='val '+pnlC(d.pnl);
+            $('s-pnl').textContent = fmtPct(d.pnl_pct)+' ('+fmt(d.pnl,0)+'元)'; $('s-pnl').className='sub '+pnlC(d.pnl);
+            $('s-cash').textContent = '¥'+fmt(d.cash,0);
+            $('s-cash-ratio').textContent = '现金占比 '+((1-d.position_ratio)*100).toFixed(1)+'%';
+            $('s-pos-ratio').textContent = (d.position_ratio*100).toFixed(1)+'%';
+            $('s-pos-count').textContent = d.position_count+' 只持仓';
+            $('pos-count').textContent = d.position_count+' 只';
+
+            const list = $('pos-list'), pos = d.positions || [];
+            if (!pos.length){ list.innerHTML='<div class="empty">空仓</div>'; }
+            else {
+                list.innerHTML = pos.map(p=>`
+                    <div class="row-item">
+                        <div class="ri-main"><div class="ri-name">${esc(p.name||p.code)}</div>
+                        <div class="ri-sub">${p.shares}股 · 成本¥${fmt(p.avg_cost,3)}</div></div>
+                        <div class="ri-right"><div class="px">¥${fmt(p.current_price,3)}</div>
+                        <div class="pct ${pnlC(p.profit_pct)}">${fmtPct(p.profit_pct)}</div></div>
                     </div>`).join('');
             }
-        } catch (e) { console.error(e); }
+            drawPosChart(d.cash, pos);
+        } catch(e){ console.error(e); }
     }
 
-    // Trades
-    async function loadTrades() {
-        try {
-            const r = await fetch('/api/trades');
-            const d = await r.json();
-            const trades = (d.trades || []).slice().reverse();
-            document.getElementById('trade-count').textContent = trades.length + ' 条';
-            document.getElementById('s-trade-count').textContent = trades.filter(t => t.date === new Date().toISOString().slice(0,10).replace(/-/g,'')).length;
-            if (trades.length > 0) {
-                const last = trades[0];
-                document.getElementById('s-last-trade').textContent = last.time + ' ' + (last.action === 'buy' ? '买入' : '卖出') + ' ' + last.code;
-            }
-
-            const el = document.getElementById('trade-list');
-            if (trades.length === 0) {
-                el.innerHTML = '<div style="text-align:center;color:var(--text2);padding:10px;">暂无交易</div>';
-            } else {
-                el.innerHTML = trades.slice(0, 30).map(t => `
-                    <div class="trade-item">
-                        <span style="color:var(--text2);font-size:10px;min-width:40px;">${t.time || ''}</span>
-                        <span class="trade-badge ${t.action === 'buy' ? 'badge-buy' : 'badge-sell'}">${t.action === 'buy' ? '买' : '卖'}</span>
-                        <span style="flex:1;">${t.code}</span>
-                        <span>${t.shares}股</span>
-                        <span style="min-width:60px;text-align:right;">¥${fmt(t.price, 3)}</span>
-                    </div>`).join('');
-            }
-        } catch (e) { console.error(e); }
+    const PIE_COLORS = ['#4a9eff','#00d26a','#ffb028','#9b7dff','#ff4d61','#3bd6c6','#ff8a4a','#6c8cff','#c77dff','#7ad65a'];
+    function drawPosChart(cash, pos){
+        if (!CHARTS_OK) return;
+        const labels = ['现金', ...pos.map(p=>p.name||p.code)];
+        const data = [cash, ...pos.map(p=>p.value)];
+        const colors = ['#2a3040', ...pos.map((_,i)=>PIE_COLORS[i%PIE_COLORS.length])];
+        if (posChart){ posChart.data.labels=labels; posChart.data.datasets[0].data=data; posChart.data.datasets[0].backgroundColor=colors; posChart.update(); return; }
+        posChart = new Chart($('posChart'), { type:'doughnut',
+            data:{ labels, datasets:[{ data, backgroundColor: colors, borderColor:'#111720', borderWidth:2 }] },
+            options:{ responsive:true, maintainAspectRatio:false, cutout:'62%',
+                plugins:{ legend:{ position:'right', labels:{ boxWidth:8, font:{size:10} } },
+                tooltip:{ callbacks:{ label:c=>c.label+': ¥'+fmt(c.raw,0) } } } } });
     }
 
-    // Scan / Candidates
-    async function loadCandidates() {
+    // ---------- equity ----------
+    async function loadEquity(){
         try {
-            const r = await fetch('/api/candidates');
-            const d = await r.json();
+            const d = await (await fetch('/api/equity')).json();
+            const pts = d.points || [];
+            if (!pts.length){ $('equity-empty').style.display='block'; return; }
+            $('equity-empty').style.display='none';
+            const labels = pts.map(p=>String(p.t).slice(5,16));
+            const vals = pts.map(p=>p.value);
+            const dds = pts.map(p=> p.drawdown==null?0:-(p.drawdown*100));
+            $('equity-meta').textContent = pts.length+' 个快照';
+            // 当前回撤 stat
+            const lastDd = pts[pts.length-1].drawdown;
+            if (lastDd!=null){ $('s-dd').textContent=(lastDd*100).toFixed(2)+'%'; $('s-dd').className='val '+(lastDd>0.06?'c-r':lastDd>0?'c-n':'c-g'); }
+            if (!CHARTS_OK){ $('equity-meta').textContent='图表库未加载'; return; }
+            if (equityChart){ equityChart.data.labels=labels; equityChart.data.datasets[0].data=vals; equityChart.update(); }
+            else equityChart = lineChart($('equityChart'), labels, vals, '#4a9eff', 'rgba(74,158,255,0.10)');
+            if (ddChart){ ddChart.data.labels=labels; ddChart.data.datasets[0].data=dds; ddChart.update(); }
+            else ddChart = lineChart($('ddChart'), labels, dds, '#ff4d61', 'rgba(255,77,97,0.12)');
+        } catch(e){ console.error(e); }
+    }
+
+    // ---------- candidates ----------
+    async function loadCandidates(){
+        try {
+            const d = await (await fetch('/api/candidates')).json();
             const stocks = d.candidates || [];
-            document.getElementById('cand-time').textContent = d.updated_at || '';
-            document.getElementById('s-cand-count').textContent = stocks.length + ' 只';
-            document.getElementById('s-scan-time').textContent = d.updated_at ? '更新: ' + d.updated_at : '';
-
-            const el = document.getElementById('cand-list');
-            if (stocks.length === 0) {
-                el.innerHTML = '<div style="text-align:center;color:var(--text2);padding:20px;">等待扫描...</div>';
-                return;
-            }
-            el.innerHTML = stocks.map(s => `
-                <div class="cand-item">
-                    <span class="cand-rank">${s.rank}</span>
-                    <div class="cand-info">
-                        <div class="cand-name">${s.name}</div>
-                        <div class="cand-code">${s.code} · 得分 ${s.score.toFixed(4)}</div>
-                    </div>
-                    <div class="cand-price">
-                        <div>${s.current_price ? '¥' + fmt(s.current_price, 2) : '--'}</div>
-                        <div class="cand-mom ${pnlC(s.momentum)}">${fmtPct(s.momentum)}</div>
-                    </div>
+            $('cand-time').textContent = d.updated_at || '--';
+            $('s-cand-count').textContent = stocks.length+' 只';
+            $('s-scan-time').textContent = d.updated_at ? '更新 '+String(d.updated_at).slice(11) : '';
+            const el = $('cand-list');
+            if (!stocks.length){ el.innerHTML='<div class="empty">等待扫描...</div>'; return; }
+            el.innerHTML = stocks.map(s=>`
+                <div class="row-item"><span class="rank">${s.rank}</span>
+                    <div class="ri-main"><div class="ri-name">${esc(s.name)}</div>
+                    <div class="ri-sub">${s.code} · 得分 ${(s.score||0).toFixed(4)}</div></div>
+                    <div class="ri-right"><div class="px">${s.current_price?'¥'+fmt(s.current_price,2):'--'}</div>
+                    <div class="pct ${pnlC(s.momentum)}">${fmtPct(s.momentum)}</div></div>
                 </div>`).join('');
-        } catch (e) { console.error(e); }
+        } catch(e){ console.error(e); }
     }
 
-    // Logs
-    let lastLogHash = '';
-    async function loadLogs() {
+    // ---------- trades ----------
+    async function loadTrades(){
         try {
-            const r = await fetch('/api/logs?lines=' + logLines + '&file=live_today');
-            const d = await r.json();
-            const el = document.getElementById('log-content');
-            const logs = d.logs || [];
+            const d = await (await fetch('/api/trades')).json();
+            const trades = (d.trades||[]).slice().reverse();
+            $('trade-count').textContent = trades.length+' 条';
+            $('s-trade-count').textContent = trades.filter(t=>t.date===todayStr()).length;
+            if (trades.length){ const l=trades[0]; $('s-last-trade').textContent=(l.time||'')+' '+((l.action||l.direction)==='buy'?'买':'卖')+' '+l.code; }
+            const el = $('trade-list');
+            if (!trades.length){ el.innerHTML='<div class="empty">暂无交易</div>'; return; }
+            el.innerHTML = trades.slice(0,40).map(t=>{ const buy=(t.action||t.direction)==='buy'; return `
+                <div class="row-item" style="gap:8px">
+                    <span class="ri-sub" style="min-width:48px">${t.time||''}</span>
+                    <span class="badge ${buy?'badge-buy':'badge-sell'}">${buy?'买':'卖'}</span>
+                    <span class="ri-main ri-name">${t.code}</span>
+                    <span class="ri-sub">${t.shares}股</span>
+                    <span class="ri-right" style="min-width:64px">¥${fmt(t.price,3)}</span>
+                </div>`; }).join('');
+        } catch(e){ console.error(e); }
+    }
 
-            // 用最后3行做指纹，内容没变就不更新DOM
-            const hash = logs.slice(-3).join('|');
-            if (hash === lastLogHash) return;
-            lastLogHash = hash;
+    // ---------- logs ----------
+    let logLines=100, logAutoScroll=true, lastLogHash='';
+    function setLogLines(n,btn){ logLines=n; $('btn-100').classList.toggle('active',n===100); $('btn-300').classList.toggle('active',n===300); loadLogs(); }
+    function toggleAutoScroll(btn){ logAutoScroll=!logAutoScroll; btn.classList.toggle('active',logAutoScroll); }
+    async function loadLogs(){
+        try {
+            const d = await (await fetch('/api/logs?lines='+logLines+'&file=live_today')).json();
+            const logs = d.logs||[], el=$('log-content');
+            const hash = logs.slice(-3).join('|'); if (hash===lastLogHash) return; lastLogHash=hash;
+            el.innerHTML = logs.map(line=>{
+                let cls='';
+                if (line.includes('买入')||line.includes('[买入]')) cls='log-buy';
+                else if (line.includes('卖出')||line.includes('[卖出]')||line.includes('止损')) cls='log-sell';
+                else if (line.includes('[ERROR]')||line.includes('失败')) cls='log-error';
+                else if (line.includes('[WARNING]')||line.includes('警告')) cls='log-warn';
+                else if (line.includes('[INFO]')) cls='log-info';
+                if (line.includes('盯盘线')||line.includes('扫描线')) cls='log-thread';
+                return `<div class="log-line ${cls}">${esc(line)}</div>`;
+            }).join('') || '<div class="empty">暂无日志</div>';
+            if (logAutoScroll) el.scrollTop = el.scrollHeight;
+        } catch(e){ console.error(e); }
+    }
 
-            el.innerHTML = logs.map(line => {
-                let cls = '';
-                if (line.includes('买入') || line.includes('[买入]')) cls = 'log-buy';
-                else if (line.includes('卖出') || line.includes('[卖出]') || line.includes('止损')) cls = 'log-sell';
-                else if (line.includes('[ERROR]') || line.includes('失败')) cls = 'log-error';
-                else if (line.includes('[WARNING]') || line.includes('警告')) cls = 'log-warn';
-                else if (line.includes('[INFO]')) cls = 'log-info';
-                if (line.includes('盯盘线') || line.includes('扫描线')) cls = 'log-thread';
-                // 高亮时间戳
-                const safe = line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
-                return `<div class="log-line ${cls}">${safe}</div>`;
-            }).join('');
-
-            if (logAutoScroll) {
-                el.scrollTop = el.scrollHeight;
+    // ---------- observation ----------
+    async function loadObservation(){
+        try {
+            const d = await (await fetch('/api/observation')).json();
+            const h=d.health||{}, r=d.review||{}, a=d.acceptance||{};
+            const ok = h.ok!==false && (!h.failures || !h.failures.length);
+            $('obs-health').innerHTML = ok ? '<span class="pill-ok">● 健康</span>' : '<span class="pill-bad">● 异常</span>';
+            const snapDays = a.snapshot_days||0, need = a.required_snapshot_days||20;
+            const pct = Math.min(100, Math.round(snapDays/need*100));
+            let html = `<div class="kv">
+                <span class="k">健康检查</span><span class="v ${ok?'pill-ok':'pill-bad'}">${ok?'通过':'有失败项'}</span>
+                <span class="k">QMT 验收</span><span class="v ${a.ready_for_qmt_dry_run?'pill-ok':'pill-bad'}">${a.ready_for_qmt_dry_run?'就绪':'未就绪'}</span>
+              </div>
+              <div style="font-size:11px;color:var(--text2);margin-top:10px">观察期进度 ${snapDays}/${need} 个快照日</div>
+              <div class="progress"><span style="width:${pct}%"></span></div>`;
+            if (r && r.total_return!=null){
+                html += `<div style="font-size:11px;color:var(--text2);margin:12px 0 4px">近 ${r.days||30} 日复盘</div>
+                  <div class="kv">
+                    <span class="k">总收益</span><span class="v ${pnlC(r.total_return)}">${fmtPct(r.total_return)}</span>
+                    <span class="k">最大回撤</span><span class="v">${fmtPct(r.max_drawdown)}</span>
+                    <span class="k">胜率</span><span class="v">${(r.win_rate*100||0).toFixed(0)}%</span>
+                    <span class="k">交易笔数</span><span class="v">${r.trade_count||0}</span>
+                  </div>`;
             }
-        } catch (e) { console.error(e); }
+            (h.failures||[]).slice(0,3).forEach(f=> html+=`<div class="alert alert-bad">✕ ${esc(f)}</div>`);
+            (a.failures||[]).slice(0,2).forEach(f=> html+=`<div class="alert alert-warn">! ${esc(f)}</div>`);
+            $('obs-body').innerHTML = html;
+        } catch(e){ $('obs-body').innerHTML='<div class="empty">观察期状态不可用</div>'; }
     }
 
-    // Main loop
-    function refresh() {
-        flash();
-        loadStatus();
-        loadPortfolio();
-        loadTrades();
-        loadCandidates();
-        loadLogs();
+    // ---------- backtest ----------
+    const BT_COLORS = ['#4a9eff','#00d26a','#ffb028','#9b7dff'];
+    async function loadBacktest(){
+        try {
+            const d = await (await fetch('/api/backtest')).json();
+            if (!d.available || !d.series || !d.series.length){ $('bt-content').style.display='none'; $('bt-empty').style.display='block'; return; }
+            $('bt-empty').style.display='none'; $('bt-content').style.display='block';
+            $('bt-meta').textContent = (d.window||'') + ' · ' + (d.generated_at||'');
+            // table
+            const M=[['总收益','total_return',1],['年化','annual_return',1],['最大回撤','max_drawdown',1],['夏普','sharpe_ratio',0],['卡尔玛','calmar_ratio',0],['胜率','win_rate',1],['交易数','total_trades',0]];
+            let th='<tr><th>策略</th>'+M.map(m=>`<th>${m[0]}</th>`).join('')+'</tr>';
+            let rows=d.series.map((s,i)=>{ const m=s.metrics||{};
+                return `<tr><td style="color:${BT_COLORS[i%BT_COLORS.length]}">${esc(s.name)}</td>`+
+                    M.map(c=>{ const v=m[c[1]]; const txt=c[2]?fmtPct(v):(v==null?'--':v);
+                    const cls=(c[1]==='total_return'||c[1]==='annual_return'||c[1]==='sharpe_ratio')?pnlC(v):'';
+                    return `<td class="${cls}">${txt}</td>`; }).join('')+'</tr>'; }).join('');
+            $('bt-table').innerHTML = `<table>${th}${rows}</table>
+                <div style="font-size:11px;color:var(--text3);margin-top:8px">注:回测含幸存者偏差,绝对收益偏乐观,看相对优劣。</div>`;
+            // chart (normalize each series to % return from start)
+            if (CHARTS_OK){
+                const base = d.series[0].equity.map(e=>String(e.date).slice(4));
+                const datasets = d.series.map((s,i)=>{ const v0=s.equity[0]?s.equity[0].value:1;
+                    return { label:s.name, data:s.equity.map(e=>((e.value/v0-1)*100)), borderColor:BT_COLORS[i%BT_COLORS.length],
+                        backgroundColor:'transparent', borderWidth:1.6, pointRadius:0, tension:0.2 }; });
+                if (btChart){ btChart.data.labels=base; btChart.data.datasets=datasets; btChart.update(); }
+                else btChart = new Chart($('btChart'), { type:'line', data:{ labels:base, datasets },
+                    options:{ responsive:true, maintainAspectRatio:false,
+                        plugins:{ legend:{ display:true, position:'top' }, tooltip:{ intersect:false, mode:'index', callbacks:{ label:c=>c.dataset.label+': '+c.raw.toFixed(1)+'%' } } },
+                        scales:{ x:{ ...GRID, ticks:{ maxTicksLimit:8, color:'#5a6478' } }, y:{ ...GRID, ticks:{ callback:v=>v+'%' } } } } });
+            }
+        } catch(e){ console.error(e); $('bt-content').style.display='none'; $('bt-empty').style.display='block'; }
     }
 
-    refresh();
-    // 5秒刷新一次
-    refreshTimer = setInterval(refresh, 5000);
+    // ---------- loop ----------
+    function fast(){ flash(); loadStatus(); loadPortfolio(); loadTrades(); loadCandidates(); loadLogs(); loadEquity(); }
+    function slow(){ loadObservation(); loadBacktest(); }
+    fast(); slow();
+    setInterval(fast, 5000);
+    setInterval(slow, 60000);
     </script>
 </body>
 </html>

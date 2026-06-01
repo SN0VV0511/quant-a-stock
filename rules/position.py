@@ -3,9 +3,11 @@
 JSON 持久化，支持买入、卖出、T+1 检查、仓位限制等
 """
 
+import contextlib
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime
 
 from config.settings import (
@@ -101,6 +103,7 @@ class PositionManager:
                 "avg_cost": round(actual_price, 4),
                 "buy_date": date,
                 "strategy": strategy,
+                "peak_price": round(actual_price, 4),
             }
 
         # 扣除现金
@@ -233,7 +236,7 @@ class PositionManager:
         return self.state["cash"]
 
     def update_prices(self, current_prices):
-        """更新持仓当前价格。
+        """更新持仓当前价格,并维护持仓期间最高价(供移动止损)。
 
         Args:
             current_prices: dict {code: price}
@@ -242,7 +245,12 @@ class PositionManager:
             return
         for code, pos in self.state["positions"].items():
             if code in current_prices:
-                pos["current_price"] = current_prices[code]
+                price = current_prices[code]
+                pos["current_price"] = price
+                # 维护峰值价:取历史峰值、成本、当前价三者最大,兼容旧状态文件
+                prev_peak = pos.get("peak_price", pos.get("avg_cost", price))
+                if price and price > 0:
+                    pos["peak_price"] = max(prev_peak, price)
         self.state["updated_at"] = datetime.now().strftime("%Y%m%d %H:%M:%S")
 
     def get_total_value(self, current_prices=None):
@@ -400,10 +408,28 @@ class PositionManager:
         return round((today_value - prev_value) / prev_value, 4)
 
     def save(self):
-        """保存状态到文件"""
+        """原子保存状态到文件。
+
+        先写入同目录临时文件再 ``os.replace`` 原子替换,避免进程在写入
+        ``portfolio_state.json`` 中途崩溃时损坏关键持仓状态文件,也避免
+        Web 仪表盘读取到写了一半的半截 JSON。``os.replace`` 在 POSIX 和
+        Windows 上均保证同卷内的原子重命名。
+        """
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-        with open(self.state_file, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, ensure_ascii=False, indent=2)
+        # 临时文件与目标同目录,确保 os.replace 在同一文件系统内原子生效
+        dir_name = os.path.dirname(self.state_file)
+        fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=dir_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())  # 落盘后再替换,防止替换后内容仍在缓存丢失
+            os.replace(tmp_path, self.state_file)
+        except Exception:
+            # 写入失败时清理临时文件,避免残留 *.tmp
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+            raise
 
     def load(self):
         """从文件加载状态"""
@@ -482,6 +508,7 @@ class PositionManager:
             pos.setdefault("strategy", "legacy")
             pos.setdefault("buy_date", datetime.now().strftime("%Y%m%d"))
             pos.setdefault("current_price", pos.get("avg_cost", 0))
+            pos.setdefault("peak_price", pos.get("avg_cost", 0))
 
     def _append_trade_log(self, trade):
         """同步追加 Web 仪表盘读取的交易流水。"""

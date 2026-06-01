@@ -8,18 +8,29 @@ MA + RSI 组合确认策略
 import pandas as pd
 import numpy as np
 
+from config.settings import (
+    MA_SHORT,
+    MA_LONG,
+    RSI_OVERBOUGHT,
+    RSI_OVERSOLD,
+    RSI_MOMENTUM_MAX,
+    MOMENTUM_CHASE_GAP,
+)
+
 
 class ComboSignalStrategy:
     """MA + RSI 组合策略"""
 
-    def __init__(self, ma_short=5, ma_long=20, rsi_period=14, rsi_oversold=35, rsi_overbought=70):
+    def __init__(self, ma_short=MA_SHORT, ma_long=MA_LONG, rsi_period=14,
+                 rsi_oversold=RSI_OVERSOLD, rsi_overbought=RSI_OVERBOUGHT):
         self.ma_short = ma_short
         self.ma_long = ma_long
         self.rsi_period = rsi_period
         self.rsi_oversold = rsi_oversold
         self.rsi_overbought = rsi_overbought
-        # 动量追涨模式：RSI 上限放宽
-        self.rsi_momentum_max = 85
+        # 动量追涨模式:RSI 上限放宽、价差阈值(均从 config 读取,便于回测调参)
+        self.rsi_momentum_max = RSI_MOMENTUM_MAX
+        self.momentum_chase_gap = MOMENTUM_CHASE_GAP
         self.name = f"MA{ma_short}/{ma_long}+RSI{rsi_period}"
 
     def calc_rsi(self, series, period=14):
@@ -106,10 +117,10 @@ class ComboSignalStrategy:
                 "ma_long": round(ma_l, 2),
             }
 
-        # 动量追涨模式：MA5>MA20 且价差>10% + RSI 未极端超买
+        # 动量追涨模式：MA5>MA20 且价差>阈值 + RSI 未极端超买
         if (last["signal"] != -1 and
             ma_s > ma_l and
-            (ma_s - ma_l) / ma_l > 0.10 and
+            (ma_s - ma_l) / ma_l > self.momentum_chase_gap and
             self.rsi_oversold < rsi_val < self.rsi_momentum_max and
             close > ma_l):  # 至少站上长均线
             return {

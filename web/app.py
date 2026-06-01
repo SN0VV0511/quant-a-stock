@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (
     INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR,
-    normalize_a_share_code,
+    SNAPSHOT_LOG_FILE, normalize_a_share_code,
 )
 from data.ak_loader import AKDataLoader
 from scripts.paper_status import build_status
@@ -145,6 +145,8 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "/api/status": lambda: self._json_response(self._api_status()),
             "/api/observation": lambda: self._json_response(self._api_observation()),
             "/api/candidates": lambda: self._json_response(self._api_candidates()),
+            "/api/equity": lambda: self._json_response(self._api_equity()),
+            "/api/backtest": lambda: self._json_response(self._api_backtest()),
         }
 
         handler = routes.get(path)
@@ -355,6 +357,61 @@ class QuantHandler(SimpleHTTPRequestHandler):
     def _api_observation(self):
         """虚拟盘观察期统一状态。"""
         return asdict(build_status(ROOT_DIR, log_lines=30))
+
+    def _api_equity(self):
+        """净值曲线与回撤序列。
+
+        优先读账户快照流水 portfolio_snapshots.jsonl(含时间戳与回撤),
+        为空时回退到 state 的 daily_snapshots(仅日期与总市值)。
+        """
+        points = []
+        if os.path.exists(SNAPSHOT_LOG_FILE):
+            try:
+                with open(SNAPSHOT_LOG_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        s = obj.get("summary", {})
+                        points.append({
+                            "t": obj.get("timestamp") or obj.get("date", ""),
+                            "value": s.get("total_value"),
+                            "drawdown": s.get("drawdown", 0),
+                        })
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("读取快照流水失败: %s", exc)
+
+        if not points:
+            state = load_state()
+            daily = state.get("daily_snapshots", {})
+            peak = INITIAL_CAPITAL
+            for date in sorted(daily.keys()):
+                val = daily[date].get("total_value")
+                if val is None:
+                    continue
+                peak = max(peak, val)
+                points.append({
+                    "t": date,
+                    "value": val,
+                    "drawdown": round((peak - val) / peak, 4) if peak > 0 else 0,
+                })
+
+        return {"points": points, "initial": INITIAL_CAPITAL}
+
+    def _api_backtest(self):
+        """读取最近一次回测结果(由回测脚本写入 reports/backtest_latest.json)。"""
+        path = os.path.join(REPORT_DIR, "backtest_latest.json")
+        if not os.path.exists(path):
+            return {"available": False}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["available"] = True
+            return data
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("读取回测结果失败: %s", exc)
+            return {"available": False, "error": str(exc)}
 
     def _api_reports(self):
         return {"reports": load_reports()}

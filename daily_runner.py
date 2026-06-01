@@ -5,7 +5,6 @@
 
 import os
 import sys
-import logging
 from datetime import datetime, timedelta
 
 # 添加项目根目录到 sys.path
@@ -25,18 +24,14 @@ from strategies.stock_selection import MainboardStockStrategy
 from strategies.market_scanner import MarketScanner
 from reports.generator import ReportGenerator
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(
-            os.path.join(os.path.dirname(__file__), "logs", "daily_runner.log"),
-            encoding="utf-8",
-        ),
-    ],
+from config.logging_setup import setup_logger
+
+# 复用统一日志配置:daily_runner.log 为累计日志,启用大小轮转
+logger = setup_logger(
+    "daily_runner",
+    rotating_files=("daily_runner.log",),
+    fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("daily_runner")
 
 
 class DailyRunner:

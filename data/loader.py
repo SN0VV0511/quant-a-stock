@@ -130,19 +130,23 @@ class DataLoader:
         end_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
         code_bs = to_baostock_code(code)
 
-        cache_key = {"start": start_date, "end": end_date, "adj": adjust_flag}
-
-        if use_cache and self._is_cache_valid("daily", code_bs, **cache_key):
-            return self._load_cache("daily", code_bs, **cache_key)
-
-        self._login()
-
         if fields is None:
             fields_list = "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg"
         elif isinstance(fields, list):
             fields_list = ",".join(fields)
         else:
             fields_list = fields
+
+        # 缓存键纳入字段签名:不同字段集对应不同数据,不能共用同一缓存文件,
+        # 否则请求扩展字段(如 pbMRQ/isST)时会命中只含默认字段的旧缓存。
+        import hashlib
+        fields_tag = hashlib.md5(fields_list.encode("utf-8")).hexdigest()[:6]
+        cache_key = {"start": start_date, "end": end_date, "adj": adjust_flag, "f": fields_tag}
+
+        if use_cache and self._is_cache_valid("daily", code_bs, **cache_key):
+            return self._load_cache("daily", code_bs, **cache_key)
+
+        self._login()
 
         rs = bs.query_history_k_data_plus(
             code_bs, fields_list,

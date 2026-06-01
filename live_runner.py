@@ -29,16 +29,21 @@ from config.settings import (  # noqa: E402
     INITIAL_CAPITAL,
     LIVE_SCAN_INTERVAL_SECONDS,
     LIVE_WATCH_INTERVAL_SECONDS,
-    LOG_DIR,
     LOT_SIZE,
     MAX_SINGLE_STOCK,
     REPORT_DIR,
+    ENABLE_MARKET_REGIME,
+    MARKET_INDEX_CODE,
+    MARKET_REGIME_MA,
     normalize_a_share_code,
 )
+from config.logging_setup import setup_logger  # noqa: E402
 from data.ak_loader import AKDataLoader  # noqa: E402
 from data.holidays import is_trading_day as is_calendar_trading_day  # noqa: E402
 from risk.control import RiskController  # noqa: E402
 from strategies.combo_signal import ComboSignalStrategy  # noqa: E402
+from strategies.exit_rules import evaluate_exit  # noqa: E402
+from strategies.market_regime import is_risk_on  # noqa: E402
 from strategies.market_scanner import MarketScanner  # noqa: E402
 from trading.brokers import PaperBrokerAdapter, create_broker  # noqa: E402
 from trading.models import ExecutionReport, OrderIntent, RiskDecision  # noqa: E402
@@ -46,23 +51,15 @@ from trading.observability import EventRecorder  # noqa: E402
 
 
 def _setup_logger() -> logging.Logger:
-    """初始化实时运行日志。"""
-    os.makedirs(LOG_DIR, exist_ok=True)
-    logger = logging.getLogger("live_runner")
-    logger.setLevel(logging.INFO)
-    if logger.handlers:
-        return logger
+    """初始化实时运行日志。
 
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s")
-    for filename in ("live.log", "live_today.log"):
-        handler = logging.FileHandler(os.path.join(LOG_DIR, filename), encoding="utf-8")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-    logger.addHandler(console)
-    return logger
+    ``live.log`` 为累计日志,使用轮转避免无限增长;``live_today.log`` 为当日日志。
+    """
+    return setup_logger(
+        "live_runner",
+        rotating_files=("live.log",),
+        plain_files=("live_today.log",),
+    )
 
 
 logger = _setup_logger()
@@ -80,6 +77,7 @@ class SharedState:
         self.rejected_exits: dict[str, float] = {}
         self.last_scan_time: datetime | None = None
         self.scanning = False
+        self.risk_on = True  # 大盘择时状态,由扫描线程刷新
 
     def update(self, stocks: list[dict[str, Any]]) -> None:
         """更新候选股池。"""
@@ -119,6 +117,16 @@ class SharedState:
         with self._lock:
             self.scanning = value
 
+    def is_risk_on(self) -> bool:
+        """读取大盘择时状态(risk-off 时暂停开新仓)。"""
+        with self._lock:
+            return self.risk_on
+
+    def set_risk_on(self, value: bool) -> None:
+        """设置大盘择时状态。"""
+        with self._lock:
+            self.risk_on = value
+
     def is_exit_cooling_down(self, code: str) -> bool:
         """判断卖出拒单是否仍处于冷却期。"""
         with self._lock:
@@ -137,6 +145,18 @@ def normalize_code(code: str) -> str:
     except ValueError:
         logger.warning("忽略无法归一化的非沪深 A 股代码: %s", code)
         return str(code).strip().lower()
+
+
+def _holding_days(buy_date: str | None, today: str) -> int:
+    """计算持仓自然日数(用于时间止损),解析失败返回 0。"""
+    if not buy_date:
+        return 0
+    try:
+        d0 = datetime.strptime(str(buy_date), "%Y%m%d")
+        d1 = datetime.strptime(str(today), "%Y%m%d")
+        return max(0, (d1 - d0).days)
+    except (ValueError, TypeError):
+        return 0
 
 
 def is_trading_day(date_str: str | None = None) -> bool:
@@ -306,7 +326,7 @@ def _handle_position_exits(
     shared: SharedState | None = None,
     combo: ComboSignalStrategy | None = None,
 ) -> None:
-    """处理持仓止损/止盈。"""
+    """处理持仓止损/止盈(策略卖出 / 硬止损 / 移动止损 / 时间止损 / 止盈)。"""
     today = datetime.now().strftime("%Y%m%d")
     for code, pos in positions.items():
         if shared is not None and shared.is_exit_cooling_down(code):
@@ -318,70 +338,50 @@ def _handle_position_exits(
         if current <= 0 or avg_cost <= 0 or shares <= 0:
             continue
 
-        pnl_pct = (current - avg_cost) / avg_cost
-
-        # 策略信号检查（RSI超买/死叉等）
+        # 汇总退出判定所需输入:Combo 信号、MA20、峰值价、持有天数
+        combo_sell = False
+        combo_reason = ""
+        ma20 = None
         if combo is not None:
             try:
                 hist = loader.get_stock_data(normalize_code(code), days=60)
                 if hist is not None and len(hist) > 25:
                     sig = combo.check_realtime(hist)
-                    if sig.get("signal") == "sell":
-                        order = OrderIntent(
-                            code=code,
-                            name=str(pos.get("name", code)),
-                            action="sell",
-                            price=float(current),
-                            shares=shares,
-                            date=today,
-                            strategy="策略卖出",
-                            reason=sig.get("reason", "策略信号"),
-                            source="watch_thread",
-                        )
-                        _submit_exit_order(
-                            order, broker, risk_ctrl, market_data, recorder, shared
-                        )
-                        continue
+                    combo_sell = sig.get("signal") == "sell"
+                    combo_reason = sig.get("reason", "策略信号")
+                if hist is not None and len(hist) >= 20:
+                    ma20 = float(pd.to_numeric(hist["close"], errors="coerce").tail(20).mean())
             except Exception as exc:
-                logger.warning(
-                    "持仓卖出策略信号检查失败: %s %s", code, exc, exc_info=True
-                )
+                logger.warning("持仓退出信号检查失败: %s %s", code, exc, exc_info=True)
 
-        if pnl_pct <= -0.07:
-            order = OrderIntent(
-                code=code,
-                name=str(pos.get("name", code)),
-                action="sell",
-                price=float(current),
-                shares=shares,
-                date=today,
-                strategy="止损",
-                reason=f"盘中止损，亏损 {pnl_pct:.2%}",
-                source="watch_thread",
-            )
-            _submit_exit_order(order, broker, risk_ctrl, market_data, recorder, shared)
+        peak_price = float(pos.get("peak_price", avg_cost) or avg_cost)
+        holding_days = _holding_days(pos.get("buy_date"), today)
+
+        decision = evaluate_exit(
+            avg_cost=avg_cost,
+            price=float(current),
+            peak_price=peak_price,
+            ma20=ma20,
+            holding_days=holding_days,
+            combo_sell=combo_sell,
+            combo_reason=combo_reason,
+        )
+        if decision is None:
             continue
 
-        if pnl_pct >= 0.10:
-            hist = loader.get_stock_data(normalize_code(code), days=30)
-            if hist is None or len(hist) < 20:
-                continue
-            ma20 = pd.to_numeric(hist["close"], errors="coerce").tail(20).mean()
-            if current < ma20:
-                order = OrderIntent(
-                    code=code,
-                    name=str(pos.get("name", code)),
-                    action="sell",
-                    price=float(current),
-                    shares=shares,
-                    date=today,
-                    strategy="止盈",
-                    reason=f"盘中止盈，盈利 {pnl_pct:.2%} 且跌破 MA20",
-                    source="watch_thread",
-                )
-                _submit_exit_order(
-                    order, broker, risk_ctrl, market_data, recorder, shared
-                )
+        strategy, reason = decision
+        order = OrderIntent(
+            code=code,
+            name=str(pos.get("name", code)),
+            action="sell",
+            price=float(current),
+            shares=shares,
+            date=today,
+            strategy=strategy,
+            reason=reason,
+            source="watch_thread",
+        )
+        _submit_exit_order(order, broker, risk_ctrl, market_data, recorder, shared)
 
 
 def _submit_exit_order(
@@ -411,6 +411,11 @@ def _handle_candidate_entries(
 ) -> None:
     """处理候选股买入信号。"""
     today = datetime.now().strftime("%Y%m%d")
+
+    # 大盘择时:系统性下跌期暂停开新仓,只保留持仓退出
+    if not shared.is_risk_on():
+        return
+
     positions = broker.query_positions()
     position_norms = {normalize_code(code) for code in positions}
     stocks = shared.get_stocks()
@@ -549,6 +554,9 @@ def _do_scan(
                 if df is not None:
                     shared.update_hist(stock["code"], df)
                 time.sleep(0.05)
+
+            # 刷新大盘择时状态:指数跌破均线则暂停开新仓
+            _refresh_market_regime(hist_loader, shared, recorder)
         finally:
             hist_loader.close()
 
@@ -557,6 +565,27 @@ def _do_scan(
         recorder.record("scan_failed", {"error": str(exc)})
     finally:
         shared.set_scanning(False)
+
+
+def _refresh_market_regime(
+    loader: AKDataLoader,
+    shared: SharedState,
+    recorder: EventRecorder,
+) -> None:
+    """根据基准指数刷新大盘择时状态。取数失败时保持放行(risk-on)。"""
+    if not ENABLE_MARKET_REGIME:
+        shared.set_risk_on(True)
+        return
+    try:
+        index_df = loader.get_index_history(MARKET_INDEX_CODE, days=MARKET_REGIME_MA + 40)
+        risk_on = is_risk_on(index_df, ma_period=MARKET_REGIME_MA)
+        shared.set_risk_on(risk_on)
+        if not risk_on:
+            logger.info("大盘择时: %s 跌破 MA%d,暂停开新仓", MARKET_INDEX_CODE, MARKET_REGIME_MA)
+        recorder.record("market_regime", {"index": MARKET_INDEX_CODE, "risk_on": risk_on})
+    except Exception as exc:
+        logger.warning("大盘择时刷新失败,默认放行: %s", exc)
+        shared.set_risk_on(True)
 
 
 def _generate_report(

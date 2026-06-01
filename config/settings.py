@@ -47,6 +47,64 @@ CASH_BUFFER = 0.10          # 现金缓冲 10%
 DAILY_LOSS_THRESHOLD = 0.025    # 单日最大亏损 2.5% 触发降仓
 MAX_DRAWDOWN_THRESHOLD = 0.06   # 最大回撤 6% 暂停开仓
 
+# ==================== 策略参数(集中管理,便于回测调参) ====================
+# 择时:止损止盈(live_runner 持仓退出逻辑读取)
+STOP_LOSS_PCT = 0.07            # 固定止损线:亏损达 7% 离场
+TAKE_PROFIT_PCT = 0.10          # 止盈触发线:盈利达 10% 且跌破 MA20 离场
+TRAILING_STOP_PCT = 0.08        # 移动止损:自持仓最高点回撤 8% 离场
+TRAILING_ACTIVATE_PCT = 0.05    # 移动止损激活线:峰值相对成本盈利达 5% 后才启用,避免买入即被噪声扫出
+ENABLE_TRAILING_STOP = True     # 是否启用移动止损
+TIME_STOP_DAYS = 0              # 时间止损:持有(自然日)达此值且仍不达预期则清仓;0=禁用
+TIME_STOP_MIN_PROFIT = 0.0      # 时间止损的"达标"盈亏阈值,低于此值才触发
+
+# 择时:大盘择时(系统性风险过滤)
+# 回测结论(scripts/ab_backtest.py,2023~2025 与 2024H2 两段):简单的"价格≥MA20"择时
+# 在弱市与 V 型反弹窗口均跑输基线——A 股反弹多为急拉,该过滤入场滞后、错过主升段且
+# 把交易数砍半。因此默认关闭,功能保留待改进(如改用 MA20<MA60 且下行的更严判据)。
+ENABLE_MARKET_REGIME = False    # 指数处于弱势(收盘价跌破其 MA)时暂停开新仓,只允许卖出/止损
+MARKET_INDEX_CODE = "sh000300"  # 基准指数:沪深300
+MARKET_REGIME_MA = 20           # 大盘择时均线周期
+
+# 择时:ComboSignal 动量追涨参数
+MOMENTUM_CHASE_GAP = 0.10       # MA 短长价差超过此值视为强势趋势,放宽 RSI 上限追涨
+RSI_MOMENTUM_MAX = 85           # 动量追涨模式下的 RSI 上限
+RSI_OVERBOUGHT = 70             # RSI 超买线
+RSI_OVERSOLD = 35               # RSI 超卖线(脱离超卖区下限)
+
+# 选股:全市场扫描粗筛阈值
+SCAN_MIN_PRICE = 5.0            # 最低股价(元),排除低价股
+SCAN_MIN_VOLUME = 1_000_000    # 实时成交量下限(股),排除僵尸股
+SCAN_MIN_AVG_VOLUME = 500_000  # 20 日均量下限(股)
+SCAN_LIMIT_PCT = 9.8           # 实时涨跌幅绝对值达此值视为涨跌停,剔除
+SCAN_MAX_HIST_FETCH = 2000     # 粗筛后最多拉取历史数据的标的数量
+
+# 选股:横截面动量打分权重(对 z-score 标准化后的因子加权)
+# 历史问题:旧版直接用 动量*0.5 + 短动量*0.3 - 年化波动率*0.2,三者量纲不一致,
+# 波动率项(年化 0.3~0.6)长期压制动量项(0.1~0.5),导致打分偏向低波动而非高动量。
+# 现改为先做横截面 z-score 标准化再加权,消除量纲差异。
+SCORE_WEIGHT_MOMENTUM = 0.5     # 60 日动量权重
+SCORE_WEIGHT_MOMENTUM_20 = 0.3  # 20 日动量权重
+SCORE_WEIGHT_VOLATILITY = 0.2   # 波动率惩罚权重(从得分中减去)
+
+# ==================== 小市值价值策略参数 ====================
+# 依据:A股价格动量长期负 IC(短期反转主导),真正有效的是小市值 + 低估值 + 短期反转。
+# 2024「国九条」退市新规后,必须叠加严格风控过滤,规避退市/ST/面值/财务风险。
+# 调仓:周度(每 5 个交易日)。仓位:等权,持有 SMALLCAP_TOP_N 只。
+SMALLCAP_TOP_N = 12              # 持仓数量(等权)
+SMALLCAP_REBALANCE_DAYS = 5     # 调仓周期(交易日),5≈周度
+# "折中:小市值为主"——设市值下限规避最小微盘(国九条退市/流动性高风险区),设上限保持小盘暴露
+SMALLCAP_MIN_MKTCAP = 20e8      # 流通市值下限(元),约 20 亿,排除最小微盘
+SMALLCAP_MAX_MKTCAP = 200e8     # 流通市值上限(元),约 200 亿,保持小盘风格
+# 因子权重(对横截面分位 rank 加权,小市值为主)
+SMALLCAP_W_SIZE = 0.5           # 小市值(市值越小越优)
+SMALLCAP_W_PB = 0.25            # 低估值(PB 越低越优)
+SMALLCAP_W_REVERSAL = 0.25      # 短期反转(过去 N 日跌得多者下期反弹)
+SMALLCAP_REVERSAL_DAYS = 20     # 短期反转回看天数
+# 国九条风控过滤阈值
+SMALLCAP_MIN_PRICE = 2.0        # 最低股价(元),缓冲 1 元面值退市风险
+SMALLCAP_MIN_PB = 0.0           # PB 必须为正(净资产为负有退市风险)
+
+
 # ==================== 默认标的池 ====================
 # ETF 动量轮动标的（BaoStock 不支持 ETF，暂用宽基指数成分股代替）
 # 待接入 Tushare/AKShare 后替换为真实 ETF
@@ -114,8 +172,16 @@ def get_all_codes():
 
 
 def is_etf(code):
-    """判断是否为 ETF（当前用股票代替，始终返回 False）"""
-    # TODO: 接入真实 ETF 数据源后恢复
+    """判断是否为 ETF。
+
+    当前系统**仅交易沪深 A 股股票**,不交易 ETF,因此本函数有意恒返回 False。
+    这意味着 risk/control、rules/engine、rules/position 中所有 ETF 专属分支
+    (3bp 滑点、单票上限 45%、ETF 印花税豁免)目前都不会生效——这是当前
+    标的范围下的预期行为,并非遗漏。
+
+    中期 TODO:接入真实 ETF 数据源后,按代码前缀实现真正判断
+    (沪市 ETF:51/56/58 开头;深市 ETF:15 开头),并恢复上述分支。
+    """
     return False
 
 

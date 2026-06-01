@@ -82,11 +82,34 @@ def cmd_query_history(bs_code, start, end):
     return {"error_code": rs.error_code, "rows": rows}
 
 
+# 扩展字段:含换手率/估值/ST/停牌,供小市值价值选股使用
+EXT_FIELDS = "date,open,high,low,close,volume,amount,turn,peTTM,pbMRQ,isST,tradestatus,pctChg"
+
+
+def cmd_query_history_ext(bs_code, start, end):
+    """查询扩展字段历史(含 turn/peTTM/pbMRQ/isST/tradestatus)。"""
+    _ensure_login()
+    with _suppress_stdout():
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            EXT_FIELDS,
+            start_date=start,
+            end_date=end,
+            frequency="d",
+            adjustflag="2",
+        )
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+    return {"error_code": rs.error_code, "rows": rows, "fields": EXT_FIELDS}
+
+
 COMMANDS = {
     "login": cmd_login,
     "query_all_stock": cmd_query_all_stock,
     "query_stock_basic": cmd_query_stock_basic,
     "query_history": cmd_query_history,
+    "query_history_ext": cmd_query_history_ext,
 }
 
 

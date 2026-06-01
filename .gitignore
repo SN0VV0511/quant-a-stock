@@ -14,3 +14,4 @@ data/trade_events.jsonl
 data/portfolio_snapshots.jsonl
 .env
 *.log
+reports/backtest_latest.json

@@ -106,36 +106,44 @@ class AKDataLoader:
                 raise
 
     def _ensure_login(self):
-        """确保 BaoStock 连接有效，通过子进程验证，失败则重新登录，共重试 3 次。"""
-        if not self._bs_available:
-            raise ConnectionError("BaoStock 已标记为不可用，跳过登录")
-        _require_baostock()
-        # Skip re-verification if recently verified
-        now = time.time()
-        if self._bs_logged_in and (now - self._bs_last_verified) < self._bs_verify_interval:
-            return
-        for attempt in range(3):
-            if self._bs_logged_in:
-                result = _run_bs_with_subprocess("query_stock_basic", "sh.600000")
+        """确保 BaoStock 连接有效,通过子进程验证,失败则重新登录,共重试 3 次。
+
+        盯盘线程与扫描线程共享同一 loader,会并发触达本方法,因此用
+        ``self._bs_lock`` 串行化"登录态校验 + 重登录",避免对
+        ``_bs_logged_in`` / ``_bs_available`` / ``_bs_last_verified`` 的竞态。
+        注意:锁只保护登录态本身,不覆盖 ``get_stock_history`` 里的历史数据
+        子进程查询,从而保留 ``get_batch_history`` 的并发能力。
+        """
+        with self._bs_lock:
+            if not self._bs_available:
+                raise ConnectionError("BaoStock 已标记为不可用,跳过登录")
+            _require_baostock()
+            # Skip re-verification if recently verified
+            now = time.time()
+            if self._bs_logged_in and (now - self._bs_last_verified) < self._bs_verify_interval:
+                return
+            for attempt in range(3):
+                if self._bs_logged_in:
+                    result = _run_bs_with_subprocess("query_stock_basic", "sh.600000")
+                    if result is not None and result.get("error_code") == "0":
+                        self._bs_last_verified = time.time()
+                        return
+                    logger.warning("BaoStock 连接已失效,重新登录")
+                    self._bs_logged_in = False
+
+                result = _run_bs_with_subprocess("login")
                 if result is not None and result.get("error_code") == "0":
+                    self._bs_logged_in = True
                     self._bs_last_verified = time.time()
                     return
-                logger.warning("BaoStock 连接已失效，重新登录")
+                wait = 2 * (attempt + 1)
+                logger.warning("BaoStock 登录失败 (第%d次), %ds 后重试", attempt + 1, wait)
                 self._bs_logged_in = False
-
-            result = _run_bs_with_subprocess("login")
-            if result is not None and result.get("error_code") == "0":
-                self._bs_logged_in = True
-                self._bs_last_verified = time.time()
-                return
-            wait = 2 * (attempt + 1)
-            logger.warning("BaoStock 登录失败 (第%d次), %ds 后重试", attempt + 1, wait)
-            self._bs_logged_in = False
-            if attempt < 2:
-                time.sleep(wait)
-        self._bs_available = False
-        logger.error("BaoStock 登录重试 3 次均失败，标记为不可用，后续调用将跳过 BaoStock")
-        raise ConnectionError("BaoStock 登录重试 3 次均失败")
+                if attempt < 2:
+                    time.sleep(wait)
+            self._bs_available = False
+            logger.error("BaoStock 登录重试 3 次均失败,标记为不可用,后续调用将跳过 BaoStock")
+            raise ConnectionError("BaoStock 登录重试 3 次均失败")
 
     def _logout(self):
         if self._bs_logged_in and bs is not None:
@@ -368,7 +376,8 @@ class AKDataLoader:
 
             if result is None:
                 logger.warning("get_stock_history(%s) 超时或异常 (第%d次)", code, attempt + 1)
-                self._bs_logged_in = False
+                with self._bs_lock:
+                    self._bs_logged_in = False
                 if attempt < 2:
                     time.sleep(2 * (attempt + 1))
                     continue
@@ -429,6 +438,145 @@ class AKDataLoader:
     def get_stock_data(self, code, days=60):
         """获取个股历史数据（兼容别名）"""
         return self.get_stock_history(code, days=days)
+
+    def get_stock_history_ext(self, code, days=40):
+        """获取个股扩展字段历史(含换手率/PB/ST/停牌),并附加 pb/mktcap/is_st/is_suspended 列。
+
+        供小市值价值选股使用。流通市值 ≈ close * volume / (turn/100)。
+        """
+        try:
+            raw_code = normalize_a_share_code(str(code))
+            bs_code = to_baostock_code(str(code))
+        except ValueError:
+            return None
+
+        cache_key = f"histext_{raw_code}_{days}"
+        cached = self._read_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._bs_available:
+            return None
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=days + 40)).strftime("%Y-%m-%d")
+        self._ensure_login()
+
+        for attempt in range(2):
+            result = _run_bs_with_subprocess("query_history_ext", bs_code, start, end)
+            if result is None:
+                with self._bs_lock:
+                    self._bs_logged_in = False
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                return None
+            if result.get("error_code") != "0":
+                return None
+            rows = result.get("rows", [])
+            if not rows:
+                return None
+
+            cols = ["date", "open", "high", "low", "close", "volume", "amount",
+                    "turn", "peTTM", "pbMRQ", "isST", "tradestatus", "pctChg"]
+            df = pd.DataFrame(rows, columns=cols)
+            for c in ["open", "high", "low", "close", "volume", "amount",
+                      "turn", "peTTM", "pbMRQ", "isST", "tradestatus", "pctChg"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            if len(df) == 0 or df["close"].iloc[-1] <= 0:
+                return None
+
+            df["pb"] = df["pbMRQ"]
+            df["is_st"] = df["isST"].fillna(0)
+            df["is_suspended"] = (df["tradestatus"] == 0)
+            turn = df["turn"].where(df["turn"] > 0)
+            df["mktcap"] = df["close"] * df["volume"] / (turn / 100.0)
+
+            self._write_cache(cache_key, df)
+            return df
+        return None
+
+    def get_batch_history_ext(self, codes, days=40, max_batch=5000):
+        """并发批量获取扩展字段历史。"""
+        result = {}
+        target = codes[:max_batch]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_map = {executor.submit(self.get_stock_history_ext, c, days): c for c in target}
+            done = 0
+            for future in as_completed(future_map):
+                code = future_map[future]
+                done += 1
+                try:
+                    df = future.result()
+                    if df is not None and not df.empty:
+                        result[code] = df
+                except Exception:
+                    pass
+                if done % 200 == 0:
+                    logger.info("扩展历史进度: %d/%d", done, len(target))
+        logger.info("扩展历史完成: %d/%d 只", len(result), len(target))
+        return result
+
+    def get_index_history(self, index_code="sh000300", days=120, start_date=None, end_date=None):
+        """获取指数历史日线(用于大盘择时)。
+
+        指数代码(如 ``sh000300``)不是 A 股个股,不能走个股归一化路径,
+        因此这里直接构造 BaoStock 代码并通过子进程查询。
+
+        Args:
+            index_code: 指数代码,支持 ``sh000300`` / ``sh.000300`` / ``000300``。
+            days: 回溯自然日数(``start_date``/``end_date`` 均为 None 时生效)。
+            start_date: 起始日 YYYYMMDD(可选,显式区间,回测用)。
+            end_date: 结束日 YYYYMMDD(可选)。
+
+        Returns:
+            pd.DataFrame(含 date/close 等列)或 None。
+        """
+        raw = str(index_code).strip().lower().replace(".", "")
+        if raw.startswith(("sh", "sz")):
+            market, digits = raw[:2], raw[2:]
+        else:
+            # 缺省按上交所指数处理(沪深300、上证指数等)
+            market, digits = "sh", raw
+        bs_code = f"{market}.{digits}"
+
+        if start_date and end_date:
+            start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
+            end = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
+            cache_key = f"index_{market}{digits}_{start_date}_{end_date}"
+        else:
+            end = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
+            cache_key = f"index_{market}{digits}_{days}"
+
+        cached = self._read_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self._bs_available:
+            return None
+
+        try:
+            self._ensure_login()
+        except ConnectionError:
+            return None
+
+        result = _run_bs_with_subprocess("query_history", bs_code, start, end)
+        if result is None or result.get("error_code") != "0":
+            logger.warning("get_index_history(%s) 获取失败", index_code)
+            return None
+        rows = result.get("rows", [])
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"])
+        for col in ["open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if len(df) == 0 or df["close"].iloc[-1] <= 0:
+            return None
+
+        self._write_cache(cache_key, df)
+        return df
 
     def _cache_path(self, key):
         return os.path.join(self.cache_dir, f"{key}.pkl")
