@@ -13,6 +13,7 @@ from datetime import datetime
 from config.settings import (
     STATE_FILE, INITIAL_CAPITAL, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION, LOT_SIZE, is_etf, TRADE_LOG_FILE, SNAPSHOT_LOG_FILE,
+    ENFORCE_T1,
 )
 from rules.engine import TradingRules
 
@@ -57,11 +58,6 @@ class PositionManager:
         Returns:
             dict: 交易结果 {success, cost_detail, actual_price, shares}
         """
-        # TODO: 临时将买入日期写成昨天，模拟 T+1 生效状态
-        from datetime import datetime, timedelta
-        buy_dt = datetime.strptime(date, "%Y%m%d") - timedelta(days=1)
-        date = buy_dt.strftime("%Y%m%d")
-
         is_etf_flag = is_etf(code)
         amount = price * shares
 
@@ -159,8 +155,8 @@ class PositionManager:
 
         pos = self.state["positions"][code]
 
-        # T+1 检查
-        if not self.rules.check_t1(pos["buy_date"], date):
+        # T+1 检查(可通过 config.ENFORCE_T1 关闭以便虚拟盘当日联调)
+        if ENFORCE_T1 and not self.rules.check_t1(pos["buy_date"], date):
             return {"success": False, "reason": "T+1 限制，不可卖出", "shares": 0}
 
         # 检查可卖数量

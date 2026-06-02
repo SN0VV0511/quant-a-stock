@@ -31,6 +31,7 @@ from config.settings import (  # noqa: E402
     LIVE_WATCH_INTERVAL_SECONDS,
     LOT_SIZE,
     MAX_SINGLE_STOCK,
+    REBUY_COOLDOWN_SECONDS,
     REPORT_DIR,
     ENABLE_MARKET_REGIME,
     MARKET_INDEX_CODE,
@@ -75,6 +76,7 @@ class SharedState:
         self.candidate_hist: dict[str, pd.DataFrame] = {}
         self.rejected_stocks: dict[str, float] = {}  # 代码 -> 冷却结束时间戳
         self.rejected_exits: dict[str, float] = {}
+        self.rebuy_cooldown: dict[str, float] = {}  # 卖出后再买冷却 代码 -> 冷却结束时间戳
         self.last_scan_time: datetime | None = None
         self.scanning = False
         self.risk_on = True  # 大盘择时状态,由扫描线程刷新
@@ -137,6 +139,16 @@ class SharedState:
         with self._lock:
             self.rejected_exits[code] = time.time() + seconds
 
+    def mark_rebuy_cooldown(self, code: str, seconds: int) -> None:
+        """标记某标的刚被卖出,在冷却期内禁止再次开仓(防止日内来回刷单)。"""
+        with self._lock:
+            self.rebuy_cooldown[code] = time.time() + seconds
+
+    def is_rebuy_cooling_down(self, code: str) -> bool:
+        """判断某标的是否仍处于卖出后的再买冷却期。"""
+        with self._lock:
+            return time.time() < self.rebuy_cooldown.get(code, 0)
+
 
 def normalize_code(code: str) -> str:
     """统一为不带市场前缀的沪深 A 股 6 位代码。"""
@@ -198,6 +210,20 @@ def _build_market_data(mapped_quotes: dict[str, dict[str, Any]]) -> dict[str, di
             "is_suspended": float(quote.get("price", 0) or 0) <= 0,
         }
     return market_data
+
+
+def _build_realtime_hist(hist: pd.DataFrame | None, price: float | None) -> pd.DataFrame | None:
+    """将最新实时价拼成一根临时 K 线,供 ComboSignal 实时判断。
+
+    买入与卖出两条路径必须共用本函数,保证同一 tick 上对同一标的的
+    ``check_realtime`` 输入完全一致——否则买路径看到实时价、卖路径看到昨收,
+    会同时给出 buy 与 sell,导致日内反复买卖。
+    """
+    if hist is None or price is None or price <= 0:
+        return hist
+    new_row = hist.iloc[-1:].copy()
+    new_row["close"] = price
+    return pd.concat([hist, new_row], ignore_index=True)
 
 
 def _submit_order(
@@ -345,12 +371,14 @@ def _handle_position_exits(
         if combo is not None:
             try:
                 hist = loader.get_stock_data(normalize_code(code), days=60)
-                if hist is not None and len(hist) > 25:
-                    sig = combo.check_realtime(hist)
+                # 与买入路径共用实时价 K 线,避免买卖信号因输入不同而互相矛盾
+                rt_hist = _build_realtime_hist(hist, float(current))
+                if rt_hist is not None and len(rt_hist) > 25:
+                    sig = combo.check_realtime(rt_hist)
                     combo_sell = sig.get("signal") == "sell"
                     combo_reason = sig.get("reason", "策略信号")
-                if hist is not None and len(hist) >= 20:
-                    ma20 = float(pd.to_numeric(hist["close"], errors="coerce").tail(20).mean())
+                if rt_hist is not None and len(rt_hist) >= 20:
+                    ma20 = float(pd.to_numeric(rt_hist["close"], errors="coerce").tail(20).mean())
             except Exception as exc:
                 logger.warning("持仓退出信号检查失败: %s %s", code, exc, exc_info=True)
 
@@ -381,7 +409,10 @@ def _handle_position_exits(
             reason=reason,
             source="watch_thread",
         )
-        _submit_exit_order(order, broker, risk_ctrl, market_data, recorder, shared)
+        report = _submit_exit_order(order, broker, risk_ctrl, market_data, recorder, shared)
+        # 卖出成交后进入再买冷却,杜绝"卖出→立刻买回"的日内刷单
+        if report is not None and report.is_success and shared is not None:
+            shared.mark_rebuy_cooldown(code, REBUY_COOLDOWN_SECONDS)
 
 
 def _submit_exit_order(
@@ -424,6 +455,10 @@ def _handle_candidate_entries(
         if normalize_code(code) in position_norms:
             continue
 
+        # 卖出后再买冷却:刚清仓的标的不立即重新开仓
+        if shared.is_rebuy_cooling_down(code):
+            continue
+
         # Check cooldown for risk-rejected stocks (5 min)
         now_ts = time.time()
         cooldown_until = shared.rejected_stocks.get(code, 0)
@@ -442,11 +477,7 @@ def _handle_candidate_entries(
         if price is None:
             continue
 
-        realtime_hist = hist
-        if price > 0:
-            new_row = hist.iloc[-1:].copy()
-            new_row["close"] = price
-            realtime_hist = pd.concat([hist, new_row], ignore_index=True)
+        realtime_hist = _build_realtime_hist(hist, price)
 
         result = combo.check_realtime(realtime_hist)
         if result["signal"] != "buy":
