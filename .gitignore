@@ -15,3 +15,11 @@ data/portfolio_snapshots.jsonl
 .env
 *.log
 reports/backtest_latest.json
+
+# 运行时数据文件
+data/portfolio_state.json
+data/trade_log.json
+data/live_heartbeat.json
+data/portfolio_state*.json*
+data/trade_log*.json*
+reports/daily_*.txt

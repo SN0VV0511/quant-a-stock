@@ -268,7 +268,7 @@
     // ---------- status ----------
     async function loadStatus(){
         try {
-            const d = await (await fetch('/api/status')).json();
+            const d = await (await fetch('api/status')).json();
             const setDot=(id,on)=>{ $(id).className='dot '+(on?'on':'off'); };
             setDot('dot-live', d.live_runner); setDot('dot-watch', d.watch_thread); setDot('dot-scan', d.scan_thread);
             $('txt-live').textContent = d.live_runner ? '运行中' : '已停止';
@@ -278,7 +278,7 @@
     // ---------- portfolio ----------
     async function loadPortfolio(){
         try {
-            const d = await (await fetch('/api/portfolio')).json();
+            const d = await (await fetch('api/portfolio')).json();
             $('s-total').textContent = '¥'+fmt(d.total_value,0); $('s-total').className='val '+pnlC(d.pnl);
             $('s-pnl').textContent = fmtPct(d.pnl_pct)+' ('+fmt(d.pnl,0)+'元)'; $('s-pnl').className='sub '+pnlC(d.pnl);
             $('s-cash').textContent = '¥'+fmt(d.cash,0);
@@ -319,7 +319,7 @@
     // ---------- equity ----------
     async function loadEquity(){
         try {
-            const d = await (await fetch('/api/equity')).json();
+            const d = await (await fetch('api/equity')).json();
             const pts = d.points || [];
             if (!pts.length){ $('equity-empty').style.display='block'; return; }
             $('equity-empty').style.display='none';
@@ -341,7 +341,7 @@
     // ---------- candidates ----------
     async function loadCandidates(){
         try {
-            const d = await (await fetch('/api/candidates')).json();
+            const d = await (await fetch('api/candidates')).json();
             const stocks = d.candidates || [];
             $('cand-time').textContent = d.updated_at || '--';
             $('s-cand-count').textContent = stocks.length+' 只';
@@ -361,18 +361,18 @@
     // ---------- trades ----------
     async function loadTrades(){
         try {
-            const d = await (await fetch('/api/trades')).json();
+            const d = await (await fetch('api/trades')).json();
             const trades = (d.trades||[]).slice().reverse();
             $('trade-count').textContent = trades.length+' 条';
             $('s-trade-count').textContent = trades.filter(t=>t.date===todayStr()).length;
-            if (trades.length){ const l=trades[0]; $('s-last-trade').textContent=(l.time||'')+' '+((l.action||l.direction)==='buy'?'买':'卖')+' '+l.code; }
+            if (trades.length){ const l=trades[0]; $('s-last-trade').textContent=(l.time||'')+' '+((l.action||l.direction)==='buy'?'买':'卖')+' '+(l.name||l.code); }
             const el = $('trade-list');
             if (!trades.length){ el.innerHTML='<div class="empty">暂无交易</div>'; return; }
             el.innerHTML = trades.slice(0,40).map(t=>{ const buy=(t.action||t.direction)==='buy'; return `
                 <div class="row-item" style="gap:8px">
                     <span class="ri-sub" style="min-width:48px">${t.time||''}</span>
                     <span class="badge ${buy?'badge-buy':'badge-sell'}">${buy?'买':'卖'}</span>
-                    <span class="ri-main ri-name">${t.code}</span>
+                    <span class="ri-main ri-name">${t.name||t.code}</span>
                     <span class="ri-sub">${t.shares}股</span>
                     <span class="ri-right" style="min-width:64px">¥${fmt(t.price,3)}</span>
                 </div>`; }).join('');
@@ -385,7 +385,7 @@
     function toggleAutoScroll(btn){ logAutoScroll=!logAutoScroll; btn.classList.toggle('active',logAutoScroll); }
     async function loadLogs(){
         try {
-            const d = await (await fetch('/api/logs?lines='+logLines+'&file=live_today')).json();
+            const d = await (await fetch('api/logs?lines='+logLines+'&file=live_today')).json();
             const logs = d.logs||[], el=$('log-content');
             const hash = logs.slice(-3).join('|'); if (hash===lastLogHash) return; lastLogHash=hash;
             el.innerHTML = logs.map(line=>{
@@ -405,7 +405,7 @@
     // ---------- observation ----------
     async function loadObservation(){
         try {
-            const d = await (await fetch('/api/observation')).json();
+            const d = await (await fetch('api/observation')).json();
             const h=d.health||{}, r=d.review||{}, a=d.acceptance||{};
             const ok = h.ok!==false && (!h.failures || !h.failures.length);
             $('obs-health').innerHTML = ok ? '<span class="pill-ok">● 健康</span>' : '<span class="pill-bad">● 异常</span>';
@@ -436,7 +436,7 @@
     const BT_COLORS = ['#4a9eff','#00d26a','#ffb028','#9b7dff'];
     async function loadBacktest(){
         try {
-            const d = await (await fetch('/api/backtest')).json();
+            const d = await (await fetch('api/backtest')).json();
             if (!d.available || !d.series || !d.series.length){ $('bt-content').style.display='none'; $('bt-empty').style.display='block'; return; }
             $('bt-empty').style.display='none'; $('bt-content').style.display='block';
             $('bt-meta').textContent = (d.window||'') + ' · ' + (d.generated_at||'');

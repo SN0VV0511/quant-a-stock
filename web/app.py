@@ -118,7 +118,28 @@ def load_reports():
 
 
 def is_process_running(name):
-    """检查进程是否在运行"""
+    """检查进程是否在运行（优先检查心跳文件，fallback 到日志时间）"""
+    import time, json
+    # 1. 检查心跳文件（live_runner 每 30 秒写一次）
+    heartbeat_file = os.path.join(os.path.dirname(LIVE_TODAY_LOG), "..", "data", "live_heartbeat.json")
+    try:
+        if os.path.exists(heartbeat_file):
+            with open(heartbeat_file, "r") as f:
+                hb = json.load(f)
+            ts = hb.get("ts", 0)
+            if time.time() - ts < 90:
+                return True
+    except Exception:
+        pass
+    # 2. 检查日志文件修改时间
+    try:
+        if os.path.exists(LIVE_TODAY_LOG):
+            mtime = os.path.getmtime(LIVE_TODAY_LOG)
+            if time.time() - mtime < 600:
+                return True
+    except Exception:
+        pass
+    # 3. fallback: pgrep
     import subprocess
     try:
         result = subprocess.run(["pgrep", "-f", name], capture_output=True, text=True)
@@ -222,6 +243,22 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
     def _api_trades(self):
         trades = load_trade_log()
+        # 获取股票名称映射
+        name_map = {}
+        try:
+            codes = list({t.get("code", "") for t in trades if t.get("code")})
+            if codes:
+                loader = AKDataLoader()
+                raw_codes = [normalize_code(c) for c in codes]
+                quotes = loader.get_realtime_quotes(raw_codes)
+                name_map = {k: v.get("name", "") for k, v in quotes.items()}
+        except Exception:
+            pass
+        # 添加名称到交易记录
+        for t in trades:
+            code = t.get("code", "")
+            raw = normalize_code(code)
+            t["name"] = name_map.get(raw, "")
         return {"trades": trades[-50:]}
 
     def _api_scan(self):
@@ -464,6 +501,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = _parse_args(argv)
     server = HTTPServer(("0.0.0.0", args.port), QuantHandler)
+    server.allow_reuse_address = True
     logger.info("量化系统仪表盘 v2: http://0.0.0.0:%s", args.port)
     try:
         server.serve_forever()

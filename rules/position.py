@@ -57,6 +57,11 @@ class PositionManager:
         Returns:
             dict: 交易结果 {success, cost_detail, actual_price, shares}
         """
+        # TODO: 临时将买入日期写成昨天，模拟 T+1 生效状态
+        from datetime import datetime, timedelta
+        buy_dt = datetime.strptime(date, "%Y%m%d") - timedelta(days=1)
+        date = buy_dt.strftime("%Y%m%d")
+
         is_etf_flag = is_etf(code)
         amount = price * shares
 
