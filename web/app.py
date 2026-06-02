@@ -12,7 +12,6 @@ import logging
 import threading
 from dataclasses import asdict
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -22,6 +21,7 @@ from config.settings import (
     INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR,
     SNAPSHOT_LOG_FILE, RPS_STATE_FILE, normalize_a_share_code,
 )
+from config.time_utils import format_local
 from data.ak_loader import AKDataLoader
 from scripts.backtest_cache import ensure_backtest_cache
 from scripts.paper_status import build_status
@@ -418,7 +418,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "watch_thread": watch_active,
             "scan_thread": scan_active,
             "last_log_time": last_log_time,
-            "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "now": format_local(),
         }
 
     def _api_observation(self):

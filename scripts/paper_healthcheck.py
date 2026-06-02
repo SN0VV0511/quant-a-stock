@@ -27,6 +27,7 @@ from config.settings import (
     is_etf,
     is_supported_trading_target,
 )
+from config.time_utils import now_local
 
 
 LOGGER = logging.getLogger("paper_healthcheck")
@@ -187,7 +188,7 @@ def _check_snapshots(
     latest = snapshots[-1]
     timestamp = _parse_timestamp(str(latest.get("timestamp", "")))
     if timestamp:
-        age_minutes = (datetime.now() - timestamp).total_seconds() / 60
+        age_minutes = (now_local() - timestamp).total_seconds() / 60
         result.metrics["latest_snapshot_age_minutes"] = round(age_minutes, 1)
         if age_minutes > max_snapshot_age_minutes:
             result.warn(f"最近快照已超过 {max_snapshot_age_minutes} 分钟: {latest.get('timestamp')}")

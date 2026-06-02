@@ -11,6 +11,7 @@ import os
 from logging.handlers import RotatingFileHandler
 
 from config.settings import LOG_DIR
+from config.time_utils import logging_time_converter
 
 _DEFAULT_FORMAT = "%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s"
 
@@ -50,6 +51,7 @@ def setup_logger(
         return logger
 
     formatter = logging.Formatter(fmt)
+    formatter.converter = logging_time_converter
 
     for filename in rotating_files:
         handler = RotatingFileHandler(

@@ -14,7 +14,7 @@ import os
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from scripts.paper_healthcheck import run_healthcheck
 from trading.brokers import PaperBrokerAdapter
 from trading.models import ExecutionReport, OrderIntent, RiskDecision
 from trading.observability import EventRecorder
+from config.time_utils import now_local, today_yyyymmdd
 
 
 LOGGER = logging.getLogger("paper_smoke_run")
@@ -98,8 +99,8 @@ def run_smoke(root_dir: Path | None = None) -> SmokeRunResult:
     risk_ctrl.set_daily_start(broker.portfolio)
     recorder = EventRecorder(str(data_dir / "trade_events.jsonl"))
 
-    today = datetime.now().strftime("%Y%m%d")
-    next_day = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
+    today = today_yyyymmdd()
+    next_day = (now_local() + timedelta(days=1)).strftime("%Y%m%d")
     market_data = {
         "sh601988": {
             "current_price": 5.0,

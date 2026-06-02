@@ -15,6 +15,7 @@ from config.settings import (
     DEFAULT_UNIVERSE, get_rps_etf_codes, get_all_codes,
     is_etf, MAX_SINGLE_ETF, MAX_SINGLE_STOCK, RPS_HISTORY_DAYS,
 )
+from config.time_utils import today_yyyymmdd
 from data.loader import DataLoader
 from data.ak_loader import AKDataLoader
 from rules.position import PositionManager
@@ -55,7 +56,7 @@ class DailyRunner:
             dict: 执行结果
         """
         if date_str is None:
-            date_str = datetime.now().strftime("%Y%m%d")
+            date_str = today_yyyymmdd()
         date_str = date_str.replace("-", "")
 
         logger.info(f"========== 每日执行开始 {date_str} ==========")

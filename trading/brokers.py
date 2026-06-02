@@ -10,7 +10,6 @@ import os
 import threading
 import uuid
 from abc import ABC, abstractmethod
-from datetime import datetime
 from typing import Any
 
 from config.settings import (
@@ -20,6 +19,7 @@ from config.settings import (
     STATE_FILE,
     is_supported_trading_target,
 )
+from config.time_utils import today_yyyymmdd
 from rules.position import PositionManager
 from trading.models import ExecutionReport, OrderIntent, PortfolioSnapshot
 
@@ -105,7 +105,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         if not is_supported_trading_target(order.code):
             return self._reject(order, f"仅支持沪深 A 股股票或 ETF 代码: {order.code}")
 
-        trade_date = order.date or datetime.now().strftime("%Y%m%d")
+        trade_date = order.date or today_yyyymmdd()
         with self._lock:
             if order.action == "buy":
                 result = self.portfolio.buy(

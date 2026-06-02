@@ -8,13 +8,13 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime
 
 from config.settings import (
     STATE_FILE, INITIAL_CAPITAL, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION, LOT_SIZE, is_etf, TRADE_LOG_FILE, SNAPSHOT_LOG_FILE,
     ENFORCE_T1,
 )
+from config.time_utils import format_local, today_yyyymmdd
 from rules.engine import TradingRules
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,11 @@ class PositionManager:
         self.snapshot_log_file = snapshot_log_file or SNAPSHOT_LOG_FILE
         self.rules = TradingRules()
         self.state = self._default_state()
+        self._ensure_observation_files()
+        state_exists = os.path.exists(self.state_file)
         self.load()
+        if not state_exists:
+            self.save()
 
     @staticmethod
     def _default_state():
@@ -39,7 +43,7 @@ class PositionManager:
             "positions": {},       # code -> {name, shares, avg_cost, buy_date, strategy, current_price}
             "trades": [],          # 交易记录
             "daily_snapshots": {}, # date -> {cash, positions_value, total_value}
-            "created_at": datetime.now().strftime("%Y%m%d %H:%M:%S"),
+            "created_at": format_local("%Y%m%d %H:%M:%S"),
             "updated_at": None,
             "peak_value": INITIAL_CAPITAL,
         }
@@ -112,7 +116,7 @@ class PositionManager:
 
         trade = {
             "date": date,
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": format_local("%H:%M:%S"),
             "code": code,
             "name": name,
             "action": "buy",
@@ -126,7 +130,7 @@ class PositionManager:
         }
         self.state["trades"].append(trade)
 
-        self.state["updated_at"] = datetime.now().strftime("%Y%m%d %H:%M:%S")
+        self.state["updated_at"] = format_local("%Y%m%d %H:%M:%S")
         self.save()
         self._append_trade_log(trade)
 
@@ -185,7 +189,7 @@ class PositionManager:
 
         trade = {
             "date": date,
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": format_local("%H:%M:%S"),
             "code": code,
             "name": pos.get("name", code),
             "action": "sell",
@@ -200,7 +204,7 @@ class PositionManager:
         }
         self.state["trades"].append(trade)
 
-        self.state["updated_at"] = datetime.now().strftime("%Y%m%d %H:%M:%S")
+        self.state["updated_at"] = format_local("%Y%m%d %H:%M:%S")
         self.save()
         self._append_trade_log(trade)
 
@@ -252,7 +256,7 @@ class PositionManager:
                 prev_peak = pos.get("peak_price", pos.get("avg_cost", price))
                 if price and price > 0:
                     pos["peak_price"] = max(prev_peak, price)
-        self.state["updated_at"] = datetime.now().strftime("%Y%m%d %H:%M:%S")
+        self.state["updated_at"] = format_local("%Y%m%d %H:%M:%S")
 
     def get_total_value(self, current_prices=None):
         """计算总市值
@@ -452,6 +456,7 @@ class PositionManager:
         """重置为初始状态"""
         self.state = self._default_state()
         self.save()
+        self._ensure_observation_files()
 
     def get_recent_trades(self, n=10):
         """获取最近 N 条交易记录"""
@@ -507,7 +512,7 @@ class PositionManager:
         for code, pos in state.get("positions", {}).items():
             pos.setdefault("name", code)
             pos.setdefault("strategy", "legacy")
-            pos.setdefault("buy_date", datetime.now().strftime("%Y%m%d"))
+            pos.setdefault("buy_date", today_yyyymmdd())
             pos.setdefault("current_price", pos.get("avg_cost", 0))
             pos.setdefault("peak_price", pos.get("avg_cost", 0))
 
@@ -524,7 +529,7 @@ class PositionManager:
         """追加账户快照流水，便于一个月观察期复盘。"""
         snapshot = {
             "date": date,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": format_local(),
             "summary": self.summary(current_prices),
         }
         try:
@@ -533,3 +538,16 @@ class PositionManager:
                 f.write(json.dumps(snapshot, ensure_ascii=False, default=str) + "\n")
         except OSError as exc:
             logger.warning("追加账户快照失败: %s", exc)
+
+    def _ensure_observation_files(self):
+        """确保观察期流水文件存在。
+
+        健康检查在严格模式下会读取这些 JSONL 文件。启动时先创建空文件,
+        可以区分“系统尚未产生事件/快照”和“路径/挂载异常导致文件缺失”。
+        """
+        for path in (self.trade_log_file, self.snapshot_log_file):
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, "a", encoding="utf-8").close()
+            except OSError as exc:
+                logger.warning("初始化观察期文件失败 %s: %s", path, exc)

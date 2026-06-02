@@ -142,6 +142,12 @@ ETF/RPS 观察文件：
 - `data/trade_events.jsonl`：包含 `rps_rotation_completed`、`signal`、`risk_approved`、`execution` 等事件。
 - `reports/daily_YYYYMMDD.txt`：收盘日报会包含 ETF/RPS 摘要。
 
+观察期核心流水文件：
+
+- `data/trade_events.jsonl`：启动 `live_runner.py` 创建；每次扫描、RPS 轮动、信号、风控、成交、账户快照事件都会追加。
+- `data/portfolio_snapshots.jsonl`：初始化虚拟盘或创建 `PositionManager` 时先创建空文件；盘中每 5 分钟快照、收盘快照和手动 `save_snapshot()` 时追加。
+- 空文件表示“系统已初始化但还没产生对应事件/快照”；文件缺失通常表示数据目录未挂载或初始化没有跑。
+
 ## 后台守护运行
 
 无人值守观察期建议使用后台服务管理脚本，避免重复启动多个守护进程：

@@ -10,8 +10,9 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
+
+from config.time_utils import format_local
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
@@ -44,7 +45,7 @@ def _new_state(cash: float) -> dict[str, object]:
         "positions": {},
         "trades": [],
         "daily_snapshots": {},
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": format_local(),
     }
 
 
@@ -77,7 +78,7 @@ def reset_paper_state(root_dir: Path, cash: float = 10000.0, confirm: bool = Fal
             skipped_files=skipped_files,
         )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = format_local("%Y%m%d_%H%M%S")
     backup_dir = root_dir / "data" / "backups" / f"paper_state_{timestamp}"
     backup_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,6 +96,8 @@ def reset_paper_state(root_dir: Path, cash: float = 10000.0, confirm: bool = Fal
         encoding="utf-8",
     )
     (root_dir / "data" / "trade_log.json").write_text("", encoding="utf-8")
+    (root_dir / "data" / "trade_events.jsonl").write_text("", encoding="utf-8")
+    (root_dir / "data" / "portfolio_snapshots.jsonl").write_text("", encoding="utf-8")
     (root_dir / "logs").mkdir(parents=True, exist_ok=True)
     (root_dir / "logs" / "live.log").write_text("", encoding="utf-8")
     (root_dir / "logs" / "live_today.log").write_text("", encoding="utf-8")

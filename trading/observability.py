@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime
 from typing import Any
 
 from config.settings import TRADE_EVENTS_FILE
+from config.time_utils import format_local
 
 
 class EventRecorder:
@@ -21,12 +21,13 @@ class EventRecorder:
         self.path = path or TRADE_EVENTS_FILE
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        open(self.path, "a", encoding="utf-8").close()
 
     def record(self, event_type: str, payload: dict[str, Any]) -> None:
         """追加一条结构化事件。"""
         event = {
             "event_type": event_type,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": format_local(),
             "payload": payload,
         }
         with self._lock:

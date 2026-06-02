@@ -51,6 +51,7 @@ from config.settings import (  # noqa: E402
     normalize_a_share_code,
 )
 from config.logging_setup import setup_logger  # noqa: E402
+from config.time_utils import now_local, today_yyyymmdd  # noqa: E402
 from data.ak_loader import AKDataLoader  # noqa: E402
 from data.holidays import is_trading_day as is_calendar_trading_day  # noqa: E402
 from risk.control import RiskController  # noqa: E402
@@ -101,7 +102,7 @@ class SharedState:
             self.top_stocks = stocks
             self.candidate_codes = [s["code"] for s in stocks]
             self.rejected_stocks.clear()  # 新一轮扫描后重新评估候选买入
-            self.last_scan_time = datetime.now()
+            self.last_scan_time = now_local()
 
     def update_hist(self, code: str, df: pd.DataFrame) -> None:
         """更新候选股历史数据缓存。"""
@@ -187,7 +188,7 @@ def _holding_days(buy_date: str | None, today: str) -> int:
 
 def is_trading_day(date_str: str | None = None) -> bool:
     """判断是否为交易日。"""
-    target = date_str or datetime.now().strftime("%Y%m%d")
+    target = date_str or today_yyyymmdd()
     try:
         return is_calendar_trading_day(target)
     except Exception as exc:
@@ -208,8 +209,8 @@ def _initial_scan_time(now: datetime, delay_minutes: int = LIVE_INITIAL_SCAN_DEL
 
 def _wait_until(target: datetime, reason: str, interval: int = 30) -> None:
     """等待到指定时间,用于控制盘中启动节奏。"""
-    while datetime.now() < target:
-        remain = (target - datetime.now()).total_seconds()
+    while now_local() < target:
+        remain = (target - now_local()).total_seconds()
         logger.info("%s... %.0f 秒后继续", reason, max(0, remain))
         time.sleep(min(interval, max(1, remain)))
 
@@ -435,7 +436,7 @@ def _run_daily_rps_rotation(
     本函数是观察期实盘模拟链路的一部分:信号、风控、成交都会进入
     ``trade_events.jsonl``。行业指数只记录强弱观察结果,不会生成订单。
     """
-    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    started_at = now_local().strftime("%Y-%m-%d %H:%M:%S")
     if not ENABLE_RPS_ROTATION:
         state = {
             "date": today,
@@ -572,7 +573,7 @@ def _run_daily_rps_rotation(
         state.update({
             "status": "ok",
             "completed": True,
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": now_local().strftime("%Y-%m-%d %H:%M:%S"),
             "etf_loaded": len(etf_history),
             "industry_loaded": len(industry_history),
             "etf_signals": etf_signals,
@@ -595,7 +596,7 @@ def _run_daily_rps_rotation(
         state.update({
             "status": "error",
             "completed": False,
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": now_local().strftime("%Y-%m-%d %H:%M:%S"),
             "errors": [str(exc)],
         })
         _write_rps_state(state)
@@ -618,7 +619,7 @@ def watch_thread(
     last_snapshot_minute = -1
 
     while True:
-        now = datetime.now()
+        now = now_local()
         market_close = now.replace(hour=15, minute=0, second=0)
         lunch_start = now.replace(hour=11, minute=30, second=0)
         lunch_end = now.replace(hour=13, minute=0, second=0)
@@ -679,7 +680,7 @@ def _handle_position_exits(
     combo: ComboSignalStrategy | None = None,
 ) -> None:
     """处理持仓止损/止盈(策略卖出 / 硬止损 / 移动止损 / 时间止损 / 止盈)。"""
-    today = datetime.now().strftime("%Y%m%d")
+    today = today_yyyymmdd()
     for code, pos in positions.items():
         if shared is not None and shared.is_exit_cooling_down(code):
             continue
@@ -772,7 +773,7 @@ def _handle_candidate_entries(
     recorder: EventRecorder,
 ) -> None:
     """处理候选股买入信号。"""
-    today = datetime.now().strftime("%Y%m%d")
+    today = today_yyyymmdd()
 
     # 大盘择时:系统性下跌期暂停开新仓,只保留持仓退出
     if not shared.is_risk_on():
@@ -864,7 +865,7 @@ def scan_thread(
     logger.info("扫描线启动")
 
     while True:
-        now = datetime.now()
+        now = now_local()
         market_close = now.replace(hour=15, minute=0, second=0)
         lunch_start = now.replace(hour=11, minute=30, second=0)
         lunch_end = now.replace(hour=13, minute=0, second=0)
@@ -877,7 +878,7 @@ def scan_thread(
             continue
 
         time.sleep(scan_interval)
-        if datetime.now() >= market_close:
+        if now_local() >= market_close:
             break
         _do_scan(shared, scanner, recorder, top_n)
 
@@ -967,7 +968,7 @@ def _generate_report(
         prices, _, _ = _get_current_quotes(loader, list(positions.keys()))
         broker.portfolio.update_prices(prices)
 
-    today = datetime.now().strftime("%Y%m%d")
+    today = today_yyyymmdd()
     broker.portfolio.save_snapshot(today, prices)
     snapshot = broker.query_snapshot(prices)
     recorder.record("portfolio_snapshot_close", snapshot.to_dict())
@@ -975,7 +976,7 @@ def _generate_report(
     today_trades = broker.portfolio.get_trades_by_date(today)
     report_lines = [
         "=" * 50,
-        f"量化日报 - {datetime.now().strftime('%Y-%m-%d')}（虚拟盘）",
+        f"量化日报 - {now_local().strftime('%Y-%m-%d')}（虚拟盘）",
         "=" * 50,
         f"初始资金: ¥{INITIAL_CAPITAL:,.2f}",
         f"当前总值: ¥{snapshot.total_value:,.2f}",
@@ -1066,7 +1067,7 @@ def main() -> None:
     shared = SharedState()
     risk_ctrl.set_daily_start(broker.portfolio)
 
-    now = datetime.now()
+    now = now_local()
     logger.info("=" * 60)
     logger.info("虚拟盘盯盘系统启动: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("Broker=%s watch_interval=%ss scan_interval=%ss", args.broker, args.watch_interval, args.scan_interval)
@@ -1084,7 +1085,7 @@ def main() -> None:
     if now < market_open:
         _wait_until(market_open, "等待开盘启动盯盘")
 
-    today = datetime.now().strftime("%Y%m%d")
+    today = today_yyyymmdd()
     _run_daily_rps_rotation(
         broker=broker,
         loader=loader,
@@ -1103,7 +1104,7 @@ def main() -> None:
     )
     t_watch.start()
 
-    if datetime.now() < first_scan_at:
+    if now_local() < first_scan_at:
         _wait_until(first_scan_at, "等待开盘后确认扫描")
 
     _do_scan(shared, scanner, recorder, top_n=args.top_n)
@@ -1118,7 +1119,7 @@ def main() -> None:
     t_scan.start()
 
     try:
-        while datetime.now() < market_close:
+        while now_local() < market_close:
             time.sleep(30)
             snapshot = broker.query_snapshot()
             logger.info(

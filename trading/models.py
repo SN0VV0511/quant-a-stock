@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from typing import Any, Literal
+
+from config.time_utils import format_local, today_yyyymmdd
 
 Action = Literal["buy", "sell"]
 ExecutionStatus = Literal["filled", "rejected", "cancelled", "submitted", "failed"]
@@ -15,7 +16,7 @@ ExecutionStatus = Literal["filled", "rejected", "cancelled", "submitted", "faile
 
 def _now_str() -> str:
     """返回统一格式的本地时间字符串。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return format_local()
 
 
 @dataclass(frozen=True)
@@ -155,7 +156,7 @@ class ExecutionReport:
     def to_trade_dict(self) -> dict[str, Any]:
         """转换为日报和 Web 可读的交易记录。"""
         trade = {
-            "date": self.date or datetime.now().strftime("%Y%m%d"),
+            "date": self.date or today_yyyymmdd(),
             "time": self.timestamp[-8:],
             "code": self.code,
             "action": self.action,

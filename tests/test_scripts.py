@@ -614,5 +614,7 @@ def test_paper_reset_confirm_backs_up_and_initializes(tmp_path) -> None:
     assert state["cash"] == 12345.0
     assert state["positions"] == {}
     assert (data_dir / "trade_log.json").read_text(encoding="utf-8") == ""
+    assert (data_dir / "trade_events.jsonl").exists()
+    assert (data_dir / "portfolio_snapshots.jsonl").exists()
     assert (logs_dir / "live.log").read_text(encoding="utf-8") == ""
     assert (data_dir / "backups").exists()

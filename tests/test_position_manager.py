@@ -15,6 +15,9 @@ def test_position_manager_buy_sell_t1_and_persistence(tmp_path) -> None:
         trade_log_file=str(trade_log),
         snapshot_log_file=str(snapshot_log),
     )
+    assert state_file.exists()
+    assert trade_log.exists()
+    assert snapshot_log.exists()
 
     buy = portfolio.buy("sh601988", "中国银行", 5.0, 100, "20260527", "单元测试")
     same_day_sell = portfolio.sell("sh601988", 5.1, 100, "20260527", "单元测试")

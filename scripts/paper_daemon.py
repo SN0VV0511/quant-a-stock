@@ -24,6 +24,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from data.holidays import is_trading_day as is_calendar_trading_day
+from config.time_utils import now_local
 from scripts.backtest_cache import ensure_backtest_cache
 from scripts.monthly_review import build_review
 from scripts.paper_healthcheck import run_healthcheck
@@ -180,7 +181,7 @@ def run_daemon(
     config: DaemonConfig,
     pre_market: dt_time,
     market_close: dt_time,
-    now_provider=datetime.now,
+    now_provider=now_local,
     sleep_func=time.sleep,
 ) -> int:
     """运行虚拟盘守护循环。"""
@@ -246,7 +247,7 @@ def main() -> int:
     )
 
     if args.json:
-        now = datetime.now()
+        now = now_local()
         decision = decide_next_action(
             now,
             is_trading_day(now.strftime("%Y%m%d"), config.ignore_calendar),

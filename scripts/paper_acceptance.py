@@ -21,6 +21,7 @@ if str(ROOT_DIR) not in sys.path:
 from scripts.monthly_review import ReviewSummary, build_review
 from scripts.paper_healthcheck import HealthcheckResult, run_healthcheck
 from config.settings import ENABLE_RPS_ROTATION, RPS_STATE_FILE
+from config.time_utils import now_local
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,7 @@ def _parse_date(value: str) -> datetime | None:
 
 def _snapshot_day_count(root_dir: Path, days: int) -> int:
     """统计最近 N 天内有账户快照的自然日数量。"""
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = now_local() - timedelta(days=days)
     snapshot_dates = set()
     for row in _load_jsonl(root_dir / "data" / "portfolio_snapshots.jsonl"):
         date = str(row.get("date", ""))
@@ -103,7 +104,7 @@ def _check_rps_acceptance(root_dir: Path, days: int) -> tuple[dict[str, Any], li
     parsed = _parse_date(str(rps_state.get("date", "")))
     if parsed is None:
         failures.append("ETF/RPS 状态缺少可解析日期")
-    elif parsed < datetime.now() - timedelta(days=days):
+    elif parsed < now_local() - timedelta(days=days):
         failures.append(f"ETF/RPS 状态过旧: {rps_state.get('date')}")
     if int(rps_state.get("etf_loaded", 0) or 0) == 0:
         failures.append("ETF/RPS 未成功加载 ETF 历史数据")

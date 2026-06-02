@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+ENV TZ=Asia/Shanghai \
+    APP_TIMEZONE=Asia/Shanghai \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 COPY requirements.txt .

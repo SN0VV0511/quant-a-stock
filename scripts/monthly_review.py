@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from config.time_utils import now_local, today_yyyymmdd
 
 LOGGER = logging.getLogger("monthly_review")
 
@@ -128,7 +129,7 @@ def _filter_by_days(
     days: int,
 ) -> tuple[list[tuple[str, float]], list[dict[str, Any]]]:
     """按最近 N 天过滤快照和交易。"""
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = now_local() - timedelta(days=days)
     filtered_points = [
         point for point in points
         if (_parse_date(point[0]) is None or _parse_date(point[0]) >= cutoff)
@@ -153,7 +154,7 @@ def build_review(root_dir: Path, days: int = 30) -> ReviewSummary:
                 if isinstance(pos, dict):
                     position_value += float(pos.get("current_price", pos.get("avg_cost", 0)) or 0) * int(pos.get("shares", 0) or 0)
         total_value = round(cash + position_value, 2)
-        today = datetime.now().strftime("%Y%m%d")
+        today = today_yyyymmdd()
         points = [(today, total_value)]
 
     points.sort(key=lambda item: item[0])

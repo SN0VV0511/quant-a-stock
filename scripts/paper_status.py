@@ -10,7 +10,6 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -22,6 +21,7 @@ from scripts.monthly_review import build_review
 from scripts.paper_acceptance import run_acceptance
 from scripts.paper_healthcheck import run_healthcheck
 from scripts.paper_service import get_status
+from config.time_utils import format_local
 
 T = TypeVar("T")
 
@@ -118,7 +118,7 @@ def build_status(
     }
 
     return ObservationStatus(
-        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        generated_at=format_local(),
         root_dir=str(root_dir),
         service=service,
         health=health,
