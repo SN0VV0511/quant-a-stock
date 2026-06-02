@@ -24,6 +24,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from data.holidays import is_trading_day as is_calendar_trading_day
+from scripts.backtest_cache import ensure_backtest_cache
 from scripts.monthly_review import build_review
 from scripts.paper_healthcheck import run_healthcheck
 
@@ -154,14 +155,16 @@ def run_one_session(config: DaemonConfig) -> int:
         strict_report=True,
     )
     review = build_review(config.root_dir, days=config.review_days)
+    backtest_status = ensure_backtest_cache(config.root_dir, async_run=False)
 
     LOGGER.info(
-        "收盘检查: health_ok=%s, %s日收益=%.2f%%, 最大回撤=%.2f%%, 交易=%s笔",
+        "收盘检查: health_ok=%s, %s日收益=%.2f%%, 最大回撤=%.2f%%, 交易=%s笔, 回测=%s",
         health.ok,
         config.review_days,
         review.total_return * 100,
         review.max_drawdown * 100,
         review.trade_count,
+        "可用" if backtest_status.available else "不可用",
     )
     for failure in health.failures:
         LOGGER.error("健康检查失败: %s", failure)

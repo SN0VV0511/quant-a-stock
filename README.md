@@ -85,6 +85,20 @@ python main.py 000858 20230101 20240101
 - 图表文件：净值曲线、回撤图、K 线图。
 - CSV 结果：交易明细和回测序列。
 
+仪表盘的“策略回测对比”会读取 `reports/backtest_latest.json`。部署后如果该文件缺失或超过
+`BACKTEST_AUTO_MAX_AGE_HOURS`，Web 服务会自动在后台触发 `scripts.strategy_ab` 生成；观察期
+守护脚本收盘后也会同步刷新一次。需要手动强制刷新时再执行：
+
+```bash
+python -m scripts.strategy_ab 120
+```
+
+可通过环境变量调整自动回测：
+
+- `BACKTEST_AUTO_GENERATE=false`：关闭自动生成。
+- `BACKTEST_AUTO_UNIVERSE_SIZE=120`：自动回测抽样股票数。
+- `BACKTEST_AUTO_MAX_AGE_HOURS=168`：回测结果最大缓存时间。
+
 ## 虚拟盘实时运行
 
 开始新观察期前，先预览会备份哪些旧状态文件：

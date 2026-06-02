@@ -18,6 +18,9 @@ BACKTEST_START = "20240101"
 BACKTEST_END = "20250101"
 MA_SHORT = 5
 MA_LONG = 20
+BACKTEST_AUTO_GENERATE = os.getenv("BACKTEST_AUTO_GENERATE", "true").strip().lower() not in ("false", "0", "no", "off")
+BACKTEST_AUTO_UNIVERSE_SIZE = int(os.getenv("BACKTEST_AUTO_UNIVERSE_SIZE", "120"))
+BACKTEST_AUTO_MAX_AGE_HOURS = int(os.getenv("BACKTEST_AUTO_MAX_AGE_HOURS", "168"))
 
 # ==================== 交易成本 ====================
 COMMISSION_RATE = 0.0003       # 佣金费率（万三）

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scripts.monthly_review import build_review
 from scripts.paper_acceptance import run_acceptance
+from scripts.backtest_cache import ensure_backtest_cache, get_backtest_cache_status
 from scripts.paper_daemon import DaemonConfig, build_live_command, decide_next_action
 from scripts.paper_healthcheck import run_healthcheck
 from scripts.paper_reset import reset_paper_state
@@ -322,6 +323,69 @@ def test_paper_daemon_builds_live_command(tmp_path) -> None:
     assert "--scan-interval" in command
     assert "900" in command
     assert "--ignore-calendar" in command
+
+
+def test_backtest_cache_auto_generates_when_missing(monkeypatch, tmp_path) -> None:
+    """回测缓存缺失时应自动调用 strategy_ab 并生成仪表盘产物。"""
+    calls = []
+
+    def fake_run(command, cwd, check, capture_output, text, timeout):
+        calls.append({
+            "command": command,
+            "cwd": cwd,
+            "check": check,
+            "capture_output": capture_output,
+            "text": text,
+            "timeout": timeout,
+        })
+        reports = Path(cwd) / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        (reports / "backtest_latest.json").write_text(json.dumps({
+            "generated_at": "2026-06-02 15:30:00",
+            "window": "测试窗口",
+            "series": [],
+        }, ensure_ascii=False), encoding="utf-8")
+
+        class Result:
+            """模拟 subprocess.CompletedProcess。"""
+
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("scripts.backtest_cache.subprocess.run", fake_run)
+
+    status = ensure_backtest_cache(tmp_path, async_run=False, universe_size=12)
+    current = get_backtest_cache_status(tmp_path)
+
+    assert status.available is True
+    assert current.available is True
+    assert calls
+    assert calls[0]["command"][-1] == "12"
+
+
+def test_backtest_cache_records_generation_error(monkeypatch, tmp_path) -> None:
+    """自动回测失败时应记录错误,便于前端展示。"""
+
+    def fake_run(*_args, **_kwargs):
+        class Result:
+            """模拟失败的 subprocess.CompletedProcess。"""
+
+            returncode = 1
+            stdout = ""
+            stderr = "boom"
+
+        return Result()
+
+    monkeypatch.setattr("scripts.backtest_cache.subprocess.run", fake_run)
+
+    status = ensure_backtest_cache(tmp_path, async_run=False, universe_size=12)
+
+    assert status.available is False
+    assert "boom" in status.error
+    assert (tmp_path / "data" / "backtest_refresh_error.json").exists()
 
 
 def test_paper_service_status_without_pid(tmp_path) -> None:

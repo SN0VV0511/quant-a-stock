@@ -229,7 +229,7 @@
                         <div class="col-5" style="grid-column:span 5"><div id="bt-table"></div></div>
                     </div>
                 </div>
-                <div class="empty" id="bt-empty" style="display:none">暂无回测结果。运行 <code>python -m scripts.strategy_ab</code> 生成对比。</div>
+                <div class="empty" id="bt-empty" style="display:none">暂无回测结果，系统会在后台自动生成。</div>
             </div>
         </div>
     </main>
@@ -513,9 +513,16 @@
     async function loadBacktest(){
         try {
             const d = await (await fetch('api/backtest')).json();
-            if (!d.available || !d.series || !d.series.length){ $('bt-content').style.display='none'; $('bt-empty').style.display='block'; return; }
+            if (!d.available || !d.series || !d.series.length){
+                $('bt-content').style.display='none';
+                $('bt-empty').style.display='block';
+                $('bt-empty').textContent = d.generating ? '策略回测对比生成中，完成后会自动显示。' :
+                    (d.error ? '策略回测生成失败：' + d.error : '暂无回测结果，系统会在后台自动生成。');
+                $('bt-meta').textContent = d.generating ? '生成中' : (d.status || '--');
+                return;
+            }
             $('bt-empty').style.display='none'; $('bt-content').style.display='block';
-            $('bt-meta').textContent = (d.window||'') + ' · ' + (d.generated_at||'');
+            $('bt-meta').textContent = (d.window||'') + ' · ' + (d.generated_at||'') + (d.stale ? ' · 后台刷新中' : '');
             // table
             const M=[['总收益','total_return',1],['年化','annual_return',1],['最大回撤','max_drawdown',1],['夏普','sharpe_ratio',0],['卡尔玛','calmar_ratio',0],['胜率','win_rate',1],['交易数','total_trades',0]];
             let th='<tr><th>策略</th>'+M.map(m=>`<th>${m[0]}</th>`).join('')+'</tr>';

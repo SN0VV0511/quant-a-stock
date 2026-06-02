@@ -23,6 +23,7 @@ from config.settings import (
     SNAPSHOT_LOG_FILE, RPS_STATE_FILE, normalize_a_share_code,
 )
 from data.ak_loader import AKDataLoader
+from scripts.backtest_cache import ensure_backtest_cache
 from scripts.paper_status import build_status
 
 logger = logging.getLogger(__name__)
@@ -470,18 +471,20 @@ class QuantHandler(SimpleHTTPRequestHandler):
         return {"points": points, "initial": INITIAL_CAPITAL}
 
     def _api_backtest(self):
-        """读取最近一次回测结果(由回测脚本写入 reports/backtest_latest.json)。"""
+        """读取最近一次回测结果；缺失或过期时自动后台生成。"""
+        status = ensure_backtest_cache(ROOT_DIR, async_run=True)
         path = os.path.join(REPORT_DIR, "backtest_latest.json")
         if not os.path.exists(path):
-            return {"available": False}
+            return {**status.to_dict(), "series": []}
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            data.update(status.to_dict())
             data["available"] = True
             return data
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("读取回测结果失败: %s", exc)
-            return {"available": False, "error": str(exc)}
+            return {**status.to_dict(), "available": False, "error": str(exc), "series": []}
 
     def _api_reports(self):
         return {"reports": load_reports()}
