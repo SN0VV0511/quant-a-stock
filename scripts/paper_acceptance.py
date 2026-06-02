@@ -20,6 +20,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from scripts.monthly_review import ReviewSummary, build_review
 from scripts.paper_healthcheck import HealthcheckResult, run_healthcheck
+from config.settings import ENABLE_RPS_ROTATION, RPS_STATE_FILE
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class AcceptanceResult:
     required_snapshot_days: int = 20
     review: dict[str, Any] = field(default_factory=dict)
     health_metrics: dict[str, Any] = field(default_factory=dict)
+    rps: dict[str, Any] = field(default_factory=dict)
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -68,6 +70,48 @@ def _snapshot_day_count(root_dir: Path, days: int) -> int:
     return len(snapshot_dates)
 
 
+def _load_rps_state(root_dir: Path) -> dict[str, Any]:
+    """读取 ETF/RPS 日频状态。"""
+    configured = Path(RPS_STATE_FILE)
+    path = configured if configured.is_absolute() else root_dir / configured
+    if not path.exists():
+        fallback = root_dir / "data" / "rps_state.json"
+        path = fallback
+    if not path.exists():
+        return {"available": False, "status": "missing"}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["available"] = True
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        return {"available": False, "status": "error", "error": str(exc)}
+
+
+def _check_rps_acceptance(root_dir: Path, days: int) -> tuple[dict[str, Any], list[str], list[str]]:
+    """检查 ETF/RPS 是否具备观察期验收证据。"""
+    rps_state = _load_rps_state(root_dir)
+    failures: list[str] = []
+    warnings: list[str] = []
+    if not ENABLE_RPS_ROTATION:
+        warnings.append("ETF/RPS 轮动已关闭，观察期不会验证该策略")
+        return rps_state, failures, warnings
+    if not rps_state.get("available"):
+        failures.append("ETF/RPS 状态文件缺失或不可读")
+        return rps_state, failures, warnings
+    if rps_state.get("status") != "ok" or rps_state.get("completed") is not True:
+        failures.append(f"ETF/RPS 最近一次运行未完成: {rps_state.get('status')}")
+    parsed = _parse_date(str(rps_state.get("date", "")))
+    if parsed is None:
+        failures.append("ETF/RPS 状态缺少可解析日期")
+    elif parsed < datetime.now() - timedelta(days=days):
+        failures.append(f"ETF/RPS 状态过旧: {rps_state.get('date')}")
+    if int(rps_state.get("etf_loaded", 0) or 0) == 0:
+        failures.append("ETF/RPS 未成功加载 ETF 历史数据")
+    if int(rps_state.get("industry_loaded", 0) or 0) == 0:
+        warnings.append("ETF/RPS 未成功加载行业指数数据，行业强弱观察不可用")
+    return rps_state, failures, warnings
+
+
 def run_acceptance(
     root_dir: Path,
     days: int = 30,
@@ -98,9 +142,12 @@ def run_acceptance(
     )
     review: ReviewSummary = build_review(root_dir, days=days)
     snapshot_days = _snapshot_day_count(root_dir, days)
+    rps_state, rps_failures, rps_warnings = _check_rps_acceptance(root_dir, days)
 
     failures = list(health.failures)
     warnings = list(health.warnings)
+    failures.extend(rps_failures)
+    warnings.extend(rps_warnings)
     if snapshot_days < min_snapshot_days:
         failures.append(f"快照天数不足: {snapshot_days} < {min_snapshot_days}")
     if review.max_drawdown > max_drawdown:
@@ -118,6 +165,7 @@ def run_acceptance(
         required_snapshot_days=min_snapshot_days,
         review=asdict(review),
         health_metrics=health.metrics,
+        rps=rps_state,
     )
 
 

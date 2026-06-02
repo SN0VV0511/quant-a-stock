@@ -185,6 +185,12 @@
             <div class="card-body scroll" id="cand-list" style="max-height:360px;padding:6px 12px"><div class="empty">等待扫描...</div></div>
         </div>
 
+        <!-- ETF / RPS -->
+        <div class="card col-4">
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-trend"/></svg>ETF / RPS 日频</span><span class="meta" id="rps-status">--</span></div>
+            <div class="card-body scroll" id="rps-body" style="max-height:360px;padding:6px 12px"><div class="empty">等待日频轮动...</div></div>
+        </div>
+
         <!-- Logs -->
         <div class="card col-4">
             <div class="card-head">
@@ -373,6 +379,61 @@
         } catch(e){ console.error(e); }
     }
 
+    // ---------- ETF / RPS ----------
+    async function loadRps(){
+        try {
+            const d = await (await fetch('api/rps')).json();
+            const el = $('rps-body');
+            const ok = d.status === 'ok' && d.completed;
+            $('rps-status').innerHTML = ok ? '<span class="pill-ok">● 已完成</span>' :
+                (d.status === 'error' ? '<span class="pill-bad">● 异常</span>' : esc(d.status || '--'));
+            if (!d.available && d.status === 'missing'){
+                el.innerHTML = '<div class="empty">今日尚未运行 ETF/RPS</div>';
+                return;
+            }
+            const etfs = d.etf_signals || [];
+            const industries = d.industry_signals || [];
+            const orders = d.orders || [];
+            let html = `<div class="kv" style="margin:6px 0 10px">
+                <span class="k">日期</span><span class="v">${esc(d.date || '--')}</span>
+                <span class="k">ETF 数据</span><span class="v">${d.etf_loaded || 0}/${d.etf_pool_size || 0}</span>
+                <span class="k">行业数据</span><span class="v">${d.industry_loaded || 0}/${d.industry_pool_size || 0}</span>
+                <span class="k">订单</span><span class="v">${orders.length}</span>
+            </div>`;
+            if (d.errors && d.errors.length){
+                d.errors.slice(0,2).forEach(err => html += `<div class="alert alert-bad">${esc(err)}</div>`);
+            }
+            html += '<div class="ri-sub" style="margin:8px 0 4px">ETF 入选</div>';
+            html += etfs.length ? etfs.slice(0,4).map(s=>`
+                <div class="row-item"><span class="rank">${s.rank || ''}</span>
+                    <div class="ri-main"><div class="ri-name">${esc(s.name || s.code)}</div>
+                    <div class="ri-sub">${esc(s.code)} · RPS ${(s.rps || 0).toFixed(0)} · 量 ${fmt(s.avg_volume,0)}</div></div>
+                    <div class="ri-right"><div class="px">¥${fmt(s.price,3)}</div>
+                    <div class="pct ${pnlC(s.momentum)}">${fmtPct(s.momentum)}</div></div>
+                </div>`).join('') : '<div class="empty" style="padding:10px">无 ETF 入选</div>';
+            html += '<div class="ri-sub" style="margin:10px 0 4px">行业强弱(观察)</div>';
+            html += industries.length ? industries.slice(0,3).map(s=>`
+                <div class="row-item"><span class="rank">${s.rank || ''}</span>
+                    <div class="ri-main"><div class="ri-name">${esc(s.name || s.code)}</div>
+                    <div class="ri-sub">RPS ${(s.rps || 0).toFixed(0)} · 不直接下单</div></div>
+                    <div class="ri-right"><div class="pct ${pnlC(s.momentum)}">${fmtPct(s.momentum)}</div></div>
+                </div>`).join('') : '<div class="empty" style="padding:10px">无行业数据</div>';
+            if (orders.length){
+                html += '<div class="ri-sub" style="margin:10px 0 4px">RPS 订单</div>';
+                html += orders.slice(0,4).map(o=>`
+                    <div class="row-item">
+                        <span class="badge ${o.action === 'buy' ? 'badge-buy' : 'badge-sell'}">${o.action === 'buy' ? '买' : '卖'}</span>
+                        <div class="ri-main"><div class="ri-name">${esc(o.name || o.code)}</div>
+                        <div class="ri-sub">${esc(o.status || '--')} · ${esc(o.reason || o.message || '')}</div></div>
+                        <div class="ri-right"><div class="px">${o.shares || 0}份</div><div class="ri-sub">¥${fmt(o.price,3)}</div></div>
+                    </div>`).join('');
+            }
+            el.innerHTML = html;
+        } catch(e){
+            $('rps-body').innerHTML='<div class="empty">RPS 状态不可用</div>';
+        }
+    }
+
     // ---------- trades ----------
     async function loadTrades(){
         try {
@@ -481,7 +542,7 @@
     }
 
     // ---------- loop ----------
-    function fast(){ flash(); loadStatus(); loadPortfolio(); loadTrades(); loadCandidates(); loadLogs(); loadEquity(); }
+    function fast(){ flash(); loadStatus(); loadPortfolio(); loadTrades(); loadCandidates(); loadRps(); loadLogs(); loadEquity(); }
     function slow(){ loadObservation(); loadBacktest(); }
     fast(); slow();
     setInterval(fast, 5000);

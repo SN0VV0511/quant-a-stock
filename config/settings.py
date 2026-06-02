@@ -129,6 +129,8 @@ RPS_LOOKBACK_DAYS = 20          # RPS 回看周期(日频)
 RPS_MIN_SCORE = 85.0            # 入选最低相对强弱分位
 RPS_TOP_N = 2                   # 每日最多持有/买入数量
 RPS_MIN_AVG_VOLUME = 500_000    # 20 日均量下限
+RPS_HISTORY_DAYS = 120          # RPS 拉取历史行情天数
+ENABLE_RPS_ROTATION = os.getenv("ENABLE_RPS_ROTATION", "true").strip().lower() not in ("false", "0", "no", "off")
 
 
 # ==================== 默认标的池 ====================
@@ -190,6 +192,7 @@ STATE_FILE = os.path.join(DATA_DIR, "portfolio_state.json")
 TRADE_LOG_FILE = os.path.join(DATA_DIR, "trade_log.json")
 TRADE_EVENTS_FILE = os.path.join(DATA_DIR, "trade_events.jsonl")
 SNAPSHOT_LOG_FILE = os.path.join(DATA_DIR, "portfolio_snapshots.jsonl")
+RPS_STATE_FILE = os.path.join(DATA_DIR, "rps_state.json")
 CACHE_DIR = os.path.join(DATA_DIR, "cache")
 REPORT_DIR = os.path.join(BASE_DIR, "reports")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -315,6 +318,32 @@ def is_a_share_stock(code: str) -> bool:
 def is_supported_trading_target(code: str) -> bool:
     """判断是否为当前交易通道支持的沪深 A 股股票或 ETF。"""
     return is_a_share_stock(code) or is_etf(code)
+
+
+def get_etf_market(code: str) -> str | None:
+    """返回 ETF 所属市场，非支持 ETF 返回 None。"""
+    prefix, raw_code = _split_market_prefix(code)
+    if not raw_code.isdigit() or len(raw_code) != 6:
+        return None
+    if raw_code.startswith(SH_ETF_PREFIXES):
+        market = "sh"
+    elif raw_code.startswith(SZ_ETF_PREFIXES):
+        market = "sz"
+    else:
+        return None
+    if prefix is not None and prefix != market:
+        return None
+    return market
+
+
+def to_tencent_security_code(code: str) -> str:
+    """转换为腾讯实时行情代码，支持沪深 A 股股票和 ETF。"""
+    if is_a_share_stock(code):
+        return to_tencent_code(code)
+    market = get_etf_market(code)
+    if market is None:
+        raise ValueError(f"非沪深 A 股股票/ETF 代码，无法请求腾讯行情: {code}")
+    return f"{market}{normalize_a_share_code(code)}"
 
 
 def to_tencent_code(code: str) -> str:

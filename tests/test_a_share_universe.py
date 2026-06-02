@@ -12,6 +12,7 @@ from config.settings import (
     is_chinext,
     normalize_a_share_code,
     to_baostock_code,
+    to_tencent_security_code,
     to_tencent_code,
 )
 from data.ak_loader import AKDataLoader
@@ -31,6 +32,8 @@ def test_a_share_code_helpers_accept_hu_shen_stocks() -> None:
     assert is_chinext("sz301308") is True
     assert to_tencent_code("600519") == "sh600519"
     assert to_tencent_code("000001") == "sz000001"
+    assert to_tencent_security_code("510300") == "sh510300"
+    assert to_tencent_security_code("159915") == "sz159915"
     assert to_baostock_code("sh601988") == "sh.601988"
     assert is_etf("510300") is True
     assert is_etf("sz159915") is True
@@ -43,8 +46,6 @@ def test_a_share_code_helpers_accept_hu_shen_stocks() -> None:
     [
         "sh000001",  # 上证指数
         "sz399001",  # 深证成指
-        "159915",  # ETF
-        "sh510300",  # ETF
         "hk00700",  # 港股
         "usAAPL",  # 美股
         "bj430047",  # 北交所，本轮暂不纳入
@@ -60,8 +61,8 @@ def test_a_share_code_helpers_reject_non_supported_targets(code: str) -> None:
         to_baostock_code(code)
 
 
-def test_realtime_loader_ignores_non_a_share_codes(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """实时行情请求应在联网前过滤掉非沪深 A 股股票。"""
+def test_realtime_loader_ignores_unsupported_codes(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """实时行情请求应在联网前过滤掉非沪深 A 股股票/ETF。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
 
     def _fail_urlopen(*_args, **_kwargs):
@@ -69,7 +70,7 @@ def test_realtime_loader_ignores_non_a_share_codes(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr("urllib.request.urlopen", _fail_urlopen)
 
-    quotes = loader.get_realtime_quotes(["hk00700", "sh000001", "159915"])
+    quotes = loader.get_realtime_quotes(["hk00700", "sh000001", "bj430047"])
 
     assert quotes == {}
 

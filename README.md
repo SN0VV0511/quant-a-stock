@@ -114,12 +114,19 @@ python live_runner.py --broker paper
 
 虚拟盘运行流程：
 
-1. 开盘前或启动时做一次全市场扫描。
-2. 盯盘线程持续更新持仓价格和候选股价格。
-3. 持仓触发止损、止盈或策略卖出时生成卖出订单。
-4. 候选股触发组合策略买入信号时生成买入订单。
-5. 所有订单先经过风控，再进入 `PaperBrokerAdapter` 虚拟成交。
-6. 信号、风控、成交和账户快照写入结构化事件。
+1. 开盘后先执行一次 ETF/RPS 日频轮动，使用 AKShare 拉取 ETF 与行业指数历史数据。
+2. ETF/RPS 生成的买卖订单先经过风控，再进入 `PaperBrokerAdapter` 虚拟成交。
+3. 开盘后延迟确认全市场扫描，形成股票候选池。
+4. 盯盘线程持续更新持仓价格和候选股价格。
+5. 持仓触发止损、止盈或策略卖出时生成卖出订单。
+6. 候选股触发组合策略买入信号时生成买入订单。
+7. 所有信号、风控、成交、RPS 状态和账户快照写入结构化文件，供 1-2 个月观察期验收。
+
+ETF/RPS 观察文件：
+
+- `data/rps_state.json`：每日 ETF/RPS 数据源状态、ETF 入选、行业强弱和订单结果。
+- `data/trade_events.jsonl`：包含 `rps_rotation_completed`、`signal`、`risk_approved`、`execution` 等事件。
+- `reports/daily_YYYYMMDD.txt`：收盘日报会包含 ETF/RPS 摘要。
 
 ## 后台守护运行
 
@@ -204,6 +211,7 @@ python scripts/paper_acceptance.py --days 30 --min-snapshot-days 20 --json
 
 - 连续运行 20 个以上交易日。
 - `paper_healthcheck.py` 无失败项。
+- `data/rps_state.json` 最近一次状态为 `ok` 且 ETF 数据成功加载。
 - `monthly_review.py` 指标可解释，最大回撤和交易次数符合策略预期。
 - `paper_acceptance.py` 输出 `ready_for_qmt_dry_run=true`。
 - `trade_events.jsonl` 能串起每笔成交对应的信号、风控和成交。

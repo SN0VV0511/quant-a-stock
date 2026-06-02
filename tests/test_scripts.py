@@ -80,6 +80,39 @@ def test_paper_healthcheck_passes_valid_state(tmp_path) -> None:
     assert result.metrics["trade_count"] == 1
 
 
+def test_paper_healthcheck_accepts_etf_position_and_trade(tmp_path) -> None:
+    """健康检查应接受观察期 ETF/RPS 持仓和交易流水。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "portfolio_state.json").write_text(json.dumps({
+        "cash": 9000.0,
+        "positions": {
+            "510300": {
+                "name": "沪深300ETF",
+                "shares": 100,
+                "avg_cost": 4.0,
+                "current_price": 4.1,
+                "buy_date": "20260527",
+                "strategy": "ETF/行业RPS轮动",
+            }
+        },
+        "trades": [],
+    }, ensure_ascii=False), encoding="utf-8")
+    _write_jsonl(data_dir / "trade_log.json", [{
+        "date": "20260527",
+        "action": "buy",
+        "code": "510300",
+        "shares": 100,
+        "price": 4.0,
+    }])
+
+    result = run_healthcheck(tmp_path)
+
+    assert result.ok is True
+    assert result.metrics["position_count"] == 1
+    assert result.metrics["trade_count"] == 1
+
+
 def test_paper_healthcheck_fails_negative_cash(tmp_path) -> None:
     """健康检查应拒绝负现金。"""
     data_dir = tmp_path / "data"
@@ -433,6 +466,16 @@ def test_paper_acceptance_passes_after_enough_snapshots(tmp_path) -> None:
         f"当前总值: ¥{latest_total:,.2f}\n",
         encoding="utf-8",
     )
+    (data_dir / "rps_state.json").write_text(json.dumps({
+        "date": latest_date,
+        "status": "ok",
+        "completed": True,
+        "etf_loaded": 3,
+        "industry_loaded": 2,
+        "etf_signals": [],
+        "industry_signals": [],
+        "orders": [],
+    }, ensure_ascii=False), encoding="utf-8")
 
     result = run_acceptance(tmp_path, days=30, min_snapshot_days=20)
 

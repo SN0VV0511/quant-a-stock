@@ -5,23 +5,22 @@
 
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # 添加项目根目录到 sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config.settings import (
-    INITIAL_CAPITAL, DEFAULT_ETF_PROXY_POOL, DEFAULT_STOCK_POOL,
-    DEFAULT_UNIVERSE, get_etf_codes, get_stock_codes, get_all_codes,
-    is_etf, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
+    DEFAULT_RPS_ETF_POOL,
+    DEFAULT_UNIVERSE, get_rps_etf_codes, get_all_codes,
+    is_etf, MAX_SINGLE_ETF, MAX_SINGLE_STOCK, RPS_HISTORY_DAYS,
 )
 from data.loader import DataLoader
 from data.ak_loader import AKDataLoader
 from rules.position import PositionManager
 from risk.control import RiskController
-from strategies.etf_momentum import ETFRotationStrategy
-from strategies.stock_selection import MainboardStockStrategy
 from strategies.market_scanner import MarketScanner
+from strategies.rps_rotation import RPSRotationStrategy
 from reports.generator import ReportGenerator
 
 from config.logging_setup import setup_logger
@@ -43,8 +42,7 @@ class DailyRunner:
         self.portfolio = PositionManager()
         self.risk_ctrl = RiskController()
         self.reporter = ReportGenerator()
-        self.etf_strategy = ETFRotationStrategy()
-        self.stock_strategy = MainboardStockStrategy()
+        self.rps_strategy = RPSRotationStrategy(target_pool=DEFAULT_RPS_ETF_POOL)
         self.scanner = MarketScanner(loader=self.ak_loader)
 
     def run(self, date_str=None):
@@ -87,7 +85,10 @@ class DailyRunner:
             # 3. 更新行情数据
             all_codes = get_all_codes()
             current_prices = self.loader.get_batch_latest_prices(all_codes)
-            logger.info(f"获取到 {len(current_prices)} 只标的价格")
+            etf_codes = get_rps_etf_codes()
+            if etf_codes:
+                current_prices.update(self.ak_loader.get_realtime_batch(etf_codes))
+            logger.info(f"获取到 {len(current_prices)} 只标的/ETF价格")
 
             if not current_prices:
                 logger.error("未获取到任何价格数据")
@@ -98,39 +99,24 @@ class DailyRunner:
             self.portfolio.save_snapshot(date_str, current_prices)
 
             # 5. 准备策略数据
-            # 加载近 120 天数据用于策略计算
-            start_dt = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=180)).strftime("%Y%m%d")
+            etf_data = self.ak_loader.get_batch_etf_history(
+                get_rps_etf_codes(),
+                days=RPS_HISTORY_DAYS,
+                max_batch=len(get_rps_etf_codes()),
+            )
 
-            etf_data = {}
-            for code in get_etf_codes():
-                try:
-                    df = self.loader.get_daily_data(code, start_dt, date_str, adjust_flag="2")
-                    if df is not None and not df.empty:
-                        etf_data[code] = df
-                except Exception as e:
-                    logger.warning(f"加载 ETF 数据失败 {code}: {e}")
-
-            stock_data = {}
-            for code in get_stock_codes():
-                try:
-                    df = self.loader.get_daily_data(code, start_dt, date_str, adjust_flag="2")
-                    if df is not None and not df.empty:
-                        stock_data[code] = df
-                except Exception as e:
-                    logger.warning(f"加载股票数据失败 {code}: {e}")
-
-            # 6. 运行 ETF 动量策略
+            # 6. 运行 ETF/RPS 日频轮动策略
             current_positions = self.portfolio.get_all_positions()
             all_orders = []
 
             try:
-                etf_orders = self.etf_strategy.generate_orders(
+                etf_orders = self.rps_strategy.generate_orders(
                     etf_data, current_positions, date_str
                 )
                 all_orders.extend(etf_orders)
-                logger.info(f"ETF 策略生成 {len(etf_orders)} 个订单")
+                logger.info(f"ETF/RPS 策略生成 {len(etf_orders)} 个订单")
             except Exception as e:
-                logger.error(f"ETF 策略执行失败: {e}")
+                logger.error(f"ETF/RPS 策略执行失败: {e}")
 
             # 7. 全市场扫描选股（替代原有固定股票池选股）
             scanner_orders = []
@@ -243,7 +229,7 @@ class DailyRunner:
             today_trades = []
             for order in approved:
                 code = order["code"]
-                name = DEFAULT_UNIVERSE.get(code, {}).get("name", code)
+                name = DEFAULT_RPS_ETF_POOL.get(code, DEFAULT_UNIVERSE.get(code, {})).get("name", code)
                 price = order["price"]
 
                 # 使用实际收盘价

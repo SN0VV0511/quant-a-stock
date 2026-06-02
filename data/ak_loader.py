@@ -27,7 +27,7 @@ from config.settings import (
     is_etf,
     normalize_a_share_code,
     to_baostock_code,
-    to_tencent_code,
+    to_tencent_security_code,
 )
 
 try:
@@ -364,7 +364,7 @@ class AKDataLoader:
         for code in codes:
             try:
                 raw_code = normalize_a_share_code(str(code))
-                tencent_code = to_tencent_code(str(code))
+                tencent_code = to_tencent_security_code(str(code))
             except ValueError:
                 invalid_codes.append(str(code))
                 continue

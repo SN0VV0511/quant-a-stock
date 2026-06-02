@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (
     INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR,
-    SNAPSHOT_LOG_FILE, normalize_a_share_code,
+    SNAPSHOT_LOG_FILE, RPS_STATE_FILE, normalize_a_share_code,
 )
 from data.ak_loader import AKDataLoader
 from scripts.paper_status import build_status
@@ -81,6 +81,34 @@ def load_trade_log():
             if key not in known:
                 trades.append(trade)
     return trades
+
+
+def load_rps_state():
+    """读取 ETF/RPS 日频轮动状态。"""
+    if not os.path.exists(RPS_STATE_FILE):
+        return {
+            "available": False,
+            "status": "missing",
+            "message": "尚未生成 ETF/RPS 状态",
+            "etf_signals": [],
+            "industry_signals": [],
+            "orders": [],
+        }
+    try:
+        with open(RPS_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["available"] = True
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("读取 RPS 状态失败: %s", exc)
+        return {
+            "available": False,
+            "status": "error",
+            "message": str(exc),
+            "etf_signals": [],
+            "industry_signals": [],
+            "orders": [],
+        }
 
 
 def normalize_code(code):
@@ -165,6 +193,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "/api/logs": lambda: self._json_response(self._api_logs(params)),
             "/api/status": lambda: self._json_response(self._api_status()),
             "/api/observation": lambda: self._json_response(self._api_observation()),
+            "/api/rps": lambda: self._json_response(self._api_rps()),
             "/api/candidates": lambda: self._json_response(self._api_candidates()),
             "/api/equity": lambda: self._json_response(self._api_equity()),
             "/api/backtest": lambda: self._json_response(self._api_backtest()),
@@ -394,6 +423,10 @@ class QuantHandler(SimpleHTTPRequestHandler):
     def _api_observation(self):
         """虚拟盘观察期统一状态。"""
         return asdict(build_status(ROOT_DIR, log_lines=30))
+
+    def _api_rps(self):
+        """ETF/RPS 日频轮动状态。"""
+        return load_rps_state()
 
     def _api_equity(self):
         """净值曲线与回撤序列。

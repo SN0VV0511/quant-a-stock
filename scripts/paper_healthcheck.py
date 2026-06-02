@@ -24,8 +24,8 @@ from config.settings import (
     MAX_SINGLE_ETF,
     MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION,
-    is_a_share_stock,
     is_etf,
+    is_supported_trading_target,
 )
 
 
@@ -119,8 +119,8 @@ def _check_state(state: dict[str, Any], result: HealthcheckResult) -> None:
     position_value = 0.0
     position_values: dict[str, float] = {}
     for code, pos in positions.items():
-        if not is_a_share_stock(str(code)):
-            result.fail(f"持仓标的不是沪深 A 股股票: {code}")
+        if not is_supported_trading_target(str(code)):
+            result.fail(f"持仓标的不是沪深 A 股股票或 ETF: {code}")
         if not isinstance(pos, dict):
             result.fail(f"持仓结构非法: {code}")
             continue
@@ -211,8 +211,8 @@ def _check_trades(trades: list[dict[str, Any]], result: HealthcheckResult) -> No
     valid_actions = {"buy", "sell"}
     for idx, trade in enumerate(trades, start=1):
         code = str(trade.get("code", ""))
-        if not is_a_share_stock(code):
-            result.fail(f"交易流水第 {idx} 行标的不是沪深 A 股股票: {code}")
+        if not is_supported_trading_target(code):
+            result.fail(f"交易流水第 {idx} 行标的不是沪深 A 股股票或 ETF: {code}")
         action = trade.get("action") or trade.get("direction")
         if action not in valid_actions:
             result.fail(f"交易流水第 {idx} 行方向非法: {action}")
@@ -276,8 +276,8 @@ def _check_events(
         elif event_type == "execution":
             key = _event_order_key(payload)
             code = str(payload.get("code", ""))
-            if not is_a_share_stock(code):
-                result.fail(f"成交事件第 {idx} 行标的不是沪深 A 股股票: {code}")
+            if not is_supported_trading_target(code):
+                result.fail(f"成交事件第 {idx} 行标的不是沪深 A 股股票或 ETF: {code}")
             if payload.get("status") == "filled":
                 shares = payload.get("shares")
                 actual_price = payload.get("actual_price")

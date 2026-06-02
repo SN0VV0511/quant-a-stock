@@ -11,6 +11,7 @@ A 股虚拟盘实时盯盘系统。
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -26,18 +27,27 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config.settings import (  # noqa: E402
     BROKER_MODE,
     CASH_BUFFER,
+    DEFAULT_INDUSTRY_INDEX_POOL,
+    DEFAULT_RPS_ETF_POOL,
+    ENABLE_RPS_ROTATION,
     INITIAL_CAPITAL,
     ATR_PERIOD,
     LIVE_INITIAL_SCAN_DELAY_MINUTES,
     LIVE_SCAN_INTERVAL_SECONDS,
     LIVE_WATCH_INTERVAL_SECONDS,
     LOT_SIZE,
+    MAX_SINGLE_ETF,
     MAX_SINGLE_STOCK,
+    MAX_TOTAL_POSITION,
     REBUY_COOLDOWN_SECONDS,
     REPORT_DIR,
+    RPS_HISTORY_DAYS,
+    RPS_STATE_FILE,
     ENABLE_MARKET_REGIME,
     MARKET_INDEX_CODE,
     MARKET_REGIME_MA,
+    get_industry_index_names,
+    get_rps_etf_codes,
     normalize_a_share_code,
 )
 from config.logging_setup import setup_logger  # noqa: E402
@@ -49,6 +59,7 @@ from strategies.exit_rules import evaluate_exit  # noqa: E402
 from strategies.indicators import calculate_atr  # noqa: E402
 from strategies.market_regime import is_risk_on  # noqa: E402
 from strategies.market_scanner import MarketScanner  # noqa: E402
+from strategies.rps_rotation import RPSRotationStrategy, calculate_rps_scores  # noqa: E402
 from trading.brokers import PaperBrokerAdapter, create_broker  # noqa: E402
 from trading.models import ExecutionReport, OrderIntent, RiskDecision  # noqa: E402
 from trading.observability import EventRecorder  # noqa: E402
@@ -321,6 +332,276 @@ def _get_current_quotes(
     prices, mapped_quotes = _map_quotes_to_codes(unique_codes, quotes_raw)
     market_data = _build_market_data(mapped_quotes)
     return prices, mapped_quotes, market_data
+
+
+def _read_rps_state() -> dict[str, Any]:
+    """读取 ETF/RPS 日频状态。"""
+    if not os.path.exists(RPS_STATE_FILE):
+        return {}
+    try:
+        with open(RPS_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("读取 RPS 状态失败: %s", exc)
+        return {}
+
+
+def _write_rps_state(state: dict[str, Any]) -> None:
+    """写入 ETF/RPS 日频状态，供前端和验收读取。"""
+    os.makedirs(os.path.dirname(RPS_STATE_FILE), exist_ok=True)
+    tmp_path = f"{RPS_STATE_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+    os.replace(tmp_path, RPS_STATE_FILE)
+
+
+def _should_skip_rps(today: str, force: bool) -> bool:
+    """判断当天 RPS 是否已完成，避免服务重启重复调仓。"""
+    if force:
+        return False
+    state = _read_rps_state()
+    return (
+        state.get("date") == today
+        and state.get("status") == "ok"
+        and state.get("completed") is True
+    )
+
+
+def _latest_history_market_data(
+    history_map: dict[str, pd.DataFrame],
+) -> tuple[dict[str, float], dict[str, dict[str, Any]]]:
+    """从历史行情尾部构造价格与风控行情，作为实时行情失败时的兜底。"""
+    prices: dict[str, float] = {}
+    market_data: dict[str, dict[str, Any]] = {}
+    for code, df in history_map.items():
+        if df is None or df.empty or "close" not in df.columns:
+            continue
+        close = pd.to_numeric(df["close"], errors="coerce").dropna()
+        if close.empty:
+            continue
+        price = float(close.iloc[-1])
+        prev_close = float(close.iloc[-2]) if len(close) >= 2 else price
+        if price <= 0:
+            continue
+        prices[code] = price
+        market_data[code] = {
+            "current_price": price,
+            "prev_close": prev_close,
+            "is_st": False,
+            "is_suspended": False,
+        }
+    return prices, market_data
+
+
+def _merge_market_data(
+    base: dict[str, dict[str, Any]],
+    fallback: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """合并风控行情，实时行情优先，历史尾部兜底。"""
+    merged = dict(fallback)
+    merged.update(base)
+    return merged
+
+
+def _calculate_buy_shares(
+    broker: PaperBrokerAdapter,
+    price: float,
+    prices: dict[str, float],
+    target_count: int,
+) -> int:
+    """按 ETF/RPS 目标数量计算买入份额。"""
+    if price <= 0:
+        return 0
+    target_ratio = min(MAX_SINGLE_ETF, MAX_TOTAL_POSITION / max(1, target_count))
+    return broker.portfolio.rules.calc_lot_size(
+        price,
+        broker.query_cash(),
+        max_ratio=target_ratio,
+        total_value=broker.portfolio.get_total_value(prices),
+    )
+
+
+def _run_daily_rps_rotation(
+    broker: PaperBrokerAdapter,
+    loader: AKDataLoader,
+    risk_ctrl: RiskController,
+    recorder: EventRecorder,
+    today: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """执行 ETF/RPS 日频轮动并写入观察期状态。
+
+    本函数是观察期实盘模拟链路的一部分:信号、风控、成交都会进入
+    ``trade_events.jsonl``。行业指数只记录强弱观察结果,不会生成订单。
+    """
+    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not ENABLE_RPS_ROTATION:
+        state = {
+            "date": today,
+            "status": "disabled",
+            "completed": True,
+            "started_at": started_at,
+            "updated_at": started_at,
+            "message": "ENABLE_RPS_ROTATION=false",
+            "etf_signals": [],
+            "industry_signals": [],
+            "orders": [],
+        }
+        _write_rps_state(state)
+        recorder.record("rps_rotation_skipped", state)
+        logger.info("ETF/RPS 轮动已关闭")
+        return state
+
+    if _should_skip_rps(today, force):
+        state = _read_rps_state()
+        recorder.record("rps_rotation_skipped", {
+            "date": today,
+            "reason": "今日已完成，跳过重复调仓",
+        })
+        logger.info("ETF/RPS 今日已完成，跳过重复调仓")
+        return state
+
+    state: dict[str, Any] = {
+        "date": today,
+        "status": "running",
+        "completed": False,
+        "started_at": started_at,
+        "updated_at": started_at,
+        "data_source": "AKShare: fund_etf_hist_em + stock_board_industry_hist_em",
+        "etf_pool_size": len(DEFAULT_RPS_ETF_POOL),
+        "industry_pool_size": len(DEFAULT_INDUSTRY_INDEX_POOL),
+        "etf_loaded": 0,
+        "industry_loaded": 0,
+        "etf_signals": [],
+        "industry_signals": [],
+        "orders": [],
+        "errors": [],
+    }
+    _write_rps_state(state)
+
+    try:
+        logger.info("===== 开始 ETF/RPS 日频轮动 =====")
+        etf_codes = get_rps_etf_codes()
+        etf_history = loader.get_batch_etf_history(etf_codes, days=RPS_HISTORY_DAYS, max_batch=len(etf_codes))
+        industry_names = get_industry_index_names()
+        industry_history = loader.get_batch_industry_index_history(
+            industry_names,
+            days=RPS_HISTORY_DAYS,
+            max_batch=len(industry_names),
+        )
+
+        strategy = RPSRotationStrategy(target_pool=DEFAULT_RPS_ETF_POOL)
+        etf_signals = strategy.calculate_signals(etf_history, today)
+        industry_signals = calculate_rps_scores(
+            industry_history,
+            lookback=strategy.lookback,
+            top_n=min(10, max(1, len(industry_history))),
+            min_rps=0,
+            min_avg_volume=0,
+            name_map={name: name for name in industry_history},
+        )
+        orders_raw = strategy.generate_orders(etf_history, broker.query_positions(), today)
+
+        fallback_prices, fallback_market_data = _latest_history_market_data(etf_history)
+        quote_prices, _, quote_market_data = _get_current_quotes(loader, list(set(etf_codes + [o["code"] for o in orders_raw])))
+        prices = {**fallback_prices, **quote_prices}
+        market_data = _merge_market_data(quote_market_data, fallback_market_data)
+        broker.portfolio.update_prices(prices)
+
+        selected_count = max(1, len([s for s in etf_signals if s.get("code")]))
+        submitted_orders: list[dict[str, Any]] = []
+        for raw_order in orders_raw:
+            code = str(raw_order["code"])
+            price = float(prices.get(code) or raw_order.get("price") or 0)
+            if price <= 0:
+                skipped = {
+                    "code": code,
+                    "action": raw_order.get("action"),
+                    "status": "skipped",
+                    "reason": "缺少 ETF 有效价格",
+                }
+                submitted_orders.append(skipped)
+                recorder.record("signal_skipped", skipped)
+                continue
+
+            shares = int(raw_order.get("shares", 0) or 0)
+            if raw_order["action"] == "buy":
+                shares = _calculate_buy_shares(broker, price, prices, selected_count)
+                if shares < LOT_SIZE:
+                    skipped = {
+                        "code": code,
+                        "action": "buy",
+                        "status": "skipped",
+                        "reason": "ETF/RPS 可买数量不足一手",
+                        "price": price,
+                        "cash": broker.query_cash(),
+                    }
+                    submitted_orders.append(skipped)
+                    recorder.record("signal_skipped", skipped)
+                    continue
+
+            order = OrderIntent(
+                code=code,
+                name=str(raw_order.get("name", DEFAULT_RPS_ETF_POOL.get(code, {}).get("name", code))),
+                action=raw_order["action"],
+                price=price,
+                shares=shares,
+                date=today,
+                strategy=str(raw_order.get("strategy", "ETF/行业RPS轮动")),
+                reason=str(raw_order.get("reason", "")),
+                source="daily_rps_rotation",
+                metadata={
+                    "rps_signals": etf_signals,
+                    "industry_top": industry_signals[:5],
+                    "data_source": "AKShare",
+                },
+            )
+            report = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+            submitted_orders.append({
+                "code": order.code,
+                "name": order.name,
+                "action": order.action,
+                "price": order.price,
+                "shares": order.shares,
+                "status": report.status if report else "risk_rejected",
+                "message": report.message if report else "风控拒绝",
+                "reason": order.reason,
+            })
+
+        state.update({
+            "status": "ok",
+            "completed": True,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "etf_loaded": len(etf_history),
+            "industry_loaded": len(industry_history),
+            "etf_signals": etf_signals,
+            "industry_signals": industry_signals,
+            "orders": submitted_orders,
+        })
+        _write_rps_state(state)
+        recorder.record("rps_rotation_completed", state)
+        logger.info(
+            "ETF/RPS 完成: ETF数据 %d/%d 行业数据 %d/%d 信号 %d 订单 %d",
+            len(etf_history),
+            len(etf_codes),
+            len(industry_history),
+            len(industry_names),
+            len(etf_signals),
+            len(submitted_orders),
+        )
+        return state
+    except Exception as exc:
+        state.update({
+            "status": "error",
+            "completed": False,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "errors": [str(exc)],
+        })
+        _write_rps_state(state)
+        recorder.record("rps_rotation_failed", state)
+        logger.error("ETF/RPS 日频轮动失败: %s", exc, exc_info=True)
+        return state
 
 
 def watch_thread(
@@ -723,6 +1004,23 @@ def _generate_report(
     if not today_trades:
         report_lines.append("  (无交易)")
 
+    rps_state = _read_rps_state()
+    report_lines.extend(["", "ETF/RPS 日频:"])
+    if rps_state.get("date") == today:
+        report_lines.append(
+            f"  状态={rps_state.get('status', '--')} "
+            f"ETF数据={rps_state.get('etf_loaded', 0)}/{rps_state.get('etf_pool_size', 0)} "
+            f"行业数据={rps_state.get('industry_loaded', 0)}/{rps_state.get('industry_pool_size', 0)} "
+            f"订单={len(rps_state.get('orders', []))}"
+        )
+        for signal in list(rps_state.get("etf_signals", []))[:3]:
+            report_lines.append(
+                f"  ETF入选 {signal.get('name', signal.get('code'))} "
+                f"RPS={float(signal.get('rps', 0)):.0f} 动量={float(signal.get('momentum', 0)):+.2%}"
+            )
+    else:
+        report_lines.append("  今日未记录 RPS 状态")
+
     report_lines.append("=" * 50)
     report_text = "\n".join(report_lines)
     logger.info("\n%s", report_text)
@@ -743,6 +1041,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-scan-delay-minutes", type=int, default=LIVE_INITIAL_SCAN_DELAY_MINUTES,
                         help="开盘后首次全市场确认扫描延迟分钟数")
     parser.add_argument("--top-n", type=int, default=30, help="候选股数量")
+    parser.add_argument("--force-rps", action="store_true", help="强制重跑当天 ETF/RPS 日频轮动")
     parser.add_argument("--ignore-calendar", action="store_true", help="忽略交易日判断，便于联调")
     return parser.parse_args()
 
@@ -784,6 +1083,16 @@ def main() -> None:
 
     if now < market_open:
         _wait_until(market_open, "等待开盘启动盯盘")
+
+    today = datetime.now().strftime("%Y%m%d")
+    _run_daily_rps_rotation(
+        broker=broker,
+        loader=loader,
+        risk_ctrl=risk_ctrl,
+        recorder=recorder,
+        today=today,
+        force=args.force_rps,
+    )
 
     logger.info("===== 开盘：启动盯盘线 =====")
     t_watch = threading.Thread(
