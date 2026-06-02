@@ -5,6 +5,8 @@
 - 历史数据: BaoStock
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -22,6 +24,7 @@ import numpy as np
 
 from config.settings import (
     is_a_share_stock,
+    is_etf,
     normalize_a_share_code,
     to_baostock_code,
     to_tencent_code,
@@ -31,6 +34,11 @@ try:
     import baostock as bs
 except ImportError:  # pragma: no cover - 运行环境可能未安装行情依赖
     bs = None
+
+try:
+    import akshare as ak
+except ImportError:  # pragma: no cover - 运行环境可能未安装行情依赖
+    ak = None
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +84,93 @@ def _require_baostock():
     """确保 BaoStock 依赖已安装。"""
     if bs is None:
         raise ImportError("缺少 baostock 依赖，请先执行: pip install -r requirements.txt")
+
+
+def _require_akshare():
+    """确保 AKShare 依赖已安装。"""
+    if ak is None:
+        raise ImportError("缺少 akshare 依赖，请先执行: pip install -r requirements.txt")
+
+
+def _normalize_compact_date(value: object) -> str:
+    """将常见日期值归一化为 YYYYMMDD。"""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return text.replace("-", "").replace("/", "")[:8]
+    return parsed.strftime("%Y%m%d")
+
+
+def _safe_cache_fragment(value: object) -> str:
+    """生成可用于缓存文件名的短字符串。"""
+    raw = str(value).strip()
+    safe = "".join(ch if ch.isalnum() else "_" for ch in raw)
+    return safe[:80] or "empty"
+
+
+def _pick_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+    """按候选名称查找 DataFrame 列。"""
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
+
+
+def _normalize_market_history(
+    raw_df: pd.DataFrame,
+    code: str,
+    name: str | None = None,
+) -> pd.DataFrame:
+    """将 AKShare ETF/行业指数历史行情标准化为策略统一字段。
+
+    Args:
+        raw_df: AKShare 原始返回数据。
+        code: 标的代码或行业名称。
+        name: 展示名称。
+
+    Returns:
+        含 ``date/open/high/low/close/volume/amount/pctChg`` 的 DataFrame。
+
+    Raises:
+        ValueError: 当缺少日期或收盘价字段时抛出。
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    columns = {
+        "date": ("日期", "date", "时间"),
+        "open": ("开盘", "open", "开盘价"),
+        "high": ("最高", "high", "最高价"),
+        "low": ("最低", "low", "最低价"),
+        "close": ("收盘", "close", "收盘价"),
+        "volume": ("成交量", "volume", "成交量(股)"),
+        "amount": ("成交额", "amount", "成交额(元)"),
+        "pctChg": ("涨跌幅", "pctChg", "涨幅"),
+    }
+    picked = {target: _pick_column(raw_df, candidates) for target, candidates in columns.items()}
+    if picked["date"] is None or picked["close"] is None:
+        raise ValueError(f"行情数据缺少必要字段: columns={list(raw_df.columns)}")
+
+    df = pd.DataFrame()
+    df["date"] = raw_df[picked["date"]].map(_normalize_compact_date)
+    df["code"] = code
+    df["name"] = name or code
+    for target in ("open", "high", "low", "close", "volume", "amount", "pctChg"):
+        source = picked[target]
+        if source is None:
+            df[target] = np.nan
+        else:
+            df[target] = pd.to_numeric(raw_df[source], errors="coerce")
+
+    df = df.dropna(subset=["date", "close"])
+    df = df[df["date"].astype(str).str.len() == 8]
+    df = df[df["close"] > 0]
+    df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    return df
 
 
 class AKDataLoader:
@@ -577,6 +672,218 @@ class AKDataLoader:
 
         self._write_cache(cache_key, df)
         return df
+
+    def get_etf_history(
+        self,
+        code: str,
+        days: int = 120,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame | None:
+        """通过 AKShare 获取 ETF 日线历史行情。
+
+        Args:
+            code: ETF 代码,支持 ``510300`` / ``sh510300`` / ``sz159915``。
+            days: 未显式传入日期区间时的回溯自然日数。
+            start_date: 起始日期,支持 YYYYMMDD 或 YYYY-MM-DD。
+            end_date: 结束日期,支持 YYYYMMDD 或 YYYY-MM-DD。
+            adjust: 复权方式,AKShare 支持 ``""`` / ``qfq`` / ``hfq``。
+
+        Returns:
+            标准化后的日线 DataFrame,失败时返回 None。
+        """
+        raw_code = str(code).strip().lower().replace(".", "")
+        if raw_code.startswith(("sh", "sz")):
+            raw_code = raw_code[2:]
+        if not is_etf(raw_code):
+            logger.warning("ETF 历史行情忽略非 ETF 代码: %s", code)
+            return None
+
+        start, end = self._resolve_date_range(days, start_date, end_date)
+        cache_key = f"ak_etf_{raw_code}_{start}_{end}_{adjust or 'none'}"
+        cached = self._read_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            _require_akshare()
+            raw_df = ak.fund_etf_hist_em(
+                symbol=raw_code,
+                period="daily",
+                start_date=start,
+                end_date=end,
+                adjust=adjust,
+            )
+            df = _normalize_market_history(raw_df, code=raw_code)
+        except Exception as exc:
+            logger.warning("AKShare ETF 历史行情获取失败 %s: %s", code, exc)
+            return None
+
+        if df.empty:
+            logger.warning("AKShare ETF 历史行情为空: %s %s-%s", code, start, end)
+            return None
+        self._write_cache(cache_key, df)
+        return df
+
+    def get_batch_etf_history(
+        self,
+        codes: list[str],
+        days: int = 120,
+        max_batch: int = 50,
+        adjust: str = "qfq",
+    ) -> dict[str, pd.DataFrame]:
+        """批量获取 ETF 日线历史行情。
+
+        Args:
+            codes: ETF 代码列表。
+            days: 回溯自然日数。
+            max_batch: 单次最多请求数量,避免小服务器被外部接口拖慢。
+            adjust: 复权方式。
+
+        Returns:
+            ``{code: DataFrame}``。
+        """
+        result: dict[str, pd.DataFrame] = {}
+        target_codes = codes[:max_batch]
+        workers = min(4, max(1, len(target_codes)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(self.get_etf_history, code, days, None, None, adjust): code
+                for code in target_codes
+            }
+            for future in as_completed(future_map):
+                code = future_map[future]
+                try:
+                    df = future.result()
+                    if df is not None and not df.empty:
+                        result[code] = df
+                except Exception as exc:
+                    logger.warning("批量 ETF 历史行情失败 %s: %s", code, exc)
+        logger.info("ETF 历史行情完成: %d/%d 只", len(result), len(target_codes))
+        return result
+
+    def get_industry_index_history(
+        self,
+        industry_name: str,
+        days: int = 120,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        provider: str = "em",
+    ) -> pd.DataFrame | None:
+        """通过 AKShare 获取行业指数日线历史行情。
+
+        Args:
+            industry_name: 行业板块名称,例如 ``证券``、``半导体``。
+            days: 未显式传入日期区间时的回溯自然日数。
+            start_date: 起始日期,支持 YYYYMMDD 或 YYYY-MM-DD。
+            end_date: 结束日期,支持 YYYYMMDD 或 YYYY-MM-DD。
+            provider: ``em`` 使用东方财富行业板块,``ths`` 使用同花顺行业指数。
+
+        Returns:
+            标准化后的行业指数日线 DataFrame,失败时返回 None。
+        """
+        name = str(industry_name).strip()
+        if not name:
+            logger.warning("行业指数名称为空")
+            return None
+        if provider not in ("em", "ths"):
+            raise ValueError(f"不支持的行业指数数据源: {provider}")
+
+        start, end = self._resolve_date_range(days, start_date, end_date)
+        cache_name = _safe_cache_fragment(name)
+        cache_key = f"ak_industry_{provider}_{cache_name}_{start}_{end}"
+        cached = self._read_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            _require_akshare()
+            if provider == "em":
+                raw_df = ak.stock_board_industry_hist_em(
+                    symbol=name,
+                    start_date=start,
+                    end_date=end,
+                    period="日k",
+                    adjust="",
+                )
+            else:
+                raw_df = ak.stock_board_industry_index_ths(
+                    symbol=name,
+                    start_date=start,
+                    end_date=end,
+                )
+            df = _normalize_market_history(raw_df, code=name, name=name)
+        except Exception as exc:
+            logger.warning("AKShare 行业指数历史行情获取失败 %s(%s): %s", name, provider, exc)
+            return None
+
+        if df.empty:
+            logger.warning("AKShare 行业指数历史行情为空: %s %s-%s", name, start, end)
+            return None
+        self._write_cache(cache_key, df)
+        return df
+
+    def get_batch_industry_index_history(
+        self,
+        industry_names: list[str],
+        days: int = 120,
+        max_batch: int = 50,
+        provider: str = "em",
+    ) -> dict[str, pd.DataFrame]:
+        """批量获取行业指数日线历史行情。
+
+        Args:
+            industry_names: 行业名称列表。
+            days: 回溯自然日数。
+            max_batch: 单次最多请求数量。
+            provider: 行业指数数据源。
+
+        Returns:
+            ``{industry_name: DataFrame}``。
+        """
+        result: dict[str, pd.DataFrame] = {}
+        targets = industry_names[:max_batch]
+        workers = min(4, max(1, len(targets)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(
+                    self.get_industry_index_history,
+                    name,
+                    days,
+                    None,
+                    None,
+                    provider,
+                ): name
+                for name in targets
+            }
+            for future in as_completed(future_map):
+                name = future_map[future]
+                try:
+                    df = future.result()
+                    if df is not None and not df.empty:
+                        result[name] = df
+                except Exception as exc:
+                    logger.warning("批量行业指数历史行情失败 %s: %s", name, exc)
+        logger.info("行业指数历史行情完成: %d/%d 个", len(result), len(targets))
+        return result
+
+    @staticmethod
+    def _resolve_date_range(
+        days: int,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> tuple[str, str]:
+        """解析历史行情查询日期区间为 AKShare 需要的 YYYYMMDD。"""
+        if days <= 0:
+            raise ValueError(f"days 必须为正整数: {days}")
+        if start_date and end_date:
+            start = str(start_date).replace("-", "")[:8]
+            end = str(end_date).replace("-", "")[:8]
+            return start, end
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y%m%d")
+        return start, end
 
     def _cache_path(self, key):
         return os.path.join(self.cache_dir, f"{key}.pkl")

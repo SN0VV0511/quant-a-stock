@@ -6,7 +6,9 @@ import pytest
 
 from config.settings import (
     get_a_share_market,
+    is_etf,
     is_a_share_stock,
+    is_supported_trading_target,
     is_chinext,
     normalize_a_share_code,
     to_baostock_code,
@@ -30,6 +32,10 @@ def test_a_share_code_helpers_accept_hu_shen_stocks() -> None:
     assert to_tencent_code("600519") == "sh600519"
     assert to_tencent_code("000001") == "sz000001"
     assert to_baostock_code("sh601988") == "sh.601988"
+    assert is_etf("510300") is True
+    assert is_etf("sz159915") is True
+    assert is_supported_trading_target("510300") is True
+    assert is_supported_trading_target("600519") is True
 
 
 @pytest.mark.parametrize(
@@ -46,7 +52,7 @@ def test_a_share_code_helpers_accept_hu_shen_stocks() -> None:
     ],
 )
 def test_a_share_code_helpers_reject_non_supported_targets(code: str) -> None:
-    """指数、ETF、港美股、北交所和错误前缀不能进入实时交易范围。"""
+    """指数、ETF、港美股、北交所和错误前缀不能进入 A 股股票实时扫描范围。"""
     assert is_a_share_stock(code) is False
     with pytest.raises(ValueError):
         to_tencent_code(code)
@@ -100,7 +106,7 @@ def test_market_scanner_filters_input_to_hu_shen_a_shares() -> None:
 
 
 def test_risk_and_paper_broker_reject_non_a_share_order(tmp_path) -> None:
-    """风控和虚拟 Broker 都应拒绝非沪深 A 股股票订单。"""
+    """风控和虚拟 Broker 都应拒绝非沪深 A 股股票/ETF 订单。"""
     broker = PaperBrokerAdapter(
         state_file=str(tmp_path / "state.json"),
         trade_log_file=str(tmp_path / "trade_log.json"),
@@ -126,6 +132,37 @@ def test_risk_and_paper_broker_reject_non_a_share_order(tmp_path) -> None:
 
     assert approved == []
     assert len(rejected) == 1
-    assert "不是沪深 A 股股票" in rejected[0].reason
+    assert "不是支持的沪深 A 股股票或 ETF" in rejected[0].reason
     assert report.status == "rejected"
-    assert "仅支持沪深 A 股股票代码" in report.message
+    assert "仅支持沪深 A 股股票或 ETF 代码" in report.message
+
+
+def test_risk_and_paper_broker_allow_etf_order(tmp_path) -> None:
+    """ETF 订单应能通过风控与虚拟盘基础校验。"""
+    broker = PaperBrokerAdapter(
+        state_file=str(tmp_path / "state.json"),
+        trade_log_file=str(tmp_path / "trade_log.json"),
+        snapshot_log_file=str(tmp_path / "snapshots.jsonl"),
+    )
+    broker.connect()
+    risk = RiskController()
+    order = OrderIntent(
+        code="510300",
+        action="buy",
+        price=4.0,
+        shares=100,
+        name="沪深300ETF",
+        strategy="ETF/行业RPS轮动",
+        date="20260528",
+    )
+
+    approved, rejected = risk.filter_order_intents(
+        [order],
+        broker.portfolio,
+        {"510300": {"current_price": 4.0, "prev_close": 3.98, "is_st": False, "is_suspended": False}},
+    )
+    report = broker.place_order(approved[0])
+
+    assert rejected == []
+    assert len(approved) == 1
+    assert report.status == "filled"

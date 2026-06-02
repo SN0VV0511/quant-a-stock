@@ -132,6 +132,33 @@ RPS_MIN_AVG_VOLUME = 500_000    # 20 日均量下限
 
 
 # ==================== 默认标的池 ====================
+# 真实 ETF 池(AKShare 数据源)。RPS 日频轮动优先使用该池；保持数量克制,
+# 适配 4 核 4G 服务器,也避免小资金在过多行业上过度分散。
+DEFAULT_RPS_ETF_POOL = {
+    "510300": {"name": "沪深300ETF", "code": "510300", "raw_code": "510300", "asset_type": "etf"},
+    "510500": {"name": "中证500ETF", "code": "510500", "raw_code": "510500", "asset_type": "etf"},
+    "159915": {"name": "创业板ETF", "code": "159915", "raw_code": "159915", "asset_type": "etf"},
+    "588000": {"name": "科创50ETF", "code": "588000", "raw_code": "588000", "asset_type": "etf"},
+    "512100": {"name": "中证1000ETF", "code": "512100", "raw_code": "512100", "asset_type": "etf"},
+    "512880": {"name": "证券ETF", "code": "512880", "raw_code": "512880", "asset_type": "etf"},
+    "512760": {"name": "半导体ETF", "code": "512760", "raw_code": "512760", "asset_type": "etf"},
+    "512170": {"name": "医疗ETF", "code": "512170", "raw_code": "512170", "asset_type": "etf"},
+    "515790": {"name": "光伏ETF", "code": "515790", "raw_code": "515790", "asset_type": "etf"},
+    "516160": {"name": "新能源ETF", "code": "516160", "raw_code": "516160", "asset_type": "etf"},
+}
+
+# 行业指数池仅用于 RPS 观察/过滤,不作为可交易标的直接下单。
+DEFAULT_INDUSTRY_INDEX_POOL = {
+    "证券": {"name": "证券", "code": "证券", "asset_type": "industry_index"},
+    "半导体": {"name": "半导体", "code": "半导体", "asset_type": "industry_index"},
+    "光伏设备": {"name": "光伏设备", "code": "光伏设备", "asset_type": "industry_index"},
+    "电池": {"name": "电池", "code": "电池", "asset_type": "industry_index"},
+    "软件开发": {"name": "软件开发", "code": "软件开发", "asset_type": "industry_index"},
+    "通信设备": {"name": "通信设备", "code": "通信设备", "asset_type": "industry_index"},
+    "医疗服务": {"name": "医疗服务", "code": "医疗服务", "asset_type": "industry_index"},
+    "白酒": {"name": "白酒", "code": "白酒", "asset_type": "industry_index"},
+}
+
 # ETF 动量轮动标的（BaoStock 不支持 ETF，暂用宽基指数成分股代替）
 # 待接入 Tushare/AKShare 后替换为真实 ETF
 DEFAULT_ETF_PROXY_POOL = {
@@ -184,8 +211,18 @@ for d in [DATA_DIR, CACHE_DIR, REPORT_DIR, LOG_DIR]:
 
 
 def get_etf_codes():
-    """返回 ETF 代理标的代码列表（BaoStock 格式）"""
+    """返回旧版 ETF 代理标的代码列表（BaoStock 格式）。"""
     return list(DEFAULT_ETF_PROXY_POOL.keys())
+
+
+def get_rps_etf_codes() -> list[str]:
+    """返回真实 ETF RPS 轮动标的代码列表。"""
+    return list(DEFAULT_RPS_ETF_POOL.keys())
+
+
+def get_industry_index_names() -> list[str]:
+    """返回行业指数 RPS 观察池名称列表。"""
+    return list(DEFAULT_INDUSTRY_INDEX_POOL.keys())
 
 
 def get_stock_codes():
@@ -198,17 +235,23 @@ def get_all_codes():
     return list(DEFAULT_UNIVERSE.keys())
 
 
-def is_etf(code):
+SH_ETF_PREFIXES = ("51", "56", "58")
+SZ_ETF_PREFIXES = ("15",)
+
+
+def is_etf(code: str) -> bool:
     """判断是否为 ETF。
 
-    当前系统**仅交易沪深 A 股股票**,不交易 ETF,因此本函数有意恒返回 False。
-    这意味着 risk/control、rules/engine、rules/position 中所有 ETF 专属分支
-    (3bp 滑点、单票上限 45%、ETF 印花税豁免)目前都不会生效——这是当前
-    标的范围下的预期行为,并非遗漏。
-
-    中期 TODO:接入真实 ETF 数据源后,按代码前缀实现真正判断
-    (沪市 ETF:51/56/58 开头;深市 ETF:15 开头),并恢复上述分支。
+    支持 ``510300``、``sh510300``、``sh.510300``、``159915`` 等常见格式。
+    沪市 ETF 常见前缀为 51/56/58,深市 ETF 常见前缀为 15。
     """
+    prefix, raw_code = _split_market_prefix(code)
+    if not raw_code.isdigit() or len(raw_code) != 6:
+        return False
+    if raw_code.startswith(SH_ETF_PREFIXES):
+        return prefix in (None, "sh")
+    if raw_code.startswith(SZ_ETF_PREFIXES):
+        return prefix in (None, "sz")
     return False
 
 
@@ -267,6 +310,11 @@ def get_a_share_market(code: str) -> str | None:
 def is_a_share_stock(code: str) -> bool:
     """判断代码是否为当前系统支持的沪深 A 股股票。"""
     return get_a_share_market(code) is not None
+
+
+def is_supported_trading_target(code: str) -> bool:
+    """判断是否为当前交易通道支持的沪深 A 股股票或 ETF。"""
+    return is_a_share_stock(code) or is_etf(code)
 
 
 def to_tencent_code(code: str) -> str:

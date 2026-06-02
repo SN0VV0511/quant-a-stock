@@ -9,7 +9,7 @@ from datetime import datetime
 from config.settings import (
     INITIAL_CAPITAL, MAX_TOTAL_POSITION, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     CASH_BUFFER, DAILY_LOSS_THRESHOLD, MAX_DRAWDOWN_THRESHOLD, LOT_SIZE,
-    is_etf, is_a_share_stock, DEFAULT_UNIVERSE,
+    is_etf, is_supported_trading_target, DEFAULT_UNIVERSE,
 )
 from trading.models import OrderIntent, RiskDecision
 
@@ -86,13 +86,18 @@ class RiskController:
         code = order["code"]
         action = order["action"]
 
-        # 1. 标的范围检查：实时虚拟盘只允许沪深 A 股股票。
-        if not is_a_share_stock(code):
-            return False, f"标的 {code} 不是沪深 A 股股票"
+        # 1. 标的范围检查：当前交易通道允许沪深 A 股股票和 ETF。
+        if not is_supported_trading_target(code):
+            return False, f"标的 {code} 不是支持的沪深 A 股股票或 ETF"
 
         # 2. 标的白名单检查（扫描策略跳过白名单限制；卖出不限制）
         strategy_name = order.get("strategy", "")
-        if action == "buy" and "全市场扫描" not in strategy_name and code not in DEFAULT_UNIVERSE:
+        if (
+            action == "buy"
+            and not is_etf(code)
+            and "全市场扫描" not in strategy_name
+            and code not in DEFAULT_UNIVERSE
+        ):
             return False, f"标的 {code} 不在白名单中"
 
         # 3. 市场数据检查

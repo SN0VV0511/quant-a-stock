@@ -49,3 +49,22 @@ def test_generate_orders_daily_rotates_selected_pool() -> None:
     orders = strategy.generate_orders(history, portfolio, "20260228")
     assert any(o["action"] == "sell" and o["code"] == "B" for o in orders)
     assert any(o["action"] == "buy" and o["code"] == "A" for o in orders)
+
+
+def test_industry_index_rps_signals_do_not_generate_orders() -> None:
+    """行业指数可用于强弱观察,但不能被当成可交易标的下单。"""
+    pool = {
+        "证券": {"name": "证券", "asset_type": "industry_index"},
+        "半导体": {"name": "半导体", "asset_type": "industry_index"},
+    }
+    strategy = RPSRotationStrategy(target_pool=pool, lookback=20, top_n=1, min_rps=50)
+    history = {
+        "证券": _hist("证券", 0.30),
+        "半导体": _hist("半导体", -0.10),
+    }
+
+    signals = strategy.calculate_signals(history, "20260228")
+    orders = strategy.generate_orders(history, {}, "20260228")
+
+    assert [s["code"] for s in signals] == ["证券"]
+    assert orders == []

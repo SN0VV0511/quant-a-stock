@@ -1,8 +1,7 @@
-"""ETF / 行业代理 RPS 日频轮动策略。
+"""ETF / 行业 RPS 日频轮动策略。
 
-RPS(Relative Price Strength) 用横截面收益率分位衡量相对强弱。当前项目尚未
-接入真实 ETF/行业指数交易数据,因此本模块默认可用于 ETF 代理池或行业代理标的;
-未来接入真实 ETF 后只需替换 ``target_pool`` 与历史数据输入。
+RPS(Relative Price Strength) 用横截面收益率分位衡量相对强弱。ETF 可以作为
+可交易标的生成订单;行业指数仅用于观察/过滤,不直接生成交易订单。
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from typing import Any
 import pandas as pd
 
 from config.settings import (
-    DEFAULT_ETF_PROXY_POOL,
+    DEFAULT_RPS_ETF_POOL,
     RPS_LOOKBACK_DAYS,
     RPS_MIN_AVG_VOLUME,
     RPS_MIN_SCORE,
@@ -118,7 +117,7 @@ def calculate_rps_scores(
 
 
 class RPSRotationStrategy:
-    """ETF/行业代理 RPS 日频轮动策略。"""
+    """ETF/行业 RPS 日频轮动策略。"""
 
     def __init__(
         self,
@@ -130,12 +129,12 @@ class RPSRotationStrategy:
         """初始化 RPS 轮动策略。
 
         Args:
-            target_pool: 标的池,默认使用 ETF 代理池。
+            target_pool: 标的池,默认使用真实 ETF 池;行业指数池可用于观察但不下单。
             lookback: RPS 回看周期。
             top_n: 每日最多持有/买入数量。
             min_rps: 入选最低 RPS 分位。
         """
-        self.target_pool = target_pool or DEFAULT_ETF_PROXY_POOL
+        self.target_pool = target_pool or DEFAULT_RPS_ETF_POOL
         self.lookback = lookback
         self.top_n = top_n
         self.min_rps = min_rps
@@ -187,7 +186,11 @@ class RPSRotationStrategy:
         signals = self.calculate_signals(history_map, current_date)
         selected_codes = {s["code"] for s in signals}
         signal_map = {s["code"]: s for s in signals}
-        tradable_codes = set(self.target_pool)
+        tradable_codes = {
+            code
+            for code, meta in self.target_pool.items()
+            if meta.get("asset_type", "etf") != "industry_index"
+        }
         orders: list[dict[str, Any]] = []
 
         for code, pos in current_portfolio.items():
@@ -204,6 +207,8 @@ class RPSRotationStrategy:
 
         for signal in signals:
             code = signal["code"]
+            if code not in tradable_codes:
+                continue
             if code in current_portfolio:
                 continue
             orders.append({
