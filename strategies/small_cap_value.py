@@ -22,10 +22,13 @@ from config.settings import (
     SMALLCAP_W_SIZE,
     SMALLCAP_W_PB,
     SMALLCAP_W_REVERSAL,
+    SMALLCAP_W_OBV,
     SMALLCAP_MIN_PRICE,
+    SMALLCAP_MAX_PRICE,
     SMALLCAP_MIN_PB,
     SMALLCAP_REVERSAL_DAYS,
 )
+from strategies.indicators import calculate_obv_trend
 
 
 def _rank_pct(values: list[float], ascending: bool = True) -> list[float]:
@@ -63,6 +66,8 @@ def passes_risk_filter(row: dict[str, Any]) -> bool:
         return False
     price = row.get("price", 0) or 0
     if price < SMALLCAP_MIN_PRICE:           # 面值退市缓冲
+        return False
+    if price > SMALLCAP_MAX_PRICE:           # 小资金单手金额控制
         return False
     pb = row.get("pb")
     if pb is None or pb <= SMALLCAP_MIN_PB:   # 净资产为负退市风险
@@ -118,6 +123,10 @@ def build_factor_rows(history_map, reversal_days=SMALLCAP_REVERSAL_DAYS, name_ma
 
         pb = _col(last, df, "pb")
         mktcap = _col(last, df, "mktcap")
+        obv_trend = 0.0
+        if "volume" in df.columns:
+            obv_trend = calculate_obv_trend(df, lookback=min(reversal_days, len(df) - 1))
+
         rows.append({
             "code": code,
             "name": name_map.get(code) or (df["name"].iloc[0] if "name" in df.columns else code),
@@ -127,6 +136,7 @@ def build_factor_rows(history_map, reversal_days=SMALLCAP_REVERSAL_DAYS, name_ma
             "is_st": bool(_col(last, df, "is_st") or 0),
             "is_suspended": suspended,
             "reversal": reversal,
+            "obv_trend": obv_trend,
         })
     return rows
 
@@ -134,7 +144,7 @@ def build_factor_rows(history_map, reversal_days=SMALLCAP_REVERSAL_DAYS, name_ma
 def score_small_cap_value(
     rows: list[dict[str, Any]],
     top_n: int = SMALLCAP_TOP_N,
-    weights: tuple[float, float, float] | None = None,
+    weights: tuple[float, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """对标的快照做"小市值+低PB+短期反转"打分并排序(纯函数)。
 
@@ -143,14 +153,20 @@ def score_small_cap_value(
             code, name, price, mktcap(流通市值,元), pb(市净率),
             reversal(过去 N 日收益率,越小越优), is_st, is_suspended。
         top_n: 返回前 N 名(等权持仓数)。
-        weights: (w_size, w_pb, w_reversal),None 时取 config 默认。
+        weights: (w_size, w_pb, w_reversal[, w_obv]),None 时取 config 默认。
 
     Returns:
         list[dict]: 通过风控且得分最高的 top_n 只,含 score 与 rank,按 score 降序。
     """
     if weights is None:
-        weights = (SMALLCAP_W_SIZE, SMALLCAP_W_PB, SMALLCAP_W_REVERSAL)
-    w_size, w_pb, w_rev = weights
+        weights = (SMALLCAP_W_SIZE, SMALLCAP_W_PB, SMALLCAP_W_REVERSAL, SMALLCAP_W_OBV)
+    if len(weights) == 3:
+        w_size, w_pb, w_rev = weights
+        w_obv = 0.0
+    elif len(weights) == 4:
+        w_size, w_pb, w_rev, w_obv = weights
+    else:
+        raise ValueError(f"小市值权重数量必须为 3 或 4: {weights}")
 
     pool = [r for r in rows if passes_risk_filter(r)]
     if not pool:
@@ -160,11 +176,17 @@ def score_small_cap_value(
     size_score = _rank_pct([float(r["mktcap"]) for r in pool], ascending=True)
     pb_score = _rank_pct([float(r["pb"]) for r in pool], ascending=True)
     rev_score = _rank_pct([float(r.get("reversal", 0.0)) for r in pool], ascending=True)
+    obv_score = _rank_pct([float(r.get("obv_trend", 0.0)) for r in pool], ascending=False)
 
     for i, r in enumerate(pool):
         r["score"] = round(
-            size_score[i] * w_size + pb_score[i] * w_pb + rev_score[i] * w_rev, 4
+            size_score[i] * w_size
+            + pb_score[i] * w_pb
+            + rev_score[i] * w_rev
+            + obv_score[i] * w_obv,
+            4,
         )
+        r["obv_score"] = round(obv_score[i], 4)
 
     pool.sort(key=lambda x: x["score"], reverse=True)
     final = pool[:top_n]

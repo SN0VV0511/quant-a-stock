@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from strategies.small_cap_value import score_small_cap_value, passes_risk_filter
+from strategies.small_cap_value import build_factor_rows, score_small_cap_value, passes_risk_filter
 from backtest.factor_backtest import FactorBacktester
 
 
@@ -23,6 +23,9 @@ class TestRiskFilter:
 
     def test_low_price_excluded(self):
         assert not passes_risk_filter(_row("600000", 30e8, 1.0, price=1.5))
+
+    def test_high_price_excluded_for_small_capital(self):
+        assert not passes_risk_filter(_row("600000", 30e8, 1.0, price=35.0))
 
     def test_negative_pb_excluded(self):
         assert not passes_risk_filter(_row("600000", 30e8, -1.0))
@@ -59,6 +62,22 @@ class TestScoring:
     def test_empty_returns_empty(self):
         assert score_small_cap_value([]) == []
 
+    def test_obv_bonus_improves_rank_without_hard_filter(self):
+        rows = [
+            _row("600001", 50e8, 1.5, reversal=-0.05) | {"obv_trend": -5.0},
+            _row("600002", 50e8, 1.5, reversal=-0.05) | {"obv_trend": 5.0},
+        ]
+        ranked = score_small_cap_value(rows, top_n=2, weights=(0.0, 0.0, 0.0, 1.0))
+        assert ranked[0]["code"] == "600002"
+        assert {r["code"] for r in ranked} == {"600001", "600002"}
+
+    def test_build_factor_rows_contains_obv_trend(self):
+        days = _bdays(25)
+        df = _factor_frame(days, np.linspace(10, 12, 25), 30e8, 1.0)
+        rows = build_factor_rows({"600001": df}, reversal_days=20)
+        assert rows and "obv_trend" in rows[0]
+        assert rows[0]["obv_trend"] > 0
+
 
 def _factor_frame(dates, close, mktcap, pb):
     n = len(dates)
@@ -80,7 +99,7 @@ def _bdays(n):
 
 
 class TestFactorBacktester:
-    """注意:RiskController 强制单票上限 25%,故 top_n 需 >=5(每只<=20%)才能正常建仓。"""
+    """注意:当前小资金风控会按单票 15%、总仓 60% 控制调仓目标。"""
 
     @staticmethod
     def _universe(days):

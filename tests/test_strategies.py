@@ -5,12 +5,41 @@ import pandas as pd
 import pytest
 
 from strategies.combo_signal import ComboSignalStrategy
+from strategies.indicators import calculate_atr, calculate_volume_filter, calculate_volume_ratio
 from strategies.ma_cross import MACrossStrategy
 from strategies.rsi import RSIStrategy
 
 
 def _df(closes):
     return pd.DataFrame({"close": list(closes)})
+
+
+def _ohlcv(closes, volume=1_000):
+    closes = list(closes)
+    return pd.DataFrame({
+        "high": [c + 1 for c in closes],
+        "low": [c - 1 for c in closes],
+        "close": closes,
+        "volume": [volume] * len(closes),
+    })
+
+
+class TestIndicators:
+    def test_atr_uses_true_range(self):
+        df = pd.DataFrame({
+            "high": [11, 12, 13, 14],
+            "low": [9, 10, 11, 12],
+            "close": [10, 11, 12, 13],
+        })
+        atr = calculate_atr(df, period=3)
+        assert atr.iloc[-1] == pytest.approx(2.0)
+
+    def test_volume_ratio_and_filter(self):
+        df = pd.DataFrame({"volume": [100] * 20 + [50]})
+        ratio = calculate_volume_ratio(df, lookback=20)
+        passed = calculate_volume_filter(df, lookback=20, min_ratio=1.0)
+        assert ratio.iloc[-1] == pytest.approx(0.5)
+        assert not passed.iloc[-1]
 
 
 class TestMACross:
@@ -73,4 +102,18 @@ class TestComboSignal:
         closes = list(np.linspace(10, 20, 40))
         combo = ComboSignalStrategy()
         df = combo.calculate_signals(_df(closes))
-        assert {"ma_short", "ma_long", "rsi", "signal"} <= set(df.columns)
+        assert {"ma_short", "ma_long", "rsi", "volume_ratio", "volume_passed", "signal"} <= set(df.columns)
+
+    def test_volume_filter_blocks_low_volume_buy(self):
+        t = np.arange(80)
+        closes = 10 + 0.09 * t + 1.2 * np.sin(t / 4.0)
+        df = _ohlcv(closes, volume=100)
+
+        no_filter = ComboSignalStrategy(volume_filter_enabled=False).calculate_signals(df)
+        strict_filter = ComboSignalStrategy(
+            volume_filter_enabled=True,
+            volume_min_ratio=2.0,
+        ).calculate_signals(df)
+
+        assert (no_filter["signal"] == 1).any(), "测试数据应先能产生未过滤买入信号"
+        assert not (strict_filter["signal"] == 1).any(), "低量信号应被成交量过滤拦截"

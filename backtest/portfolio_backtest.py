@@ -38,6 +38,7 @@ from risk.control import RiskController
 from rules.position import PositionManager
 from strategies.combo_signal import ComboSignalStrategy
 from strategies.exit_rules import evaluate_exit
+from strategies.indicators import calculate_atr
 from strategies.market_regime import is_risk_on
 from strategies.market_scanner import score_candidates
 
@@ -109,7 +110,7 @@ class PortfolioBacktester:
 
         Args:
             history_map: ``{code: DataFrame}``,DataFrame 需含
-                ``date, open, close, volume`` 列(前复权口径,date 为 YYYYMMDD 或带横线)。
+                ``date, open, high, low, close, volume`` 列(前复权口径,date 为 YYYYMMDD 或带横线)。
             trading_days: 升序交易日列表(YYYYMMDD)。
             index_history: 基准指数历史(含 date/close),用于大盘择时;
                 None 或未启用择时时全程视为 risk-on。
@@ -289,18 +290,25 @@ class PortfolioBacktester:
         combo_sell = False
         combo_reason = ""
         ma20 = None
+        atr = None
         if sl is not None and len(sl) >= 25:
             sig = self.combo.check_realtime(sl)
             combo_sell = sig.get("signal") == "sell"
             combo_reason = str(sig.get("reason", "策略信号"))
         if sl is not None and len(sl) >= 20:
             ma20 = float(pd.to_numeric(sl["close"], errors="coerce").tail(20).mean())
+        if sl is not None and {"high", "low", "close"} <= set(sl.columns):
+            from config.settings import ATR_PERIOD
+
+            atr_value = calculate_atr(sl, period=ATR_PERIOD).iloc[-1]
+            atr = float(atr_value) if pd.notna(atr_value) else None
 
         return evaluate_exit(
             avg_cost=avg_cost,
             price=price,
             peak_price=peak_price,
             ma20=ma20,
+            atr=atr,
             holding_days=holding_days,
             combo_sell=combo_sell,
             combo_reason=combo_reason,
@@ -599,4 +607,3 @@ if __name__ == "__main__":
     # 落地结果供 Web 仪表盘读取
     if result:
         save_backtest_result(result, name="动量Combo", window=f"{start}~{end}")
-

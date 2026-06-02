@@ -93,7 +93,7 @@ def test_rebalance_builds_equal_weight_smallcap_portfolio():
 
     pos = broker.query_positions()
     assert pos, "调仓应建立持仓"
-    # top_n=5,单票上限 1/5=20% < 风控 25%,应能建多只
+    # top_n=5 时按 min(单票15%,总仓60%/5)≈12% 建仓,应能建多只
     assert len(pos) >= 4
     # 选中的应是市值最小/最便宜的(600000~600004),不含最大最贵的 600007
     assert "600007" not in pos

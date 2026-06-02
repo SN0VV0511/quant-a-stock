@@ -13,6 +13,8 @@ import pandas as pd
 
 from config.settings import (
     INITIAL_CAPITAL,
+    MAX_SINGLE_STOCK,
+    MAX_TOTAL_POSITION,
     SMALLCAP_TOP_N,
     SMALLCAP_REBALANCE_DAYS,
     SMALLCAP_REVERSAL_DAYS,
@@ -34,12 +36,13 @@ class FactorBacktester(PortfolioBacktester):
         rebalance_days: int = SMALLCAP_REBALANCE_DAYS,
         reversal_days: int = SMALLCAP_REVERSAL_DAYS,
     ) -> None:
-        # 等权:单票上限设为 1/N,避免前几只买光额度破坏等权
+        # 等权目标受单票和总仓位双重约束,避免调仓订单被风控整体拒绝。
+        target_single_ratio = min(MAX_SINGLE_STOCK, MAX_TOTAL_POSITION / max(1, top_n))
         super().__init__(
             initial_capital=initial_capital,
             top_n=top_n,
             rebalance_every=rebalance_days,
-            max_single_stock=1.0 / max(1, top_n),
+            max_single_stock=target_single_ratio,
         )
         self.reversal_days = reversal_days
 

@@ -34,6 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config.logging_setup import setup_logger  # noqa: E402
 from config.settings import (  # noqa: E402
     INITIAL_CAPITAL,
+    MAX_SINGLE_STOCK,
+    MAX_TOTAL_POSITION,
     REPORT_DIR,
     SMALLCAP_TOP_N,
     SMALLCAP_REBALANCE_DAYS,
@@ -227,8 +229,8 @@ def rebalance(broker: PaperBrokerAdapter, loader: AKDataLoader, risk: RiskContro
         )
         _submit(intent, broker, risk, md, recorder, dry_run)
 
-    # 2) 再买(等权,单票 ≈ 1/N)
-    max_ratio = 1.0 / max(1, top_n)
+    # 2) 再买:等权目标受单票和总仓位上限约束,避免计划仓位被风控整体拒绝。
+    max_ratio = min(MAX_SINGLE_STOCK, MAX_TOTAL_POSITION / max(1, top_n))
     for t in buys:
         code = t["code"]
         price = float(quotes.get(code, {}).get("price", 0) or t.get("price", 0) or 0)

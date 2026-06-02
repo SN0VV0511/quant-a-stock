@@ -8,18 +8,18 @@
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg: #0a0e14; --bg2: #111720; --bg3: #1a2030;
-            --border: #2a3040; --text: #e6ecf3; --text2: #8b97ab; --text3: #5a6478;
-            --accent: #4a9eff; --accent2: #9b7dff;
-            --green: #00d26a; --red: #ff4d61; --yellow: #ffb028;
-            --buy: rgba(0,210,106,0.14); --sell: rgba(255,77,97,0.14);
-            --radius: 10px; --gap: 10px;
+            --bg: #090b0a; --bg2: #111413; --bg3: #1a1f1d;
+            --border: #2d352f; --text: #e8eee9; --text2: #9aa69d; --text3: #657168;
+            --accent: #35c2ba; --accent2: #d6a84e;
+            --green: #3bd671; --red: #f05d5e; --yellow: #e6a33a;
+            --buy: rgba(59,214,113,0.14); --sell: rgba(240,93,94,0.14);
+            --radius: 8px; --gap: 12px;
             --mono: "Fira Code", "SF Mono", "PingFang SC", monospace;
             --sans: "Fira Sans", "PingFang SC", system-ui, sans-serif;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html { scroll-behavior: smooth; }
-        body { font-family: var(--sans); background: var(--bg); color: var(--text); min-height: 100dvh; font-size: 14px; -webkit-font-smoothing: antialiased; }
+        body { font-family: var(--sans); background: linear-gradient(180deg, rgba(53,194,186,.045), transparent 240px), var(--bg); color: var(--text); min-height: 100dvh; font-size: 14px; -webkit-font-smoothing: antialiased; }
 
         /* Focus accessibility */
         :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
@@ -30,7 +30,7 @@
         .icon-lg { width: 18px; height: 18px; }
 
         /* Header */
-        .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 100; flex-wrap: wrap; }
+        .header { background: rgba(17,20,19,.94); backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); padding: 10px 16px; display: flex; justify-content: space-between; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 100; flex-wrap: wrap; }
         .brand { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 700; color: var(--accent); letter-spacing: 0.5px; }
         .brand .icon { width: 20px; height: 20px; }
         .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -54,11 +54,13 @@
         .stats { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(6, 1fr); gap: var(--gap); }
         @media (max-width: 1180px) { .stats { grid-template-columns: repeat(3, 1fr); } }
         @media (max-width: 480px) { .stats { grid-template-columns: repeat(2, 1fr); } }
-        .stat { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+        .stat { background: linear-gradient(180deg, rgba(255,255,255,.015), transparent), var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; min-width: 0; }
         .stat .label { font-size: 11px; color: var(--text2); letter-spacing: 0.5px; margin-bottom: 5px; }
-        .stat .val { font-size: 22px; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+        .stat .val { font-size: 22px; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .stat .sub { font-size: 11px; color: var(--text2); margin-top: 3px; font-variant-numeric: tabular-nums; }
         .c-g { color: var(--green); } .c-r { color: var(--red); } .c-n { color: var(--text); } .c-a { color: var(--accent); }
+        .meter { height: 4px; margin-top: 8px; background: var(--bg3); border-radius: 999px; overflow: hidden; }
+        .meter > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .35s, background .35s; }
 
         /* Cards */
         .card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; }
@@ -103,8 +105,8 @@
         .kv { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; font-size: 12px; }
         .kv .k { color: var(--text2); } .kv .v { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
         .pill-ok { color: var(--green); } .pill-bad { color: var(--red); }
-        .progress { height: 8px; background: var(--bg3); border-radius: 4px; overflow: hidden; margin-top: 6px; }
-        .progress > span { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width .4s; }
+        .progress { height: 8px; background: var(--bg3); border-radius: 999px; overflow: hidden; margin-top: 6px; }
+        .progress > span { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width .4s; }
         .alert { font-size: 11px; padding: 6px 8px; border-radius: 6px; margin-top: 6px; }
         .alert-bad { background: var(--sell); color: var(--red); }
         .alert-warn { background: rgba(255,176,40,0.12); color: var(--yellow); }
@@ -155,8 +157,8 @@
         <section class="stats" aria-label="核心指标">
             <div class="stat"><div class="label">总市值</div><div class="val" id="s-total">--</div><div class="sub" id="s-pnl">--</div></div>
             <div class="stat"><div class="label">可用现金</div><div class="val" id="s-cash">--</div><div class="sub" id="s-cash-ratio">--</div></div>
-            <div class="stat"><div class="label">持仓仓位</div><div class="val" id="s-pos-ratio">--</div><div class="sub" id="s-pos-count">--</div></div>
-            <div class="stat"><div class="label">当前回撤</div><div class="val" id="s-dd">--</div><div class="sub" id="s-dd-sub">峰值回撤</div></div>
+            <div class="stat"><div class="label">持仓仓位</div><div class="val" id="s-pos-ratio">--</div><div class="sub" id="s-pos-count">--</div><div class="meter"><span id="m-pos"></span></div></div>
+            <div class="stat"><div class="label">当前回撤</div><div class="val" id="s-dd">--</div><div class="sub" id="s-dd-sub">峰值回撤</div><div class="meter"><span id="m-dd"></span></div></div>
             <div class="stat"><div class="label">今日交易</div><div class="val" id="s-trade-count">--</div><div class="sub" id="s-last-trade">--</div></div>
             <div class="stat"><div class="label">候选股</div><div class="val" id="s-cand-count">--</div><div class="sub" id="s-scan-time">--</div></div>
         </section>
@@ -286,6 +288,12 @@
             $('s-pos-ratio').textContent = (d.position_ratio*100).toFixed(1)+'%';
             $('s-pos-count').textContent = d.position_count+' 只持仓';
             $('pos-count').textContent = d.position_count+' 只';
+            const posMeter = $('m-pos');
+            if (posMeter) {
+                const posPct = Math.max(0, Math.min(100, d.position_ratio * 100));
+                posMeter.style.width = posPct + '%';
+                posMeter.style.background = d.position_ratio > 0.6 ? 'var(--red)' : d.position_ratio > 0.45 ? 'var(--yellow)' : 'var(--accent)';
+            }
 
             const list = $('pos-list'), pos = d.positions || [];
             if (!pos.length){ list.innerHTML='<div class="empty">空仓</div>'; }
@@ -329,7 +337,14 @@
             $('equity-meta').textContent = pts.length+' 个快照';
             // 当前回撤 stat
             const lastDd = pts[pts.length-1].drawdown;
-            if (lastDd!=null){ $('s-dd').textContent=(lastDd*100).toFixed(2)+'%'; $('s-dd').className='val '+(lastDd>0.06?'c-r':lastDd>0?'c-n':'c-g'); }
+            if (lastDd!=null){
+                $('s-dd').textContent=(lastDd*100).toFixed(2)+'%'; $('s-dd').className='val '+(lastDd>0.06?'c-r':lastDd>0?'c-n':'c-g');
+                const ddMeter = $('m-dd');
+                if (ddMeter) {
+                    ddMeter.style.width = Math.max(0, Math.min(100, lastDd / 0.10 * 100)) + '%';
+                    ddMeter.style.background = lastDd > 0.06 ? 'var(--red)' : lastDd > 0.03 ? 'var(--yellow)' : 'var(--accent)';
+                }
+            }
             if (!CHARTS_OK){ $('equity-meta').textContent='图表库未加载'; return; }
             if (equityChart){ equityChart.data.labels=labels; equityChart.data.datasets[0].data=vals; equityChart.update(); }
             else equityChart = lineChart($('equityChart'), labels, vals, '#4a9eff', 'rgba(74,158,255,0.10)');

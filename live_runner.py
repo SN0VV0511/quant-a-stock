@@ -16,7 +16,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -27,6 +27,8 @@ from config.settings import (  # noqa: E402
     BROKER_MODE,
     CASH_BUFFER,
     INITIAL_CAPITAL,
+    ATR_PERIOD,
+    LIVE_INITIAL_SCAN_DELAY_MINUTES,
     LIVE_SCAN_INTERVAL_SECONDS,
     LIVE_WATCH_INTERVAL_SECONDS,
     LOT_SIZE,
@@ -44,6 +46,7 @@ from data.holidays import is_trading_day as is_calendar_trading_day  # noqa: E40
 from risk.control import RiskController  # noqa: E402
 from strategies.combo_signal import ComboSignalStrategy  # noqa: E402
 from strategies.exit_rules import evaluate_exit  # noqa: E402
+from strategies.indicators import calculate_atr  # noqa: E402
 from strategies.market_regime import is_risk_on  # noqa: E402
 from strategies.market_scanner import MarketScanner  # noqa: E402
 from trading.brokers import PaperBrokerAdapter, create_broker  # noqa: E402
@@ -181,6 +184,25 @@ def is_trading_day(date_str: str | None = None) -> bool:
         return datetime.strptime(target, "%Y%m%d").weekday() < 5
 
 
+def _initial_scan_time(now: datetime, delay_minutes: int = LIVE_INITIAL_SCAN_DELAY_MINUTES) -> datetime:
+    """返回首次全市场扫描时间。
+
+    首次扫描放在连续竞价开始后,避免 9:00 集合竞价前后的成交量和涨跌幅
+    数据不稳定,导致候选池为空或被昨日报价污染。
+    """
+    delay = max(0, delay_minutes)
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return market_open + timedelta(minutes=delay)
+
+
+def _wait_until(target: datetime, reason: str, interval: int = 30) -> None:
+    """等待到指定时间,用于控制盘中启动节奏。"""
+    while datetime.now() < target:
+        remain = (target - datetime.now()).total_seconds()
+        logger.info("%s... %.0f 秒后继续", reason, max(0, remain))
+        time.sleep(min(interval, max(1, remain)))
+
+
 def _map_quotes_to_codes(
     original_codes: list[str],
     quotes_raw: dict[str, dict[str, Any]],
@@ -206,13 +228,21 @@ def _build_market_data(mapped_quotes: dict[str, dict[str, Any]]) -> dict[str, di
         market_data[code] = {
             "current_price": float(quote.get("price", 0) or 0),
             "prev_close": float(quote.get("prev_close", 0) or 0),
+            "open": float(quote.get("open", 0) or 0),
+            "high": float(quote.get("high", 0) or 0),
+            "low": float(quote.get("low", 0) or 0),
+            "volume": float(quote.get("volume", 0) or 0),
             "is_st": "ST" in name.upper() or "退" in name,
             "is_suspended": float(quote.get("price", 0) or 0) <= 0,
         }
     return market_data
 
 
-def _build_realtime_hist(hist: pd.DataFrame | None, price: float | None) -> pd.DataFrame | None:
+def _build_realtime_hist(
+    hist: pd.DataFrame | None,
+    price: float | None,
+    quote: dict[str, Any] | None = None,
+) -> pd.DataFrame | None:
     """将最新实时价拼成一根临时 K 线,供 ComboSignal 实时判断。
 
     买入与卖出两条路径必须共用本函数,保证同一 tick 上对同一标的的
@@ -221,8 +251,23 @@ def _build_realtime_hist(hist: pd.DataFrame | None, price: float | None) -> pd.D
     """
     if hist is None or price is None or price <= 0:
         return hist
+    quote = quote or {}
     new_row = hist.iloc[-1:].copy()
     new_row["close"] = price
+    if "open" in new_row.columns and quote.get("open", 0):
+        new_row["open"] = float(quote["open"])
+    if "high" in new_row.columns:
+        high_values = [price]
+        if quote.get("high", 0):
+            high_values.append(float(quote["high"]))
+        new_row["high"] = max(high_values)
+    if "low" in new_row.columns:
+        low_values = [price]
+        if quote.get("low", 0):
+            low_values.append(float(quote["low"]))
+        new_row["low"] = min(low_values)
+    if "volume" in new_row.columns and quote.get("volume", 0):
+        new_row["volume"] = float(quote["volume"])
     return pd.concat([hist, new_row], ignore_index=True)
 
 
@@ -368,19 +413,23 @@ def _handle_position_exits(
         combo_sell = False
         combo_reason = ""
         ma20 = None
-        if combo is not None:
-            try:
-                hist = loader.get_stock_data(normalize_code(code), days=60)
-                # 与买入路径共用实时价 K 线,避免买卖信号因输入不同而互相矛盾
-                rt_hist = _build_realtime_hist(hist, float(current))
-                if rt_hist is not None and len(rt_hist) > 25:
+        atr = None
+        try:
+            hist = loader.get_stock_data(normalize_code(code), days=60)
+            # 与买入路径共用实时价 K 线,避免买卖信号因输入不同而互相矛盾
+            rt_hist = _build_realtime_hist(hist, float(current), market_data.get(code))
+            if rt_hist is not None and len(rt_hist) > 25:
+                if combo is not None:
                     sig = combo.check_realtime(rt_hist)
                     combo_sell = sig.get("signal") == "sell"
                     combo_reason = sig.get("reason", "策略信号")
-                if rt_hist is not None and len(rt_hist) >= 20:
-                    ma20 = float(pd.to_numeric(rt_hist["close"], errors="coerce").tail(20).mean())
-            except Exception as exc:
-                logger.warning("持仓退出信号检查失败: %s %s", code, exc, exc_info=True)
+            if rt_hist is not None and len(rt_hist) >= 20:
+                ma20 = float(pd.to_numeric(rt_hist["close"], errors="coerce").tail(20).mean())
+            if rt_hist is not None and {"high", "low", "close"} <= set(rt_hist.columns):
+                atr_value = calculate_atr(rt_hist, period=ATR_PERIOD).iloc[-1]
+                atr = float(atr_value) if pd.notna(atr_value) else None
+        except Exception as exc:
+            logger.warning("持仓退出指标检查失败: %s %s", code, exc, exc_info=True)
 
         peak_price = float(pos.get("peak_price", avg_cost) or avg_cost)
         holding_days = _holding_days(pos.get("buy_date"), today)
@@ -390,6 +439,7 @@ def _handle_position_exits(
             price=float(current),
             peak_price=peak_price,
             ma20=ma20,
+            atr=atr,
             holding_days=holding_days,
             combo_sell=combo_sell,
             combo_reason=combo_reason,
@@ -477,7 +527,7 @@ def _handle_candidate_entries(
         if price is None:
             continue
 
-        realtime_hist = _build_realtime_hist(hist, price)
+        realtime_hist = _build_realtime_hist(hist, price, market_data.get(code))
 
         result = combo.check_realtime(realtime_hist)
         if result["signal"] != "buy":
@@ -510,7 +560,11 @@ def _handle_candidate_entries(
             strategy="全市场扫描+组合策略",
             reason=str(result["reason"]),
             source="watch_thread",
-            metadata={"rsi": result.get("rsi"), "cash_buffer": CASH_BUFFER},
+            metadata={
+                "rsi": result.get("rsi"),
+                "volume_ratio": result.get("volume_ratio"),
+                "cash_buffer": CASH_BUFFER,
+            },
         )
         result_code = _submit_order(order, broker, risk_ctrl, market_data, recorder)
         if result_code is None:
@@ -686,6 +740,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--broker", default=BROKER_MODE, choices=["paper", "qmt"], help="交易通道，默认读取 BROKER_MODE")
     parser.add_argument("--watch-interval", type=int, default=LIVE_WATCH_INTERVAL_SECONDS, help="盯盘刷新秒数")
     parser.add_argument("--scan-interval", type=int, default=LIVE_SCAN_INTERVAL_SECONDS, help="扫描间隔秒数")
+    parser.add_argument("--initial-scan-delay-minutes", type=int, default=LIVE_INITIAL_SCAN_DELAY_MINUTES,
+                        help="开盘后首次全市场确认扫描延迟分钟数")
     parser.add_argument("--top-n", type=int, default=30, help="候选股数量")
     parser.add_argument("--ignore-calendar", action="store_true", help="忽略交易日判断，便于联调")
     return parser.parse_args()
@@ -716,36 +772,40 @@ def main() -> None:
     logger.info("虚拟盘盯盘系统启动: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("Broker=%s watch_interval=%ss scan_interval=%ss", args.broker, args.watch_interval, args.scan_interval)
 
-    pre_market = now.replace(hour=9, minute=0, second=0)
-    market_open = now.replace(hour=9, minute=30, second=0)
-    market_close = now.replace(hour=15, minute=0, second=0)
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    first_scan_at = _initial_scan_time(now, args.initial_scan_delay_minutes)
+    market_close = now.replace(hour=15, minute=0, second=0, microsecond=0)
 
-    if now < pre_market:
-        wait_sec = (pre_market - now).total_seconds()
-        logger.info("等待开盘前扫描... %.0f 秒后开始", wait_sec)
-        time.sleep(wait_sec)
+    if now >= market_close:
+        logger.info("已过收盘时间，退出")
+        loader.close()
+        broker.close()
+        return
 
-    _do_scan(shared, scanner, recorder, top_n=args.top_n)
+    if now < market_open:
+        _wait_until(market_open, "等待开盘启动盯盘")
 
-    if datetime.now() < market_open:
-        logger.info("等待开盘...")
-        while datetime.now() < market_open:
-            time.sleep(5)
-
-    logger.info("===== 开盘：启动双线程 =====")
+    logger.info("===== 开盘：启动盯盘线 =====")
     t_watch = threading.Thread(
         target=watch_thread,
         args=(broker, shared, loader, combo, risk_ctrl, recorder, args.watch_interval),
         name="盯盘线",
         daemon=True,
     )
+    t_watch.start()
+
+    if datetime.now() < first_scan_at:
+        _wait_until(first_scan_at, "等待开盘后确认扫描")
+
+    _do_scan(shared, scanner, recorder, top_n=args.top_n)
+
+    logger.info("===== 启动扫描线 =====")
     t_scan = threading.Thread(
         target=scan_thread,
         args=(shared, scanner, recorder, args.top_n, args.scan_interval),
         name="扫描线",
         daemon=True,
     )
-    t_watch.start()
     t_scan.start()
 
     try:

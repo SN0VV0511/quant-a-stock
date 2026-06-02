@@ -19,6 +19,15 @@ def test_hard_stop_loss():
     assert out is not None and out[0] == "止损"
 
 
+def test_atr_stop_tightens_fixed_stop(monkeypatch):
+    # ATR 可用时,小波动标的应在小于固定 7% 的亏损处动态止损
+    monkeypatch.setattr(er, "ENABLE_ATR_STOP", True)
+    monkeypatch.setattr(er, "ATR_STOP_MULTIPLIER", 1.2)
+    monkeypatch.setattr(er, "ATR_STOP_MAX_PCT", 0.07)
+    out = er.evaluate_exit(avg_cost=10, price=9.70, peak_price=10, atr=0.2)
+    assert out is not None and out[0] == "ATR止损"
+
+
 def test_combo_sell_has_top_priority():
     # 即使盈利,Combo 卖出信号优先
     out = er.evaluate_exit(avg_cost=10, price=12, peak_price=12, combo_sell=True,
@@ -45,6 +54,14 @@ def test_take_profit_requires_below_ma20():
     # 盈利达标且跌破 MA20 → 止盈(用未触发移动止损的峰值)
     out = er.evaluate_exit(avg_cost=10, price=11.2, peak_price=11.3, ma20=11.5)
     assert out is not None and out[0] == "止盈"
+
+
+def test_atr_take_profit_requires_target_then_ma20_break(monkeypatch):
+    # 曾经达到 2.5ATR 目标,当前虽未达固定 10% 止盈,但跌破 MA20 应锁定利润
+    monkeypatch.setattr(er, "ENABLE_ATR_TAKE_PROFIT", True)
+    monkeypatch.setattr(er, "ATR_TAKE_PROFIT_MULTIPLIER", 2.5)
+    out = er.evaluate_exit(avg_cost=10, price=10.8, peak_price=11.4, ma20=11.0, atr=0.5)
+    assert out is not None and out[0] == "ATR止盈"
 
 
 def test_time_stop_disabled_by_default():
