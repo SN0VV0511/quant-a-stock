@@ -29,6 +29,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
         <button type="submit">登 录</button>
         <div class="error" id="error-msg">密码错误，请重试</div>
     </form>
+    <div style="text-align:center;margin-top:12px">
+        <a href="#" onclick="showChangePwd()" style="color:#8899aa;font-size:12px;text-decoration:none">修改密码</a>
+    </div>
+    <form id="change-pwd-form" style="display:none">
+        <label for="old-pwd">旧密码</label>
+        <input type="password" id="old-pwd" placeholder="请输入旧密码">
+        <label for="new-pwd">新密码（至少6位）</label>
+        <input type="password" id="new-pwd" placeholder="请输入新密码">
+        <button type="submit">修改密码</button>
+        <div class="error" id="change-error"></div>
+        <div class="success" id="change-ok" style="display:none;color:#35c2ba;text-align:center;font-size:13px;margin-top:12px">密码修改成功！</div>
+        <div style="text-align:center;margin-top:8px">
+            <a href="#" onclick="showLogin()" style="color:#8899aa;font-size:12px;text-decoration:none">返回登录</a>
+        </div>
+    </form>
     <div class="disclaimer">
         ⚠️ 本页面为个人量化研究工具<br>
         数据来源于公开渠道，存在延迟与误差<br>
@@ -36,6 +51,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
     </div>
 </div>
 <script>
+function showChangePwd() {
+    document.getElementById('login-form').style.display = 'none';
+    document.getElementById('change-pwd-form').style.display = 'block';
+    document.getElementById('change-error').style.display = 'none';
+    document.getElementById('change-ok').style.display = 'none';
+}
+function showLogin() {
+    document.getElementById('login-form').style.display = 'block';
+    document.getElementById('change-pwd-form').style.display = 'none';
+}
 document.getElementById('login-form').addEventListener('submit', async function(e) {
     e.preventDefault();
     const pwd = document.getElementById('password').value;
@@ -49,6 +74,29 @@ document.getElementById('login-form').addEventListener('submit', async function(
         window.location.href = '.';
     } else {
         document.getElementById('error-msg').style.display = 'block';
+    }
+});
+document.getElementById('change-pwd-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const oldPwd = document.getElementById('old-pwd').value;
+    const newPwd = document.getElementById('new-pwd').value;
+    if (newPwd.length < 6) {
+        document.getElementById('change-error').textContent = '新密码至少6位';
+        document.getElementById('change-error').style.display = 'block';
+        return;
+    }
+    const resp = await fetch('api/change-password', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({old_password: oldPwd, new_password: newPwd})
+    });
+    const data = await resp.json();
+    if (data.success) {
+        document.getElementById('change-error').style.display = 'none';
+        document.getElementById('change-ok').style.display = 'block';
+    } else {
+        document.getElementById('change-error').textContent = data.error || '修改失败';
+        document.getElementById('change-error').style.display = 'block';
     }
 });
 </script>

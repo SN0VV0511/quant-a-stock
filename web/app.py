@@ -184,11 +184,38 @@ import hashlib
 import secrets
 import base64
 
-# 密码 SHA256 哈希，从环境变量读取，默认仅用于本地开发
-_DASHBOARD_PASSWORD_HASH = os.environ.get(
-    "DASHBOARD_PASSWORD_HASH",
-    "15924eeb0a783f97e2538608a4c173051cefbd955cb48b7f44d918940f707490"
-)
+# 密码 hash 存储路径（不上传 git）
+_PASSWORD_FILE = os.path.join(DATA_DIR, ".password_hash")
+
+
+def _load_password_hash() -> str:
+    """加载密码 hash：环境变量 > 本地文件 > 自动生成。"""
+    env_hash = os.environ.get("DASHBOARD_PASSWORD_HASH", "")
+    if env_hash:
+        return env_hash
+    if os.path.exists(_PASSWORD_FILE):
+        with open(_PASSWORD_FILE) as f:
+            return f.read().strip()
+    # 首次运行：生成随机密码并保存
+    import secrets as _secrets
+    import hashlib as _hashlib
+    pwd = _secrets.token_hex(8)
+    h = _hashlib.sha256(pwd.encode()).hexdigest()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(_PASSWORD_FILE, "w") as f:
+        f.write(h)
+    logger.warning("首次运行，已生成随机密码: %s（请尽快修改）", pwd)
+    return h
+
+
+def _save_password_hash(hash_val: str) -> None:
+    """持久化密码 hash 到本地文件。"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(_PASSWORD_FILE, "w") as f:
+        f.write(hash_val)
+
+
+_DASHBOARD_PASSWORD_HASH = _load_password_hash()
 # 会话 token → 过期时间
 _sessions: dict[str, float] = {}
 _SESSION_TTL = 86400  # 24 小时
@@ -270,6 +297,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        global _DASHBOARD_PASSWORD_HASH
         parsed = urlparse(self.path)
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len) if content_len > 0 else b"{}"
@@ -305,6 +333,23 @@ class QuantHandler(SimpleHTTPRequestHandler):
             if not self._require_auth():
                 return
             self._json_response(self._api_scan_trigger())
+            return
+
+        if parsed.path == "/api/change-password":
+            if not self._require_auth():
+                return
+            old_pwd = data.get("old_password", "")
+            new_pwd = data.get("new_password", "")
+            if not new_pwd or len(new_pwd) < 6:
+                self._json_response({"success": False, "error": "新密码至少6位"}, status=400)
+                return
+            if hashlib.sha256(old_pwd.encode()).hexdigest() != _DASHBOARD_PASSWORD_HASH:
+                self._json_response({"success": False, "error": "旧密码错误"}, status=401)
+                return
+            new_hash = hashlib.sha256(new_pwd.encode()).hexdigest()
+            _DASHBOARD_PASSWORD_HASH = new_hash
+            _save_password_hash(new_hash)
+            self._json_response({"success": True})
             return
 
         self.send_error(404)
