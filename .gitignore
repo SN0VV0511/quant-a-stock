@@ -27,3 +27,8 @@ data/small_cap_state.json
 data/daily_backtest_state.json
 data/.password_hash
 reports/daily_*.txt
+
+# 前端构建产物与依赖
+web/frontend/node_modules/
+web/dist/
+*.tsbuildinfo

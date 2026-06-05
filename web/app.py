@@ -10,6 +10,7 @@ import json
 import time
 import logging
 import threading
+import mimetypes
 from datetime import datetime
 from dataclasses import asdict
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -29,6 +30,7 @@ from scripts.paper_status import build_status
 
 logger = logging.getLogger(__name__)
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
 
 # 日志文件路径
 LIVE_LOG = os.path.join(LOG_DIR, "live.log")
@@ -265,7 +267,11 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
         # 登录页不需要认证
         if path == "/login":
-            return self._serve_template("login.html")
+            return self._serve_spa("login.html")
+
+        # React/Vite 构建产物，登录页也需要加载 JS/CSS，因此静态资源不做鉴权。
+        if path.startswith("/assets/"):
+            return self._serve_static_asset(path)
 
         # API 路由
         api_routes = {
@@ -292,7 +298,25 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if path in ("/", "/index.html"):
             if not self._require_auth():
                 return
-            return self._serve_template("index.html")
+            return self._serve_spa("index.html")
+
+        self.send_error(404)
+
+    def do_HEAD(self):
+        """支持静态资源与 SPA 的 HEAD 检查，避免默认文件服务绕过自定义路由。"""
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path.startswith("/assets/"):
+            return self._serve_static_asset(path, write_body=False)
+
+        if path == "/login":
+            return self._serve_spa("login.html", write_body=False)
+
+        if path in ("/", "/index.html"):
+            if not self._require_auth():
+                return
+            return self._serve_spa("index.html", write_body=False)
 
         self.send_error(404)
 
@@ -744,6 +768,40 @@ class QuantHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_spa(self, fallback_template: str, write_body: bool = True):
+        """优先服务 React 构建产物；缺失时回退到旧模板，便于未构建环境运行。"""
+        index_path = os.path.join(DIST_DIR, "index.html")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                body = f.read().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            if write_body:
+                self.wfile.write(body)
+            return
+        self._serve_template(fallback_template)
+
+    def _serve_static_asset(self, request_path: str, write_body: bool = True):
+        """服务 Vite assets，并防止通过路径穿越读取 dist 外文件。"""
+        relative_path = request_path.lstrip("/")
+        asset_path = os.path.abspath(os.path.join(DIST_DIR, relative_path))
+        dist_root = os.path.abspath(DIST_DIR)
+        if not asset_path.startswith(dist_root + os.sep) or not os.path.exists(asset_path):
+            self.send_error(404)
+            return
+        mime_type, _ = mimetypes.guess_type(asset_path)
+        with open(asset_path, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", mime_type or "application/octet-stream")
+        self.send_header("Content-Length", len(body))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        if write_body:
+            self.wfile.write(body)
 
     def log_message(self, format, *args):
         pass

@@ -192,6 +192,40 @@ http://127.0.0.1:8888
 - `/api/status`：账户、持仓、交易和日志摘要。
 - `/api/observation`：后台服务、健康检查、30 日复盘、QMT dry-run 验收和最新日志。
 
+### React 前端开发
+
+仪表盘前端位于 `web/frontend`，生产构建输出到 `web/dist`，由 `python web/app.py 8888` 托管。
+
+首次安装依赖：
+
+```bash
+cd web/frontend
+npm install
+```
+
+本地开发时先启动 Python 后端，再启动 Vite：
+
+```bash
+python web/app.py 8888
+cd web/frontend
+npm run dev
+```
+
+生产构建：
+
+```bash
+cd web/frontend
+npm run build
+python ../../web/app.py 8888
+```
+
+前端测试：
+
+```bash
+cd web/frontend
+npm run test
+```
+
 ## 每日巡检
 
 开盘前建议执行：
