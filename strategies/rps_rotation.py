@@ -193,23 +193,19 @@ class RPSRotationStrategy:
         }
         orders: list[dict[str, Any]] = []
 
-        for code, pos in current_portfolio.items():
-            if code in tradable_codes and code not in selected_codes:
-                orders.append({
-                    "code": code,
-                    "name": pos.get("name", code),
-                    "action": "sell",
-                    "shares": pos.get("shares", 0),
-                    "price": pos.get("current_price", 0),
-                    "strategy": self.name,
-                    "reason": "RPS跌出目标池",
-                })
-
+        # ETF 退出不再由 RPS 排名触发，改为趋势退出(移动止损/MA20/止盈)
+        # 这里只生成买入信号
         for signal in signals:
             code = signal["code"]
             if code not in tradable_codes:
                 continue
-            if code in current_portfolio:
+            # 双重持仓去重: 用 code 和 market-prefixed code 都检查
+            held_keys = set(current_portfolio.keys())
+            if code in held_keys:
+                continue
+            # 归一化比较(sh510300 vs 510300)
+            norm_code = code.lstrip("shszbj")
+            if any(k.lstrip("shszbj") == norm_code for k in held_keys if norm_code):
                 continue
             orders.append({
                 "code": code,

@@ -22,7 +22,7 @@ MAX_VOLATILITY = 0.30      # 最大允许波动率（年化）
 TOP_N = 2                  # 选前 N 名
 STOP_LOSS_PCT = 0.06       # 止损比例
 TAKE_PROFIT_PCT = 0.05     # 止盈触发
-TRAILING_STOP_PCT = 0.03   # 移动止盈回撤
+TRAILING_GIVE_BACK_RATIO = 0.4  # 移动止盈:回吐盈利的 40% 即离场
 REBALANCE_DAY = 0          # 调仓日（周一=0）
 
 
@@ -225,16 +225,18 @@ class ETFRotationStrategy:
             if current_price < ma20:
                 return True, f"跌破 MA20（价格 {current_price:.3f} < MA20 {ma20:.3f}）"
 
-        # 移动止盈
+        # 移动止盈:回吐盈利的 TRAILING_GIVE_BACK_RATIO 即离场
         if pnl_pct >= TAKE_PROFIT_PCT:
             hwm = self._high_water_marks.get(code, buy_price)
             if current_price > hwm:
                 self._high_water_marks[code] = current_price
                 hwm = current_price
 
-            drawdown_from_hwm = (hwm - current_price) / hwm
-            if drawdown_from_hwm >= TRAILING_STOP_PCT:
-                return True, f"移动止盈（从高点回撤 {drawdown_from_hwm:.2%}，盈利 {pnl_pct:.2%}）"
+            profit = hwm - buy_price
+            give_back = profit * TRAILING_GIVE_BACK_RATIO
+            stop_line = max(hwm - give_back, buy_price)
+            if current_price <= stop_line:
+                return True, f"移动止盈（回吐盈利 {TRAILING_GIVE_BACK_RATIO*100:.0f}%，盈利 {pnl_pct:.2%}）"
 
         # 更新最高价
         if code not in self._high_water_marks or current_price > self._high_water_marks[code]:

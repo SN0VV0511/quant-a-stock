@@ -88,6 +88,7 @@
         .badge { padding: 1px 7px; border-radius: 5px; font-size: 11px; font-weight: 600; }
         .badge-buy { background: var(--buy); color: var(--green); }
         .badge-sell { background: var(--sell); color: var(--red); }
+        .badge-reject { background: #fff3cd; color: #856404; }
         .empty { text-align: center; color: var(--text3); padding: 20px; font-size: 12px; }
 
         /* Charts */
@@ -149,8 +150,12 @@
             <span class="status-pill"><span class="dot" id="dot-watch"></span>盯盘线</span>
             <span class="status-pill"><span class="dot" id="dot-scan"></span>扫描线</span>
             <span class="clock" id="clock" aria-label="当前时间">--:--:--</span>
+            <button onclick="logout()" style="background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:#8899aa;padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer;margin-left:4px">退出</button>
         </div>
     </header>
+    <div style="background:#fff3cd;color:#856404;text-align:center;padding:6px 12px;font-size:12px;border-bottom:1px solid #ffc107;">
+        ⚠️ 本页面为个人量化研究工具，数据来源于公开渠道，存在延迟与误差，<strong>不构成任何投资建议</strong>。请勿对外传播。
+    </div>
 
     <main class="wrap">
         <!-- Stats -->
@@ -215,7 +220,7 @@
 
         <!-- Trades -->
         <div class="card col-4">
-            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-repeat"/></svg>操作记录</span><span class="meta" id="trade-count">--</span></div>
+            <div class="card-head"><span class="title"><svg class="icon icon-lg"><use href="#i-repeat"/></svg>操作记录</span><span class="meta" id="trade-count">--</span><label style="margin-left:8px;font-size:12px;cursor:pointer;user-select:none"><input type="checkbox" id="show-rejected" onchange="loadTrades()" style="vertical-align:middle;margin-right:2px">显示异常</label></div>
             <div class="card-body scroll" id="trade-list" style="max-height:360px;padding:6px 12px"><div class="empty">暂无交易</div></div>
         </div>
 
@@ -255,6 +260,7 @@
     const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
     const todayStr = () => new Date().toISOString().slice(0,10).replace(/-/g,'');
     function flash(){ const d=$('refresh-dot'); d.classList.add('active'); setTimeout(()=>d.classList.remove('active'),300); }
+    async function logout(){ await fetch('api/logout',{method:'POST'}); window.location.href='login'; }
 
     setInterval(()=>{ $('clock').textContent = new Date().toLocaleTimeString('zh-CN'); }, 1000);
 
@@ -419,14 +425,18 @@
                     <div class="ri-right"><div class="pct ${pnlC(s.momentum)}">${fmtPct(s.momentum)}</div></div>
                 </div>`).join('') : '<div class="empty" style="padding:10px">无行业数据</div>';
             if (orders.length){
+                const activeOrders = orders.filter(o => o.status !== 'risk_rejected');
                 html += '<div class="ri-sub" style="margin:10px 0 4px">RPS 订单</div>';
-                html += orders.slice(0,4).map(o=>`
+                html += activeOrders.length ? activeOrders.slice(0,4).map(o=>`
                     <div class="row-item">
                         <span class="badge ${o.action === 'buy' ? 'badge-buy' : 'badge-sell'}">${o.action === 'buy' ? '买' : '卖'}</span>
                         <div class="ri-main"><div class="ri-name">${esc(o.name || o.code)}</div>
                         <div class="ri-sub">${esc(o.status || '--')} · ${esc(o.reason || o.message || '')}</div></div>
                         <div class="ri-right"><div class="px">${o.shares || 0}份</div><div class="ri-sub">¥${fmt(o.price,3)}</div></div>
-                    </div>`).join('');
+                    </div>`).join('') : '<div class="empty" style="padding:10px">全部被风控拒绝</div>';
+                if (orders.length > activeOrders.length) {
+                    html += `<div class="ri-sub" style="margin:4px 0;opacity:0.5;font-size:11px">${orders.length - activeOrders.length} 笔被风控拒绝已隐藏</div>`;
+                }
             }
             el.innerHTML = html;
         } catch(e){
@@ -438,19 +448,22 @@
     async function loadTrades(){
         try {
             const d = await (await fetch('api/trades')).json();
-            const trades = (d.trades||[]).slice().reverse();
+            const all = (d.trades||[]).slice().reverse();
+            const showRejected = $('show-rejected')?.checked || false;
+            const trades = showRejected ? all : all.filter(t => t.status !== 'rejected');
             $('trade-count').textContent = trades.length+' 条';
             $('s-trade-count').textContent = trades.filter(t=>t.date===todayStr()).length;
             if (trades.length){ const l=trades[0]; $('s-last-trade').textContent=(l.time||'')+' '+((l.action||l.direction)==='buy'?'买':'卖')+' '+(l.name||l.code); }
             const el = $('trade-list');
             if (!trades.length){ el.innerHTML='<div class="empty">暂无交易</div>'; return; }
-            el.innerHTML = trades.slice(0,40).map(t=>{ const buy=(t.action||t.direction)==='buy'; return `
-                <div class="row-item" style="gap:8px">
-                    <span class="ri-sub" style="min-width:48px">${t.time||''}</span>
-                    <span class="badge ${buy?'badge-buy':'badge-sell'}">${buy?'买':'卖'}</span>
+            el.innerHTML = trades.slice(0,40).map(t=>{ const buy=(t.action||t.direction)==='buy'; const rejected=t.status==='rejected'; return `
+                <div class="row-item" style="gap:8px;${rejected?'opacity:0.7':''}">
+                    <span class="ri-sub" style="min-width:80px">${t.date||''} ${t.time||''}</span>
+                    <span class="badge ${rejected?'badge-reject':(buy?'badge-buy':'badge-sell')}">${rejected?'✕':(buy?'买':'卖')}</span>
                     <span class="ri-main ri-name">${t.name||t.code}</span>
                     <span class="ri-sub">${t.shares}股</span>
                     <span class="ri-right" style="min-width:64px">¥${fmt(t.price,3)}</span>
+                    ${rejected?`<span class="ri-sub" style="color:var(--red);font-size:11px">${t.reject_reason||''}</span>`:''}
                 </div>`; }).join('');
         } catch(e){ console.error(e); }
     }
@@ -528,7 +541,7 @@
             let th='<tr><th>策略</th>'+M.map(m=>`<th>${m[0]}</th>`).join('')+'</tr>';
             let rows=d.series.map((s,i)=>{ const m=s.metrics||{};
                 return `<tr><td style="color:${BT_COLORS[i%BT_COLORS.length]}">${esc(s.name)}</td>`+
-                    M.map(c=>{ const v=m[c[1]]; const txt=c[2]?fmtPct(v):(v==null?'--':v);
+                    M.map(c=>{ const v=m[c[1]]; const txt=c[2]?fmtPct(v):(v==null?'--':fmt(v,2));
                     const cls=(c[1]==='total_return'||c[1]==='annual_return'||c[1]==='sharpe_ratio')?pnlC(v):'';
                     return `<td class="${cls}">${txt}</td>`; }).join('')+'</tr>'; }).join('');
             $('bt-table').innerHTML = `<table>${th}${rows}</table>

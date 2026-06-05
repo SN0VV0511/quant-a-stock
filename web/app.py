@@ -10,6 +10,7 @@ import json
 import time
 import logging
 import threading
+from datetime import datetime
 from dataclasses import asdict
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -18,8 +19,8 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (
-    INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR,
-    SNAPSHOT_LOG_FILE, RPS_STATE_FILE, normalize_a_share_code,
+    INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR, DATA_DIR,
+    SNAPSHOT_LOG_FILE, TRADE_EVENTS_FILE, RPS_STATE_FILE, normalize_a_share_code,
 )
 from config.time_utils import format_local
 from data.ak_loader import AKDataLoader
@@ -177,16 +178,69 @@ def is_process_running(name):
         return False
 
 
+# ==================== 登录验证 ====================
+
+import hashlib
+import secrets
+import base64
+
+# 密码 SHA256 哈希（默认: sn0vv2026!）
+_DASHBOARD_PASSWORD_HASH = (
+    "15924eeb0a783f97e2538608a4c173051cefbd955cb48b7f44d918940f707490"
+)
+# 会话 token → 过期时间
+_sessions: dict[str, float] = {}
+_SESSION_TTL = 86400  # 24 小时
+
+
+def _check_auth(handler) -> bool:
+    """检查请求是否已认证。返回 True 表示已登录。"""
+    cookie = handler.headers.get("Cookie", "")
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith("quant_token="):
+            token = part[len("quant_token="):]
+            if token in _sessions:
+                if time.time() - _sessions[token] < _SESSION_TTL:
+                    _sessions[token] = time.time()  # 续期
+                    return True
+                else:
+                    del _sessions[token]
+    return False
+
+
+def _set_auth_cookie(handler):
+    """设置认证 cookie。"""
+    token = secrets.token_hex(32)
+    _sessions[token] = time.time()
+    handler.send_header(
+        "Set-Cookie",
+        f"quant_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={_SESSION_TTL}",
+    )
+
+
 class QuantHandler(SimpleHTTPRequestHandler):
+
+    def _require_auth(self) -> bool:
+        """需要认证的路由调用此方法。未登录返回 False 并发送登录页。"""
+        if _check_auth(self):
+            return True
+        self.send_response(302)
+        self.send_header("Location", "login")
+        self.end_headers()
+        return False
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        routes = {
-            "/": lambda: self._serve_template("index.html"),
-            "/index.html": lambda: self._serve_template("index.html"),
+        # 登录页不需要认证
+        if path == "/login":
+            return self._serve_template("login.html")
+
+        # API 路由
+        api_routes = {
             "/api/portfolio": lambda: self._json_response(self._api_portfolio()),
             "/api/trades": lambda: self._json_response(self._api_trades()),
             "/api/scan": lambda: self._json_response(self._api_scan()),
@@ -200,18 +254,59 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "/api/backtest": lambda: self._json_response(self._api_backtest()),
         }
 
-        handler = routes.get(path)
-        if handler:
-            handler()
-        else:
-            self.send_error(404)
+        if path in api_routes:
+            if not self._require_auth():
+                return
+            api_routes[path]()
+            return
+
+        # 静态文件 / 主页
+        if path in ("/", "/index.html"):
+            if not self._require_auth():
+                return
+            return self._serve_template("index.html")
+
+        self.send_error(404)
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        content_len = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {}
+
+        if parsed.path == "/api/login":
+            pwd = data.get("password", "")
+            if hashlib.sha256(pwd.encode()).hexdigest() == _DASHBOARD_PASSWORD_HASH:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                _set_auth_cookie(self)
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode())
+            else:
+                self._json_response({"success": False, "error": "密码错误"}, status=401)
+            return
+
+        if parsed.path == "/api/logout":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header(
+                "Set-Cookie",
+                "quant_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+            )
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode())
+            return
+
         if parsed.path == "/api/scan/trigger":
+            if not self._require_auth():
+                return
             self._json_response(self._api_scan_trigger())
-        else:
-            self.send_error(404)
+            return
+
+        self.send_error(404)
 
     # ==================== API ====================
 
@@ -273,6 +368,48 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
     def _api_trades(self):
         trades = load_trade_log()
+        # 合并 trade_events.jsonl 中被风控拒绝的订单
+        today = datetime.now().strftime("%Y%m%d")
+        events_file = os.path.join(DATA_DIR, "trade_events.jsonl")
+        if os.path.exists(events_file):
+            try:
+                with open(events_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        evt = json.loads(line)
+                        if evt.get("event_type") != "risk_rejected":
+                            continue
+                        order = evt.get("payload", {}).get("order", {})
+                        ts = evt.get("timestamp", "")
+                        # 拆分 timestamp 为 date + time
+                        date_part = ts[:10].replace("-", "") if len(ts) >= 10 else ""
+                        time_part = ts[11:19] if len(ts) >= 19 else ""
+                        # 去重：同一天同一代码同一操作只保留一条
+                        dup = any(
+                            t.get("date") == date_part
+                            and t.get("code") == order.get("code")
+                            and t.get("action") == order.get("action")
+                            for t in trades
+                        )
+                        if dup:
+                            continue
+                        trades.append({
+                            "date": date_part,
+                            "time": time_part,
+                            "code": order.get("code", ""),
+                            "name": order.get("name", ""),
+                            "action": order.get("action", ""),
+                            "shares": order.get("shares", 0),
+                            "actual_price": order.get("price", 0),
+                            "strategy": order.get("strategy", ""),
+                            "reason": order.get("reason", ""),
+                            "status": "rejected",
+                            "reject_reason": evt.get("payload", {}).get("reason", ""),
+                        })
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("读取风控拒绝事件失败: %s", exc)
         # 获取股票名称映射
         name_map = {}
         try:
@@ -284,11 +421,12 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 name_map = {k: v.get("name", "") for k, v in quotes.items()}
         except Exception:
             pass
-        # 添加名称到交易记录
+        # 添加名称到交易记录（已有名称的跳过）
         for t in trades:
-            code = t.get("code", "")
-            raw = normalize_code(code)
-            t["name"] = name_map.get(raw, "")
+            if not t.get("name"):
+                code = t.get("code", "")
+                raw = normalize_code(code)
+                t["name"] = name_map.get(raw, "")
         return {"trades": trades[-50:]}
 
     def _api_scan(self):
@@ -432,10 +570,15 @@ class QuantHandler(SimpleHTTPRequestHandler):
     def _api_equity(self):
         """净值曲线与回撤序列。
 
-        优先读账户快照流水 portfolio_snapshots.jsonl(含时间戳与回撤),
-        为空时回退到 state 的 daily_snapshots(仅日期与总市值)。
+        合并三个数据源:
+        1. portfolio_snapshots.jsonl — 收盘快照(含回撤)
+        2. trade_events.jsonl — 盘中快照(portfolio_snapshot 事件)
+        3. state daily_snapshots — 兜底(仅日期与总市值)
         """
-        points = []
+        points: list[dict] = []
+        seen_timestamps: set[str] = set()
+
+        # 1. 收盘快照
         if os.path.exists(SNAPSHOT_LOG_FILE):
             try:
                 with open(SNAPSHOT_LOG_FILE, "r", encoding="utf-8") as f:
@@ -445,14 +588,46 @@ class QuantHandler(SimpleHTTPRequestHandler):
                             continue
                         obj = json.loads(line)
                         s = obj.get("summary", {})
+                        t = obj.get("timestamp") or obj.get("date", "")
                         points.append({
-                            "t": obj.get("timestamp") or obj.get("date", ""),
+                            "t": t,
                             "value": s.get("total_value"),
                             "drawdown": s.get("drawdown", 0),
                         })
+                        seen_timestamps.add(t)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("读取快照流水失败: %s", exc)
 
+        # 2. 盘中快照(合并，去重)
+        if os.path.exists(TRADE_EVENTS_FILE):
+            try:
+                peak = INITIAL_CAPITAL
+                with open(TRADE_EVENTS_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        if obj.get("event_type") != "portfolio_snapshot":
+                            continue
+                        p = obj.get("payload", {})
+                        val = p.get("total_value")
+                        if val is None:
+                            continue
+                        t = obj.get("timestamp", "")
+                        if t in seen_timestamps:
+                            continue
+                        seen_timestamps.add(t)
+                        peak = max(peak, val)
+                        points.append({
+                            "t": t,
+                            "value": val,
+                            "drawdown": p.get("drawdown", round((peak - val) / peak, 4) if peak > 0 else 0),
+                        })
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("读取交易事件流水失败: %s", exc)
+
+        # 3. 兜底: daily_snapshots
         if not points:
             state = load_state()
             daily = state.get("daily_snapshots", {})
@@ -467,6 +642,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
                     "value": val,
                     "drawdown": round((peak - val) / peak, 4) if peak > 0 else 0,
                 })
+
+        # 按时间排序
+        points.sort(key=lambda p: p["t"])
 
         return {"points": points, "initial": INITIAL_CAPITAL}
 
@@ -499,9 +677,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
     # ==================== 辅助 ====================
 
-    def _json_response(self, data):
+    def _json_response(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", len(body))
         self.send_header("Access-Control-Allow-Origin", "*")

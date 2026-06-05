@@ -28,6 +28,7 @@ from config.settings import (
     normalize_a_share_code,
     to_baostock_code,
     to_tencent_security_code,
+    INDUSTRY_TENCENT_MAP,
 )
 
 try:
@@ -39,6 +40,11 @@ try:
     import akshare as ak
 except ImportError:  # pragma: no cover - 运行环境可能未安装行情依赖
     ak = None
+
+try:
+    import requests as _requests_lib
+except ImportError:  # pragma: no cover
+    _requests_lib = None
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +63,11 @@ def _run_bs_with_subprocess(command, *args, timeout=30):
     cmd = [sys.executable, _BS_WORKER, command, *args]
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, _ = proc.communicate(timeout=timeout)
         if proc.returncode != 0:
-            err_msg = stderr.decode("utf-8", errors="replace").strip()
-            logger.warning("bs_worker %s 失败 (rc=%s): %s", command, proc.returncode, err_msg)
+            logger.warning("bs_worker %s 失败 (rc=%s)", command, proc.returncode)
             return None
         return json.loads(stdout.decode("utf-8"))
     except subprocess.TimeoutExpired:
@@ -103,6 +108,23 @@ def _normalize_compact_date(value: object) -> str:
     if pd.isna(parsed):
         return text.replace("-", "").replace("/", "")[:8]
     return parsed.strftime("%Y%m%d")
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """判断异常是否为网络类错误，用于决定是否重试。"""
+    msg = str(exc).lower()
+    network_keywords = (
+        "remote end closed connection",
+        "connection aborted",
+        "remotedisconnected",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "max retries exceeded",
+        "too many requests",
+        "service unavailable",
+    )
+    return any(kw in msg for kw in network_keywords)
 
 
 def _safe_cache_fragment(value: object) -> str:
@@ -173,6 +195,109 @@ def _normalize_market_history(
     return df
 
 
+# ---------------------------------------------------------------------------
+# 新浪/腾讯 fallback – AKShare 失败时的备用数据源
+# ---------------------------------------------------------------------------
+
+def _sina_symbol_for_etf(code: str) -> str:
+    """ETF 代码转换为新浪 symbol (sh510300 / sz159915)。"""
+    raw = code.strip().lower().replace(".", "")
+    if raw.startswith(("sh", "sz")):
+        raw = raw[2:]
+    # 5/6 开头→上交所, 1/2/3/4 开头→深交所
+    prefix = "sh" if raw[:1] in ("5", "6") else "sz"
+    return f"{prefix}{raw}"
+
+
+def _fetch_etf_history_sina(
+    code: str,
+    datalen: int = 120,
+) -> pd.DataFrame | None:
+    """通过新浪财经获取 ETF 日K线历史行情。"""
+    if _requests_lib is None:
+        return None
+    symbol = _sina_symbol_for_etf(code)
+    url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    params = {"symbol": symbol, "scale": "240", "ma": "no", "datalen": str(datalen)}
+    for attempt in range(2):
+        try:
+            r = _requests_lib.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                return None
+            df = pd.DataFrame(data)
+            # 新浪返回: day, open, high, low, close, volume (全是字符串)
+            df = df.rename(columns={"day": "date"})
+            for col in ("open", "high", "low", "close", "volume"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["date"] = df["date"].map(_normalize_compact_date)
+            df["code"] = code
+            df["name"] = code
+            df["amount"] = 0
+            df["pctChg"] = np.nan
+            df = df.dropna(subset=["date", "close"])
+            df = df[df["close"] > 0]
+            df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+            return df
+        except Exception as exc:
+            if attempt < 1:
+                time.sleep(1)
+                continue
+            logger.warning("新浪 ETF 历史行情获取失败 %s: %s", code, exc)
+            return None
+    return None
+
+
+def _fetch_industry_history_tencent(
+    industry_name: str,
+    datalen: int = 120,
+) -> pd.DataFrame | None:
+    """通过腾讯财经获取行业指数日K线历史行情。
+
+    使用 INDUSTRY_TENCENT_MAP 映射行业名到指数代码。
+    """
+    if _requests_lib is None:
+        return None
+    tencent_code = INDUSTRY_TENCENT_MAP.get(industry_name)
+    if not tencent_code:
+        logger.debug("行业 '%s' 无腾讯指数映射，跳过 fallback", industry_name)
+        return None
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    # param 格式: code,day,start,end,count,fq
+    param_str = f"{tencent_code},day,,,{datalen},qfq"
+    for attempt in range(2):
+        try:
+            r = _requests_lib.get(url, params={"param": param_str}, timeout=15)
+            r.raise_for_status()
+            resp = r.json()
+            # 腾讯返回结构: {"data": {code: {"qfqday": [[...], ...]}}}
+            code_data = resp.get("data", {}).get(tencent_code, {})
+            rows = code_data.get("qfqday") or code_data.get("day") or []
+            if not rows:
+                return None
+            df = pd.DataFrame(rows, columns=["date", "open", "close", "high", "low", "volume"])
+            for col in ("open", "high", "low", "close", "volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["date"] = df["date"].map(_normalize_compact_date)
+            df["code"] = industry_name
+            df["name"] = industry_name
+            df["amount"] = 0
+            df["pctChg"] = np.nan
+            df = df.dropna(subset=["date", "close"])
+            df = df[df["close"] > 0]
+            df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+            return df
+        except Exception as exc:
+            if attempt < 1:
+                time.sleep(1)
+                continue
+            logger.warning("腾讯行业指数历史行情获取失败 %s: %s", industry_name, exc)
+            return None
+    return None
+
+
 class AKDataLoader:
     """沪深 A 股股票数据加载器。"""
 
@@ -193,12 +318,13 @@ class AKDataLoader:
     def _login(self):
         _require_baostock()
         if not self._bs_logged_in:
-            try:
-                bs.login()
+            # 走子进程登录，避免 baostock C 扩展直接写 fd 2 污染日志
+            result = _run_bs_with_subprocess("login")
+            if result and result.get("ok"):
                 self._bs_logged_in = True
-            except Exception:
+            else:
                 self._bs_logged_in = False
-                raise
+                raise ConnectionError("BaoStock 登录失败")
 
     def _ensure_login(self):
         """确保 BaoStock 连接有效,通过子进程验证,失败则重新登录,共重试 3 次。
@@ -242,7 +368,8 @@ class AKDataLoader:
 
     def _logout(self):
         if self._bs_logged_in and bs is not None:
-            bs.logout()
+            # 走子进程登出，避免 baostock C 扩展污染日志
+            _run_bs_with_subprocess("logout")
             self._bs_logged_in = False
 
     def close(self):
@@ -362,8 +489,9 @@ class AKDataLoader:
         seen_codes = set()
         invalid_codes = []
         for code in codes:
+            # 去掉 sh/sz 前缀做去重 key（兼容 A 股和 ETF）
+            raw_code = str(code).replace("sh", "").replace("sz", "")
             try:
-                raw_code = normalize_a_share_code(str(code))
                 tencent_code = to_tencent_security_code(str(code))
             except ValueError:
                 invalid_codes.append(str(code))
@@ -531,7 +659,10 @@ class AKDataLoader:
         return {code: q["price"] for code, q in quotes.items()}
 
     def get_stock_data(self, code, days=60):
-        """获取个股历史数据（兼容别名）"""
+        """获取个股/ETF 历史数据（兼容别名）。ETF 走 AKShare，个股走 BaoStock。"""
+        from config.settings import is_etf as _is_etf
+        if _is_etf(str(code)):
+            return self.get_etf_history(str(code), days=days)
         return self.get_stock_history(code, days=days)
 
     def get_stock_history_ext(self, code, days=40):
@@ -706,19 +837,36 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
-        try:
-            _require_akshare()
-            raw_df = ak.fund_etf_hist_em(
-                symbol=raw_code,
-                period="daily",
-                start_date=start,
-                end_date=end,
-                adjust=adjust,
-            )
-            df = _normalize_market_history(raw_df, code=raw_code)
-        except Exception as exc:
-            logger.warning("AKShare ETF 历史行情获取失败 %s: %s", code, exc)
-            return None
+        for attempt in range(3):
+            try:
+                _require_akshare()
+                raw_df = ak.fund_etf_hist_em(
+                    symbol=raw_code,
+                    period="daily",
+                    start_date=start,
+                    end_date=end,
+                    adjust=adjust,
+                )
+                df = _normalize_market_history(raw_df, code=raw_code)
+                break
+            except Exception as exc:
+                if _is_network_error(exc) and attempt < 2:
+                    delay = (attempt + 1) * 2
+                    logger.warning(
+                        "AKShare ETF %s 网络错误，%ds后重试(%d/3): %s",
+                        code, delay, attempt + 2, exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning("AKShare ETF 历史行情获取失败 %s: %s", code, exc)
+                # AKShare 失败，fallback 到新浪
+                logger.info("ETF %s 尝试新浪 fallback", code)
+                df = _fetch_etf_history_sina(raw_code, datalen=days)
+                if df is not None and not df.empty:
+                    logger.info("ETF %s 新浪 fallback 成功，%d 条数据", code, len(df))
+                    self._write_cache(cache_key, df)
+                    return df
+                return None
 
         if df.empty:
             logger.warning("AKShare ETF 历史行情为空: %s %s-%s", code, start, end)
@@ -797,26 +945,43 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
-        try:
-            _require_akshare()
-            if provider == "em":
-                raw_df = ak.stock_board_industry_hist_em(
-                    symbol=name,
-                    start_date=start,
-                    end_date=end,
-                    period="日k",
-                    adjust="",
-                )
-            else:
-                raw_df = ak.stock_board_industry_index_ths(
-                    symbol=name,
-                    start_date=start,
-                    end_date=end,
-                )
-            df = _normalize_market_history(raw_df, code=name, name=name)
-        except Exception as exc:
-            logger.warning("AKShare 行业指数历史行情获取失败 %s(%s): %s", name, provider, exc)
-            return None
+        for attempt in range(3):
+            try:
+                _require_akshare()
+                if provider == "em":
+                    raw_df = ak.stock_board_industry_hist_em(
+                        symbol=name,
+                        start_date=start,
+                        end_date=end,
+                        period="日k",
+                        adjust="",
+                    )
+                else:
+                    raw_df = ak.stock_board_industry_index_ths(
+                        symbol=name,
+                        start_date=start,
+                        end_date=end,
+                    )
+                df = _normalize_market_history(raw_df, code=name, name=name)
+                break
+            except Exception as exc:
+                if _is_network_error(exc) and attempt < 2:
+                    delay = (attempt + 1) * 2
+                    logger.warning(
+                        "AKShare 行业指数 %s 网络错误，%ds后重试(%d/3): %s",
+                        name, delay, attempt + 2, exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning("AKShare 行业指数历史行情获取失败 %s(%s): %s", name, provider, exc)
+                # AKShare 失败，fallback 到腾讯
+                logger.info("行业指数 %s 尝试腾讯 fallback", name)
+                df = _fetch_industry_history_tencent(name, datalen=days)
+                if df is not None and not df.empty:
+                    logger.info("行业指数 %s 腾讯 fallback 成功，%d 条数据", name, len(df))
+                    self._write_cache(cache_key, df)
+                    return df
+                return None
 
         if df.empty:
             logger.warning("AKShare 行业指数历史行情为空: %s %s-%s", name, start, end)
@@ -866,6 +1031,71 @@ class AKDataLoader:
                 except Exception as exc:
                     logger.warning("批量行业指数历史行情失败 %s: %s", name, exc)
         logger.info("行业指数历史行情完成: %d/%d 个", len(result), len(targets))
+        return result
+
+    def get_industry_index_history_tencent(
+        self,
+        industry_names: list[str],
+        days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        """通过腾讯接口获取行业指数日线历史行情（AKShare 不稳定时的兜底）。
+
+        腾讯历史K线接口:
+            https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq
+
+        Args:
+            industry_names: 行业名称列表（如 证券、半导体 等）。
+            days: 回溯自然日数。
+
+        Returns:
+            ``{industry_name: DataFrame}``,列与 get_industry_index_history 一致。
+        """
+        from config.settings import INDUSTRY_TENCENT_MAP
+        import requests as _requests
+
+        result: dict[str, pd.DataFrame] = {}
+        for name in industry_names:
+            tencent_code = INDUSTRY_TENCENT_MAP.get(name)
+            if not tencent_code:
+                continue
+            try:
+                url = (
+                    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+                    f"?param={tencent_code},day,,,{days},qfq"
+                )
+                resp = _requests.get(
+                    url,
+                    headers={"Referer": "https://stock.qq.com"},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                klines = (
+                    data.get("data", {})
+                    .get(tencent_code, {})
+                    .get("day", [])
+                    or data.get("data", {})
+                    .get(tencent_code, {})
+                    .get("qfqday", [])
+                )
+                if not klines:
+                    continue
+                rows = []
+                for k in klines:
+                    rows.append({
+                        "date": str(k[0]),
+                        "open": float(k[1]),
+                        "close": float(k[2]),
+                        "high": float(k[3]),
+                        "low": float(k[4]),
+                        "volume": float(k[5]) if len(k) > 5 else 0,
+                    })
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    result[name] = df
+            except Exception as exc:
+                logger.warning("腾讯行业指数 %s 获取失败: %s", name, exc)
+        logger.info("腾讯行业指数完成: %d/%d 个", len(result), len(industry_names))
         return result
 
     @staticmethod

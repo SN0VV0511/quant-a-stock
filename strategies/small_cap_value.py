@@ -26,6 +26,8 @@ from config.settings import (
     SMALLCAP_MIN_PRICE,
     SMALLCAP_MAX_PRICE,
     SMALLCAP_MIN_PB,
+    SMALLCAP_MIN_TURNOVER,
+    SMALLCAP_MIN_VOLUME_RATIO,
     SMALLCAP_REVERSAL_DAYS,
 )
 from strategies.indicators import calculate_obv_trend
@@ -123,6 +125,21 @@ def build_factor_rows(history_map, reversal_days=SMALLCAP_REVERSAL_DAYS, name_ma
 
         pb = _col(last, df, "pb")
         mktcap = _col(last, df, "mktcap")
+
+        # 流动性/估值过滤:换手率、量比(相对自身 20 日均量)、低 PB 退市风险
+        turn = _col(last, df, "turn")
+        if turn is not None and turn < SMALLCAP_MIN_TURNOVER:
+            continue
+        if pb is not None and pb < SMALLCAP_MIN_PB:
+            continue
+        if "volume" in df.columns:
+            vol_series = pd.to_numeric(df["volume"], errors="coerce")
+            vol_ma20 = vol_series.rolling(20).mean().iloc[-1]
+            last_volume = vol_series.iloc[-1]
+            if (pd.notna(last_volume) and pd.notna(vol_ma20)
+                    and last_volume < vol_ma20 * SMALLCAP_MIN_VOLUME_RATIO):
+                continue
+
         obv_trend = 0.0
         if "volume" in df.columns:
             obv_trend = calculate_obv_trend(df, lookback=min(reversal_days, len(df) - 1))

@@ -31,18 +31,22 @@ class FakeRpsLoader:
     """模拟 RPS 所需行情接口。"""
 
     def get_batch_etf_history(self, codes, days, max_batch):
-        """返回三只 ETF 历史行情。"""
+        """返回至少 50% ETF 历史行情以满足数据完整性校验。"""
         return {
             "510300": _hist(0.30),
             "510500": _hist(0.10),
             "159915": _hist(-0.05),
+            "588000": _hist(0.15),
+            "512100": _hist(0.08),
         }
 
     def get_batch_industry_index_history(self, industry_names, days, max_batch):
-        """返回行业观察历史行情。"""
+        """返回至少 50% 行业历史行情以满足数据完整性校验。"""
         return {
             "证券": _hist(0.20),
             "半导体": _hist(0.05),
+            "光伏设备": _hist(0.12),
+            "电池": _hist(-0.03),
         }
 
     def get_realtime_quotes(self, codes):
@@ -51,6 +55,8 @@ class FakeRpsLoader:
             "510300": {"price": 5.2, "prev_close": 5.1, "open": 5.1, "high": 5.25, "low": 5.05, "volume": 1_000_000},
             "510500": {"price": 4.4, "prev_close": 4.35, "open": 4.35, "high": 4.45, "low": 4.3, "volume": 1_000_000},
             "159915": {"price": 3.8, "prev_close": 3.85, "open": 3.85, "high": 3.9, "low": 3.75, "volume": 1_000_000},
+            "588000": {"price": 1.2, "prev_close": 1.18, "open": 1.18, "high": 1.22, "low": 1.17, "volume": 1_000_000},
+            "512100": {"price": 2.1, "prev_close": 2.08, "open": 2.08, "high": 2.12, "low": 2.07, "volume": 1_000_000},
         }
 
 
@@ -98,8 +104,8 @@ def test_daily_rps_rotation_places_paper_orders(monkeypatch, tmp_path) -> None:
 
     assert result["status"] == "ok"
     assert saved["completed"] is True
-    assert saved["etf_loaded"] == 3
-    assert saved["industry_loaded"] == 2
+    assert saved["etf_loaded"] == 5
+    assert saved["industry_loaded"] == 4
     assert saved["orders"]
     assert positions
     assert "rps_rotation_completed" in events

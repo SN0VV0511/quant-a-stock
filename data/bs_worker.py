@@ -22,13 +22,16 @@ import baostock as bs
 
 @contextlib.contextmanager
 def _suppress_stdout():
-    """Suppress baostock's internal print() calls that pollute stdout."""
-    old = sys.stdout
+    """Suppress baostock's internal print() calls that pollute stdout/stderr."""
+    old_out = sys.stdout
+    old_err = sys.stderr
     sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
     try:
         yield
     finally:
-        sys.stdout = old
+        sys.stdout = old_out
+        sys.stderr = old_err
 
 
 def _ensure_login():
@@ -104,8 +107,16 @@ def cmd_query_history_ext(bs_code, start, end):
     return {"error_code": rs.error_code, "rows": rows, "fields": EXT_FIELDS}
 
 
+def cmd_logout():
+    """登出 BaoStock（子进程内执行，避免污染主进程日志）。"""
+    with _suppress_stdout():
+        bs.logout()
+    return {"ok": True}
+
+
 COMMANDS = {
     "login": cmd_login,
+    "logout": cmd_logout,
     "query_all_stock": cmd_query_all_stock,
     "query_stock_basic": cmd_query_stock_basic,
     "query_history": cmd_query_history,

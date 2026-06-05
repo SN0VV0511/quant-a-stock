@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>量化盯盘系统 - 登录</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#0f1923 0%,#1a2a3a 50%,#0d1b2a 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;color:#e0e0e0}
+.login-box{background:rgba(17,20,19,.95);backdrop-filter:blur(20px);border:1px solid rgba(53,194,186,.15);border-radius:16px;padding:40px;width:380px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.login-box h1{font-size:22px;font-weight:600;text-align:center;margin-bottom:8px;color:#35c2ba}
+.login-box .sub{text-align:center;font-size:13px;color:#8899aa;margin-bottom:28px}
+.login-box label{display:block;font-size:13px;color:#8899aa;margin-bottom:6px}
+.login-box input{width:100%;padding:12px 14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#e0e0e0;font-size:15px;margin-bottom:18px;outline:none;transition:border-color .2s}
+.login-box input:focus{border-color:#35c2ba}
+.login-box button{width:100%;padding:12px;background:#35c2ba;border:none;border-radius:8px;color:#0f1923;font-size:15px;font-weight:600;cursor:pointer;transition:background .2s}
+.login-box button:hover{background:#2db0a8}
+.login-box .error{color:#f44336;font-size:13px;text-align:center;margin-top:12px;display:none}
+.login-box .disclaimer{text-align:center;font-size:11px;color:#667788;margin-top:24px;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="login-box">
+    <h1>🔐 量化盯盘系统</h1>
+    <div class="sub">请输入密码访问</div>
+    <form id="login-form">
+        <label for="password">访问密码</label>
+        <input type="password" id="password" placeholder="请输入密码" autofocus>
+        <button type="submit">登 录</button>
+        <div class="error" id="error-msg">密码错误，请重试</div>
+    </form>
+    <div class="disclaimer">
+        ⚠️ 本页面为个人量化研究工具<br>
+        数据来源于公开渠道，存在延迟与误差<br>
+        不构成任何投资建议 · 请勿对外传播
+    </div>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const pwd = document.getElementById('password').value;
+    const resp = await fetch('api/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({password: pwd})
+    });
+    const data = await resp.json();
+    if (data.success) {
+        window.location.href = '.';
+    } else {
+        document.getElementById('error-msg').style.display = 'block';
+    }
+});
+</script>
+</body>
+</html>

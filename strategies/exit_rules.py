@@ -7,8 +7,9 @@
     1. 策略卖出:Combo 给出 sell(RSI 超买 / 死叉 / 跌破长均线)
     2. ATR 动态止损:按 ``ATR_STOP_MULTIPLIER`` 计算,并受固定止损线保护
     3. 固定止损兜底:缺少 ATR 或 ATR 关闭时,亏损达 ``STOP_LOSS_PCT``
-    4. 移动止损:峰值相对成本盈利达 ``TRAILING_ACTIVATE_PCT`` 后,自峰值回撤达
-       ``TRAILING_STOP_PCT``(锁住趋势利润,避免大幅回吐)
+    4. 移动止损:峰值相对成本盈利达 ``TRAILING_ACTIVATE_PCT`` 后,
+       回吐盈利的 ``TRAILING_GIVE_BACK_RATIO`` 即离场
+       (例:赚10个点吐4个点,止损线不低于成本)
     5. 时间止损:持有达 ``TIME_STOP_DAYS`` 自然日且盈亏低于 ``TIME_STOP_MIN_PROFIT``
        (默认禁用)
     6. ATR 止盈:峰值达到 ATR 目标后,跌破 MA20 锁定利润
@@ -25,7 +26,7 @@ from config.settings import (
     ATR_STOP_MAX_PCT,
     ENABLE_ATR_TAKE_PROFIT,
     ATR_TAKE_PROFIT_MULTIPLIER,
-    TRAILING_STOP_PCT,
+    TRAILING_GIVE_BACK_RATIO,
     TRAILING_ACTIVATE_PCT,
     ENABLE_TRAILING_STOP,
     TIME_STOP_DAYS,
@@ -84,15 +85,19 @@ def evaluate_exit(
     elif pnl_pct <= -STOP_LOSS_PCT:
         return "止损", f"止损,亏损 {pnl_pct:.2%}"
 
-    # 4. 移动止损:仅在峰值盈利越过激活线后启用
+    # 4. 移动止损:回吐盈利的 TRAILING_GIVE_BACK_RATIO 即离场
+    # 止损线 = 峰值 - 盈利 × 回吐比例，且不低于成本价
     if (
         ENABLE_TRAILING_STOP
         and peak_price
         and peak_price >= avg_cost * (1 + TRAILING_ACTIVATE_PCT)
-        and price <= peak_price * (1 - TRAILING_STOP_PCT)
     ):
-        drop = (peak_price - price) / peak_price
-        return "移动止损", f"自峰值回撤 {drop:.2%}(峰值 {peak_price:.3f})"
+        profit = peak_price - avg_cost
+        give_back = profit * TRAILING_GIVE_BACK_RATIO
+        stop_line = max(peak_price - give_back, avg_cost)
+        if price <= stop_line:
+            drop = (peak_price - price) / peak_price
+            return "移动止损", f"回吐盈利 {give_back/profit*100:.0f}%(峰值 {peak_price:.3f} 止损线 {stop_line:.3f})"
 
     # 5. 时间止损(默认禁用)
     if (

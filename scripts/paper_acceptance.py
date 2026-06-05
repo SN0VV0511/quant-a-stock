@@ -51,7 +51,7 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _parse_date(value: str) -> datetime | None:
     """解析常用日期格式。"""
-    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(value, fmt)
         except ValueError:
@@ -63,11 +63,21 @@ def _snapshot_day_count(root_dir: Path, days: int) -> int:
     """统计最近 N 天内有账户快照的自然日数量。"""
     cutoff = now_local() - timedelta(days=days)
     snapshot_dates = set()
+    # 优先读 portfolio_snapshots.jsonl
     for row in _load_jsonl(root_dir / "data" / "portfolio_snapshots.jsonl"):
         date = str(row.get("date", ""))
         parsed = _parse_date(date)
         if parsed is not None and parsed >= cutoff:
             snapshot_dates.add(date)
+    # 回退: 从 trade_events.jsonl 读取盘中快照
+    if not snapshot_dates:
+        for row in _load_jsonl(root_dir / "data" / "trade_events.jsonl"):
+            if row.get("event_type") != "portfolio_snapshot":
+                continue
+            ts = str(row.get("timestamp", ""))
+            parsed = _parse_date(ts)
+            if parsed is not None and parsed >= cutoff:
+                snapshot_dates.add(parsed.strftime("%Y%m%d"))
     return len(snapshot_dates)
 
 

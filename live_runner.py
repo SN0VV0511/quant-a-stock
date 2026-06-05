@@ -39,6 +39,7 @@ from config.settings import (  # noqa: E402
     MAX_SINGLE_ETF,
     MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION,
+    MIN_POSITION_RATIO,
     REBUY_COOLDOWN_SECONDS,
     REPORT_DIR,
     RPS_HISTORY_DAYS,
@@ -46,8 +47,17 @@ from config.settings import (  # noqa: E402
     ENABLE_MARKET_REGIME,
     MARKET_INDEX_CODE,
     MARKET_REGIME_MA,
+    SMALLCAP_TOP_N,
+    SMALLCAP_REBALANCE_DAYS,
+    SMALLCAP_REVERSAL_DAYS,
+    SMALLCAP_MIN_MKTCAP,
+    SMALLCAP_MAX_MKTCAP,
+    SMALLCAP_MIN_PRICE,
+    SMALLCAP_MAX_PRICE,
+    SMALLCAP_MIN_PB,
     get_industry_index_names,
     get_rps_etf_codes,
+    is_etf,
     normalize_a_share_code,
 )
 from config.logging_setup import setup_logger  # noqa: E402
@@ -61,6 +71,7 @@ from strategies.indicators import calculate_atr  # noqa: E402
 from strategies.market_regime import is_risk_on  # noqa: E402
 from strategies.market_scanner import MarketScanner  # noqa: E402
 from strategies.rps_rotation import RPSRotationStrategy, calculate_rps_scores  # noqa: E402
+from strategies.small_cap_value import build_factor_rows, score_small_cap_value  # noqa: E402
 from trading.brokers import PaperBrokerAdapter, create_broker  # noqa: E402
 from trading.models import ExecutionReport, OrderIntent, RiskDecision  # noqa: E402
 from trading.observability import EventRecorder  # noqa: E402
@@ -76,6 +87,181 @@ def _setup_logger() -> logging.Logger:
         rotating_files=("live.log",),
         plain_files=("live_today.log",),
     )
+
+
+SMALLCAP_STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "small_cap_state.json")
+
+
+def _read_small_cap_state() -> dict:
+    """读取小市值调仓状态。"""
+    if not os.path.exists(SMALLCAP_STATE_FILE):
+        return {}
+    try:
+        with open(SMALLCAP_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_small_cap_state(state: dict) -> None:
+    """写入小市值调仓状态。"""
+    os.makedirs(os.path.dirname(SMALLCAP_STATE_FILE), exist_ok=True)
+    with open(SMALLCAP_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def _run_weekly_small_cap(
+    broker,
+    loader,
+    risk_ctrl,
+    recorder,
+    shared,
+    today: str,
+) -> dict:
+    """小市值价值周度调仓。
+
+    每 SMALLCAP_REBALANCE_DAYS 个交易日调仓一次,从候选池中按因子打分选 top N 等权持有。
+    """
+    state = _read_small_cap_state()
+    if state.get("date") == today:
+        logger.info("小市值价值今日已调仓，跳过")
+        return state
+
+    # 判断是否为调仓日(用交易日计数)
+    import config.settings as cfg
+    trading_days = state.get("trading_days", 0)
+    if trading_days > 0 and trading_days % SMALLCAP_REBALANCE_DAYS != 0:
+        logger.info("小市值价值非调仓日(trading_day=%d),跳过", trading_days)
+        state["trading_days"] = trading_days + 1
+        state["date"] = today
+        _write_small_cap_state(state)
+        return state
+
+    logger.info("===== 开始小市值价值周度调仓 =====")
+
+    # 获取候选池
+    candidates = shared.get_candidates()
+    if not candidates:
+        logger.warning("小市值价值: 候选池为空，跳过调仓")
+        state["status"] = "no_candidates"
+        state["date"] = today
+        state["trading_days"] = trading_days + 1
+        _write_small_cap_state(state)
+        return state
+
+    # 加载扩展历史
+    codes = [c.get("code", "") for c in candidates if c.get("code")]
+    from data.loader import DataLoader
+    dl = DataLoader()
+    history = {}
+    name_map = {}
+    try:
+        for code in codes:
+            try:
+                df = dl.get_daily_data(code, adjust_flag="2")
+                if df is None or df.empty:
+                    continue
+                df = df.copy()
+                for col in ("pbMRQ", "isST", "tradestatus", "turn", "volume", "close"):
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                df["pb"] = df.get("pbMRQ")
+                df["is_st"] = df.get("isST", 0)
+                turn = df["turn"].where(df["turn"] > 0)
+                df["mktcap"] = df["close"] * df["volume"] / (turn / 100.0)
+                df["name"] = code
+                history[code] = df
+                name_map[code] = code
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("小市值价值加载失败 %s: %s", code, exc)
+    finally:
+        dl.close()
+
+    if len(history) < SMALLCAP_TOP_N:
+        logger.warning("小市值价值: 数据不足(%d只),跳过调仓", len(history))
+        state["status"] = "insufficient_data"
+        state["date"] = today
+        state["trading_days"] = trading_days + 1
+        _write_small_cap_state(state)
+        return state
+
+    # 打分选股
+    rows = build_factor_rows(history, reversal_days=SMALLCAP_REVERSAL_DAYS, name_map=name_map)
+    target = score_small_cap_value(rows, top_n=SMALLCAP_TOP_N)
+    target_codes = {t["code"] for t in target}
+
+    logger.info("小市值价值目标池: %s", [f"{t['code']}(rank{t['rank']})" for t in target[:5]])
+
+    # 获取当前持仓
+    portfolio = broker.portfolio
+    positions = portfolio.get_all_positions()
+    held_codes = set(positions)
+
+    orders: list[dict] = []
+    # 卖出不在目标池的
+    for code in held_codes - target_codes:
+        pos = positions[code]
+        orders.append({
+            "code": code, "name": pos.get("name", code),
+            "action": "sell", "shares": pos.get("shares", 0),
+            "price": pos.get("current_price", 0),
+            "strategy": "小市值价值", "reason": "调出目标池",
+        })
+
+    # 买入目标池但未持有的
+    for t in target:
+        if t["code"] not in held_codes:
+            orders.append({
+                "code": t["code"], "name": t.get("name", t["code"]),
+                "action": "buy",
+                "strategy": "全市场扫描+小市值价值",
+                "reason": f"小市值价值 rank{t['rank']}",
+            })
+
+    # 执行订单
+    executed = 0
+    for order in orders:
+        intent = OrderIntent(
+            code=order["code"],
+            name=order.get("name", order["code"]),
+            action=order["action"],
+            shares=order.get("shares"),
+            price=order.get("price"),
+            strategy=order["strategy"],
+            reason=order["reason"],
+        )
+        decision = risk_ctrl.evaluate(intent, portfolio)
+        recorder.record("risk_check", {
+            "code": intent.code,
+            "action": intent.action,
+            "decision": decision.decision,
+            "reason": decision.reason,
+        })
+        if decision.decision != "approve":
+            logger.info("风控拒绝: %s(%s) %s - %s", intent.name or intent.code, intent.code, intent.action, decision.reason)
+            continue
+        report = broker.execute(intent)
+        recorder.record("execution", report.to_dict())
+        if report.status == "filled":
+            executed += 1
+            logger.info(
+                "[成交] %s %s %s股 @ %.4f 策略=%s",
+                intent.action, intent.code, report.filled_shares,
+                report.avg_price, intent.strategy,
+            )
+
+    state = {
+        "date": today,
+        "trading_days": trading_days + 1,
+        "status": "done",
+        "target_count": len(target),
+        "orders": len(orders),
+        "executed": executed,
+        "target_codes": list(target_codes),
+    }
+    _write_small_cap_state(state)
+    logger.info("小市值价值完成: 目标%d只 订单%d 成交%d", len(target), len(orders), executed)
+    return state
 
 
 logger = _setup_logger()
@@ -295,7 +481,7 @@ def _submit_order(
     approved, rejected = risk_ctrl.filter_order_intents([order], broker.portfolio, market_data)
     for decision in rejected:
         recorder.record("risk_rejected", decision.to_dict())
-        logger.info("风控拒绝: %s %s - %s", order.code, order.action, decision.reason)
+        logger.info("风控拒绝: %s(%s) %s - %s", order.name or order.code, order.code, order.action, decision.reason)
 
     if not approved:
         return None
@@ -341,7 +527,10 @@ def _read_rps_state() -> dict[str, Any]:
         return {}
     try:
         with open(RPS_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw = f.read().strip()
+        if not raw:
+            return {}
+        data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("读取 RPS 状态失败: %s", exc)
@@ -361,7 +550,10 @@ def _should_skip_rps(today: str, force: bool) -> bool:
     """判断当天 RPS 是否已完成，避免服务重启重复调仓。"""
     if force:
         return False
-    state = _read_rps_state()
+    try:
+        state = _read_rps_state()
+    except Exception:
+        return False
     return (
         state.get("date") == today
         and state.get("status") == "ok"
@@ -437,6 +629,14 @@ def _run_daily_rps_rotation(
     ``trade_events.jsonl``。行业指数只记录强弱观察结果,不会生成订单。
     """
     started_at = now_local().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 收盘后不执行 RPS 轮动（避免收盘后重启导致重复调仓）
+    now = now_local()
+    market_close = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    if now >= market_close:
+        logger.info("ETF/RPS 已过收盘时间，跳过")
+        return {"date": today, "status": "after_hours", "completed": True}
+
     if not ENABLE_RPS_ROTATION:
         state = {
             "date": today,
@@ -491,6 +691,52 @@ def _run_daily_rps_rotation(
             days=RPS_HISTORY_DAYS,
             max_batch=len(industry_names),
         )
+
+        # 数据完整性校验：行业数据不足时降级到腾讯接口
+        etf_ratio = len(etf_history) / max(len(etf_codes), 1)
+        industry_ratio = len(industry_history) / max(len(industry_names), 1)
+        min_ratio = 0.5
+
+        if industry_ratio < min_ratio:
+            logger.warning(
+                "AKShare 行业数据不足 (%d/%d, %.0f%%), 降级到腾讯接口",
+                len(industry_history), len(industry_names), industry_ratio * 100,
+            )
+            tencent_industry = loader.get_industry_index_history_tencent(
+                industry_names, days=RPS_HISTORY_DAYS
+            )
+            if tencent_industry:
+                # 合并：腾讯数据覆盖 AKShare 缺失的
+                for name, df in tencent_industry.items():
+                    if name not in industry_history:
+                        industry_history[name] = df
+                industry_ratio = len(industry_history) / max(len(industry_names), 1)
+                logger.info(
+                    "腾讯兜底后行业数据: %d/%d (%.0f%%)",
+                    len(industry_history), len(industry_names), industry_ratio * 100,
+                )
+
+        if etf_ratio < min_ratio or industry_ratio < min_ratio:
+            state.update({
+                "status": "insufficient_data",
+                "completed": True,
+                "updated_at": now_local().strftime("%Y-%m-%d %H:%M:%S"),
+                "etf_loaded": len(etf_history),
+                "industry_loaded": len(industry_history),
+                "message": (
+                    f"数据不足跳过交易: ETF {len(etf_history)}/{len(etf_codes)} "
+                    f"({etf_ratio:.0%}) 行业 {len(industry_history)}/{len(industry_names)} "
+                    f"({industry_ratio:.0%})"
+                ),
+            })
+            _write_rps_state(state)
+            recorder.record("rps_rotation_skipped", state)
+            logger.warning(
+                "ETF/RPS 数据不足跳过交易: ETF %d/%d (%d%%) 行业 %d/%d (%d%%)",
+                len(etf_history), len(etf_codes), int(etf_ratio * 100),
+                len(industry_history), len(industry_names), int(industry_ratio * 100),
+            )
+            return state
 
         strategy = RPSRotationStrategy(target_pool=DEFAULT_RPS_ETF_POOL)
         etf_signals = strategy.calculate_signals(etf_history, today)
@@ -558,6 +804,11 @@ def _run_daily_rps_rotation(
                     "data_source": "AKShare",
                 },
             )
+            # 二次持仓去重: 防止 generate_orders 和执行之间状态变化
+            current_positions = broker.query_positions()
+            if code in current_positions:
+                logger.info("RPS 跳过已持仓 ETF: %s", code)
+                continue
             report = _submit_order(order, broker, risk_ctrl, market_data, recorder)
             submitted_orders.append({
                 "code": order.code,
@@ -679,9 +930,13 @@ def _handle_position_exits(
     shared: SharedState | None = None,
     combo: ComboSignalStrategy | None = None,
 ) -> None:
-    """处理持仓止损/止盈(策略卖出 / 硬止损 / 移动止损 / 时间止损 / 止盈)。"""
+    """处理持仓止损/止盈(策略卖出 / 硬止损 / 移动止损 / 时间止损 / 止盈)。
+
+    ETF 持仓也走趋势退出(移动止损/MA20跌破/止盈),不再由 RPS 排名踢出。
+    """
     today = today_yyyymmdd()
     for code, pos in positions.items():
+
         if shared is not None and shared.is_exit_cooling_down(code):
             continue
 
@@ -697,7 +952,10 @@ def _handle_position_exits(
         ma20 = None
         atr = None
         try:
-            hist = loader.get_stock_data(normalize_code(code), days=60)
+            if is_etf(code):
+                hist = loader.get_etf_history(code, days=60)
+            else:
+                hist = loader.get_stock_data(normalize_code(code), days=60)
             # 与买入路径共用实时价 K 线,避免买卖信号因输入不同而互相矛盾
             rt_hist = _build_realtime_hist(hist, float(current), market_data.get(code))
             if rt_hist is not None and len(rt_hist) > 25:
@@ -726,6 +984,23 @@ def _handle_position_exits(
             combo_sell=combo_sell,
             combo_reason=combo_reason,
         )
+
+        # 开盘急速止盈: 开盘后 N 分钟内，持仓盈利超阈值则立即卖出
+        if decision is None and avg_cost > 0:
+            import config.settings as _cfg
+            profit_pct = (float(current) / avg_cost - 1) * 100
+            now_ts = now_local()
+            market_open_today = now_ts.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_since_open = (now_ts - market_open_today).total_seconds() / 60
+            if (0 < minutes_since_open <= _cfg.OPENING_TAKEPROFIT_MINUTES
+                    and profit_pct >= _cfg.OPENING_TAKEPROFIT_PCT):
+                decision = ("开盘急速止盈",
+                            f"开盘{minutes_since_open:.0f}分钟 盈利{profit_pct:.1f}%≥{_cfg.OPENING_TAKEPROFIT_PCT}%")
+                logger.info(
+                    "[开盘止盈] %s(%s) 盈利%.1f%% 开盘%.0f分钟",
+                    pos.get("name", code), code, profit_pct, minutes_since_open,
+                )
+
         if decision is None:
             continue
 
@@ -852,6 +1127,56 @@ def _handle_candidate_entries(
         if result_code is None:
             # Risk rejected — cooldown for 5 minutes
             shared.rejected_stocks[code] = time.time() + 300
+
+    # 最低仓位补仓:持仓占比低于阈值时,从候选池涨幅前 3 主动补仓
+    total_value = broker.portfolio.get_total_value(prices)
+    cash = broker.query_cash()
+    position_value = total_value - cash
+    position_ratio = position_value / total_value if total_value > 0 else 0.0
+    if position_ratio < MIN_POSITION_RATIO and shared.is_risk_on():
+        top_gainers = sorted(stocks, key=lambda s: s.get("momentum", 0), reverse=True)[:3]
+        for stock in top_gainers:
+            code = stock["code"]
+            if normalize_code(code) in position_norms:
+                continue
+            if shared.is_rebuy_cooling_down(code):
+                continue
+            if time.time() < shared.rejected_stocks.get(code, 0):
+                continue
+
+            price = prices.get(code)
+            if price is None or price <= 0:
+                continue
+
+            shares = broker.portfolio.rules.calc_lot_size(
+                price,
+                broker.query_cash(),
+                max_ratio=MAX_SINGLE_STOCK,
+                total_value=broker.portfolio.get_total_value(prices),
+            )
+            if shares < LOT_SIZE:
+                recorder.record("signal_skipped", {
+                    "code": code,
+                    "reason": "最低仓位补仓可买数量不足一手",
+                    "price": price,
+                    "cash": broker.query_cash(),
+                })
+                continue
+
+            order = OrderIntent(
+                code=code,
+                name=stock.get("name", code),
+                action="buy",
+                price=float(price),
+                shares=shares,
+                date=today,
+                strategy="最低仓位补仓",
+                reason="持仓比例不足30%",
+                source="watch_thread",
+            )
+            result_code = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+            if result_code is None:
+                shared.rejected_stocks[code] = time.time() + 300
 
 
 def scan_thread(
@@ -1022,6 +1347,18 @@ def _generate_report(
     else:
         report_lines.append("  今日未记录 RPS 状态")
 
+    # 小市值价值调仓状态
+    sc_state = _read_small_cap_state()
+    report_lines.extend(["", "小市值价值:"])
+    if sc_state.get("date") == today:
+        report_lines.append(
+            f"  状态={sc_state.get('status', '--')} "
+            f"目标={sc_state.get('target_count', 0)}只 "
+            f"订单={sc_state.get('orders', 0)} 成交={sc_state.get('executed', 0)}"
+        )
+    else:
+        report_lines.append("  今日未调仓")
+
     report_lines.append("=" * 50)
     report_text = "\n".join(report_lines)
     logger.info("\n%s", report_text)
@@ -1074,15 +1411,26 @@ def main() -> None:
 
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
     first_scan_at = _initial_scan_time(now, args.initial_scan_delay_minutes)
+    pre_scan_at = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=0, second=0, microsecond=0)
 
     if now >= market_close:
-        logger.info("已过收盘时间，退出")
+        # 收盘后不退出，sleep 到明天开盘再循环，避免 restart: always 空转
+        next_open = (now + timedelta(days=1)).replace(hour=9, minute=15, second=0, microsecond=0)
+        wait_seconds = (next_open - now).total_seconds()
+        logger.info("已过收盘时间，休眠到明天 %s (%.0f 秒)", next_open.strftime("%H:%M"), wait_seconds)
         loader.close()
         broker.close()
+        time.sleep(wait_seconds)
+        # 休眠结束后重新启动
+        os.execv(sys.executable, [sys.executable] + sys.argv)
         return
 
     if now < market_open:
+        # 9:15 预扫描：用昨收数据提前形成候选池，开盘后立即验证
+        if now >= pre_scan_at:
+            logger.info("===== 开盘前预扫描 =====")
+            _do_scan(shared, scanner, recorder, top_n=args.top_n)
         _wait_until(market_open, "等待开盘启动盯盘")
 
     today = today_yyyymmdd()
@@ -1095,6 +1443,16 @@ def main() -> None:
         force=args.force_rps,
     )
 
+    # 小市值价值周度调仓
+    _run_weekly_small_cap(
+        broker=broker,
+        loader=loader,
+        risk_ctrl=risk_ctrl,
+        recorder=recorder,
+        shared=shared,
+        today=today,
+    )
+
     logger.info("===== 开盘：启动盯盘线 =====")
     t_watch = threading.Thread(
         target=watch_thread,
@@ -1104,9 +1462,8 @@ def main() -> None:
     )
     t_watch.start()
 
-    if now_local() < first_scan_at:
-        _wait_until(first_scan_at, "等待开盘后确认扫描")
-
+    # 开盘后立即用实时价重新扫描验证候选池（覆盖预扫描的昨收数据）
+    logger.info("===== 开盘后实时确认扫描 =====")
     _do_scan(shared, scanner, recorder, top_n=args.top_n)
 
     logger.info("===== 启动扫描线 =====")

@@ -373,6 +373,14 @@ def run_healthcheck(
     trade_log = _load_jsonl(data_dir / "trade_log.json", result, required=False)
     events = _load_jsonl(data_dir / "trade_events.jsonl", result, required=strict_events)
     snapshots = _load_jsonl(data_dir / "portfolio_snapshots.jsonl", result, required=strict_snapshot)
+    # 回退: 从 trade_events.jsonl 读取盘中快照
+    if not snapshots:
+        events_for_snapshot = _load_jsonl(data_dir / "trade_events.jsonl", result, required=False)
+        snapshots = [
+            {"timestamp": e.get("timestamp", ""), "summary": e.get("payload", {})}
+            for e in events_for_snapshot
+            if e.get("event_type") == "portfolio_snapshot"
+        ]
 
     if state:
         _check_state(state, result)

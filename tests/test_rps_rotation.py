@@ -39,6 +39,7 @@ def test_rps_filters_low_volume() -> None:
 
 
 def test_generate_orders_daily_rotates_selected_pool() -> None:
+    """RPS 只生成买入信号，卖出由趋势退出统一管理。"""
     pool = {"A": {"name": "强势A"}, "B": {"name": "弱势B"}}
     strategy = RPSRotationStrategy(target_pool=pool, lookback=20, top_n=1, min_rps=50)
     history = {
@@ -47,8 +48,11 @@ def test_generate_orders_daily_rotates_selected_pool() -> None:
     }
     portfolio = {"B": {"name": "弱势B", "shares": 100, "current_price": 9.0}}
     orders = strategy.generate_orders(history, portfolio, "20260228")
-    assert any(o["action"] == "sell" and o["code"] == "B" for o in orders)
-    assert any(o["action"] == "buy" and o["code"] == "A" for o in orders)
+    # RPS 不再生成卖单，只生成买入信号
+    assert all(o["action"] == "buy" for o in orders)
+    assert any(o["code"] == "A" for o in orders)
+    # B 虽然不在 top N 但不会被 RPS 卖出
+    assert not any(o["code"] == "B" for o in orders)
 
 
 def test_industry_index_rps_signals_do_not_generate_orders() -> None:
