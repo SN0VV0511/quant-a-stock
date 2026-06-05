@@ -22,4 +22,8 @@ data/trade_log.json
 data/live_heartbeat.json
 data/portfolio_state*.json*
 data/trade_log*.json*
+data/rps_state.json
+data/small_cap_state.json
+data/daily_backtest_state.json
 reports/daily_*.txt
+.env

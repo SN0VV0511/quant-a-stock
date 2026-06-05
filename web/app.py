@@ -184,8 +184,9 @@ import hashlib
 import secrets
 import base64
 
-# 密码 SHA256 哈希（默认: sn0vv2026!）
-_DASHBOARD_PASSWORD_HASH = (
+# 密码 SHA256 哈希，从环境变量读取，默认仅用于本地开发
+_DASHBOARD_PASSWORD_HASH = os.environ.get(
+    "DASHBOARD_PASSWORD_HASH",
     "15924eeb0a783f97e2538608a4c173051cefbd955cb48b7f44d918940f707490"
 )
 # 会话 token → 过期时间
