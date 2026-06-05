@@ -8,7 +8,7 @@
       "buy_date": "20260603",
       "strategy": "全市场扫描+组合策略",
       "peak_price": 85.13,
-      "current_price": 85.13
+      "current_price": 83.41
     },
     "688143": {
       "name": "长盈通",
@@ -17,7 +17,7 @@
       "buy_date": "20260605",
       "strategy": "全市场扫描+组合策略",
       "peak_price": 186.96,
-      "current_price": 178.89
+      "current_price": 176.8
     },
     "688300": {
       "name": "联瑞新材",
@@ -25,10 +25,11 @@
       "avg_cost": 162.2621,
       "buy_date": "20260605",
       "strategy": "全市场扫描+组合策略",
-      "peak_price": 162.2621
+      "peak_price": 162.2621,
+      "current_price": 157.21
     }
   },
-  "updated_at": "20260605 13:00:12",
+  "updated_at": "20260605 15:00:43",
   "trades": [
     {
       "date": "20260603",
@@ -172,8 +173,14 @@
       "positions_value": 38404.0,
       "total_value": 52208.31,
       "position_count": 3
+    },
+    "20260605": {
+      "cash": 11412.85,
+      "positions_value": 41742.0,
+      "total_value": 53154.85,
+      "position_count": 3
     }
   },
   "created_at": "20260603 09:00:17",
-  "peak_value": 52208.31
+  "peak_value": 53154.85
 }
