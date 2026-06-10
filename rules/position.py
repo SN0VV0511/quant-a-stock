@@ -48,7 +48,17 @@ class PositionManager:
             "peak_value": INITIAL_CAPITAL,
         }
 
-    def buy(self, code, name, price, shares, date, strategy="manual"):
+    def buy(
+        self,
+        code,
+        name,
+        price,
+        shares,
+        date,
+        strategy="manual",
+        strategy_tag="combo_trend",
+        trigger_reason="",
+    ):
         """执行买入，更新状态
 
         Args:
@@ -99,6 +109,15 @@ class PositionManager:
                 (pos["avg_cost"] * pos["shares"] + actual_price * shares) / total_shares, 4
             )
             pos["shares"] = total_shares
+            pos["total_qty"] = total_shares
+            pos.setdefault("buy_lots", []).append({"date": date, "qty": shares})
+            if pos.get("strategy_tag") != strategy_tag:
+                logger.warning(
+                    "持仓 %s 已属于 %s，新买入标签 %s 不覆盖原标签",
+                    code,
+                    pos.get("strategy_tag"),
+                    strategy_tag,
+                )
             # 保留最早的买入日期（用于 T+1）
             pos["buy_date"] = min(pos["buy_date"], date)
         else:
@@ -108,8 +127,17 @@ class PositionManager:
                 "avg_cost": round(actual_price, 4),
                 "buy_date": date,
                 "strategy": strategy,
+                "strategy_tag": strategy_tag,
                 "peak_price": round(actual_price, 4),
+                "highest_price": round(actual_price, 4),
+                "intraday_high_price": round(actual_price, 4),
+                "intraday_high_date": date,
+                "total_qty": shares,
+                "sellable_qty": 0 if ENFORCE_T1 else shares,
+                "buy_lots": [{"date": date, "qty": shares}],
             }
+
+        self._refresh_sellable_qty(self.state["positions"][code], date)
 
         # 扣除现金
         self.state["cash"] = round(self.state["cash"] - total_cost, 2)
@@ -127,6 +155,9 @@ class PositionManager:
             "cost": cost_detail["total"],
             "actual_price": round(actual_price, 4),
             "strategy": strategy,
+            "strategy_tag": strategy_tag,
+            "trigger_reason": trigger_reason,
+            "min_lot_check_passed": True,
         }
         self.state["trades"].append(trade)
 
@@ -141,7 +172,16 @@ class PositionManager:
             "shares": shares,
         }
 
-    def sell(self, code, price, shares, date, strategy="manual"):
+    def sell(
+        self,
+        code,
+        price,
+        shares,
+        date,
+        strategy="manual",
+        sell_reason="",
+        indicators=None,
+    ):
         """执行卖出，更新状态
 
         Args:
@@ -160,12 +200,15 @@ class PositionManager:
         pos = self.state["positions"][code]
 
         # T+1 检查(可通过 config.ENFORCE_T1 关闭以便虚拟盘当日联调)
-        if ENFORCE_T1 and not self.rules.check_t1(pos["buy_date"], date):
-            return {"success": False, "reason": "T+1 限制，不可卖出", "shares": 0}
+        self._refresh_sellable_qty(pos, date)
+        sellable_qty = int(pos.get("sellable_qty", 0) or 0)
+        if ENFORCE_T1 and sellable_qty <= 0:
+            logger.warning("T+1 locked, signal recorded but cannot sell: %s", code)
+            return {"success": False, "reason": "T+1 locked, signal recorded but cannot sell", "shares": 0}
 
         # 检查可卖数量
-        if shares > pos["shares"]:
-            shares = pos["shares"]
+        if shares > sellable_qty:
+            shares = sellable_qty
         if shares <= 0:
             return {"success": False, "reason": "可卖数量为零", "shares": 0}
 
@@ -180,7 +223,10 @@ class PositionManager:
         profit = (actual_price - pos["avg_cost"]) * shares
 
         # 更新持仓
+        self._consume_sellable_lots(pos, shares, date)
         pos["shares"] -= shares
+        pos["total_qty"] = pos["shares"]
+        self._refresh_sellable_qty(pos, date)
         if pos["shares"] <= 0:
             del self.state["positions"][code]
 
@@ -201,6 +247,10 @@ class PositionManager:
             "actual_price": round(actual_price, 4),
             "profit": round(profit, 2),
             "strategy": strategy,
+            "strategy_tag": pos.get("strategy_tag", "combo_trend"),
+            "sell_reason": sell_reason or strategy,
+            "indicators": indicators or {},
+            "buy_date": pos.get("buy_date"),
         }
         self.state["trades"].append(trade)
 
@@ -240,7 +290,7 @@ class PositionManager:
         """获取可用现金"""
         return self.state["cash"]
 
-    def update_prices(self, current_prices):
+    def update_prices(self, current_prices, date=None):
         """更新持仓当前价格,并维护持仓期间最高价(供移动止损)。
 
         Args:
@@ -248,6 +298,7 @@ class PositionManager:
         """
         if not current_prices:
             return
+        price_date = str(date or today_yyyymmdd())
         for code, pos in self.state["positions"].items():
             if code in current_prices:
                 price = current_prices[code]
@@ -255,7 +306,16 @@ class PositionManager:
                 # 维护峰值价:取历史峰值、成本、当前价三者最大,兼容旧状态文件
                 prev_peak = pos.get("peak_price", pos.get("avg_cost", price))
                 if price and price > 0:
-                    pos["peak_price"] = max(prev_peak, price)
+                    highest = max(prev_peak, price)
+                    pos["peak_price"] = highest
+                    pos["highest_price"] = highest
+                    if pos.get("intraday_high_date") != price_date:
+                        pos["intraday_high_date"] = price_date
+                        pos["intraday_high_price"] = price
+                    else:
+                        pos["intraday_high_price"] = max(
+                            float(pos.get("intraday_high_price", price) or price), price
+                        )
         self.state["updated_at"] = format_local("%Y%m%d %H:%M:%S")
 
     def get_total_value(self, current_prices=None):
@@ -289,9 +349,18 @@ class PositionManager:
         if code not in self.state["positions"]:
             return False, "无持仓"
         pos = self.state["positions"][code]
-        if not self.rules.check_t1(pos["buy_date"], date):
-            return False, f"T+1 限制（买入日: {pos['buy_date']}）"
+        self._refresh_sellable_qty(pos, date)
+        if int(pos.get("sellable_qty", 0) or 0) <= 0:
+            return False, f"T+1 locked（买入日: {pos['buy_date']}）"
         return True, "可卖出"
+
+    def get_sellable_qty(self, code, date=None):
+        """返回指定日期可卖数量，并同步持仓兼容字段。"""
+        pos = self.state["positions"].get(code)
+        if not pos:
+            return 0
+        self._refresh_sellable_qty(pos, str(date or today_yyyymmdd()))
+        return int(pos.get("sellable_qty", 0) or 0)
 
     def check_position_limit(self, code, amount, total_value=None, max_ratio_override=None):
         """检查持仓比例限制
@@ -488,6 +557,9 @@ class PositionManager:
                 "code": code,
                 "name": pos.get("name", code),
                 "shares": pos["shares"],
+                "total_qty": pos.get("total_qty", pos["shares"]),
+                "sellable_qty": self.get_sellable_qty(code),
+                "strategy_tag": pos.get("strategy_tag", "combo_trend"),
                 "avg_cost": pos["avg_cost"],
                 "current_price": cur_price,
                 "market_value": round(market_val, 2),
@@ -512,9 +584,53 @@ class PositionManager:
         for code, pos in state.get("positions", {}).items():
             pos.setdefault("name", code)
             pos.setdefault("strategy", "legacy")
+            if not pos.get("strategy_tag"):
+                pos["strategy_tag"] = "combo_trend"
+                logger.warning(
+                    "历史持仓 %s 缺少 strategy_tag，默认迁移为 combo_trend",
+                    code,
+                )
             pos.setdefault("buy_date", today_yyyymmdd())
             pos.setdefault("current_price", pos.get("avg_cost", 0))
             pos.setdefault("peak_price", pos.get("avg_cost", 0))
+            pos.setdefault("highest_price", pos.get("peak_price", pos.get("avg_cost", 0)))
+            pos.setdefault("intraday_high_price", pos.get("current_price", pos.get("avg_cost", 0)))
+            pos.setdefault("intraday_high_date", today_yyyymmdd())
+            pos.setdefault("total_qty", int(pos.get("shares", 0) or 0))
+            pos["shares"] = int(pos.get("total_qty", pos.get("shares", 0)) or 0)
+            pos.setdefault("buy_lots", [{"date": pos["buy_date"], "qty": pos["shares"]}])
+            self._refresh_sellable_qty(pos, today_yyyymmdd())
+
+    @staticmethod
+    def _refresh_sellable_qty(pos, date):
+        """按买入批次刷新 T+1 可卖数量。"""
+        total_qty = int(pos.get("shares", pos.get("total_qty", 0)) or 0)
+        pos["shares"] = total_qty
+        pos["total_qty"] = total_qty
+        if not ENFORCE_T1:
+            pos["sellable_qty"] = total_qty
+            return
+        lots = pos.get("buy_lots") or [{"date": pos.get("buy_date", date), "qty": total_qty}]
+        pos["buy_lots"] = lots
+        pos["sellable_qty"] = min(
+            total_qty,
+            sum(int(lot.get("qty", 0) or 0) for lot in lots if str(lot.get("date", date)) < str(date)),
+        )
+
+    @staticmethod
+    def _consume_sellable_lots(pos, shares, date):
+        """按 FIFO 扣减已解锁批次，保留当日不可卖批次。"""
+        remaining = int(shares)
+        lots = []
+        for lot in pos.get("buy_lots", []):
+            qty = int(lot.get("qty", 0) or 0)
+            if remaining > 0 and str(lot.get("date", date)) < str(date):
+                consumed = min(qty, remaining)
+                qty -= consumed
+                remaining -= consumed
+            if qty > 0:
+                lots.append({"date": str(lot.get("date", date)), "qty": qty})
+        pos["buy_lots"] = lots
 
     def _append_trade_log(self, trade):
         """同步追加 Web 仪表盘读取的交易流水。"""

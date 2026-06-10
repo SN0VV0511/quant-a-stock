@@ -14,7 +14,7 @@ describe("api client", () => {
 
     await expect(api.login("secret")).resolves.toEqual({ success: true });
     expect(fetch).toHaveBeenCalledWith(
-      "/api/login",
+      "/quantify/api/login",
       expect.objectContaining({
         credentials: "same-origin",
         method: "POST",

@@ -30,6 +30,7 @@ from config.settings import (  # noqa: E402
     DEFAULT_INDUSTRY_INDEX_POOL,
     DEFAULT_RPS_ETF_POOL,
     ENABLE_RPS_ROTATION,
+    ETF_REBALANCE_WEEKDAY,
     INITIAL_CAPITAL,
     ATR_PERIOD,
     LIVE_INITIAL_SCAN_DELAY_MINUTES,
@@ -67,7 +68,7 @@ from data.ak_loader import AKDataLoader  # noqa: E402
 from data.holidays import is_trading_day as is_calendar_trading_day  # noqa: E402
 from risk.control import RiskController  # noqa: E402
 from strategies.combo_signal import ComboSignalStrategy  # noqa: E402
-from strategies.exit_rules import evaluate_exit  # noqa: E402
+from strategies.exit_rules import ExitDecision, evaluate_position_exit  # noqa: E402
 from strategies.indicators import calculate_atr  # noqa: E402
 from strategies.market_regime import is_risk_on  # noqa: E402
 from strategies.market_scanner import MarketScanner  # noqa: E402
@@ -229,6 +230,7 @@ def _run_weekly_small_cap(
             shares=order.get("shares"),
             price=order.get("price"),
             strategy=order["strategy"],
+            strategy_tag="smallcap_value",
             reason=order["reason"],
         )
         decision = risk_ctrl.evaluate(intent, portfolio)
@@ -283,6 +285,7 @@ class SharedState:
         self.last_scan_time: datetime | None = None
         self.scanning = False
         self.risk_on = True  # 大盘择时状态,由扫描线程刷新
+        self.below_vwap_since: dict[str, float] = {}
 
     def update(self, stocks: list[dict[str, Any]]) -> None:
         """更新候选股池。"""
@@ -370,6 +373,15 @@ class SharedState:
         with self._lock:
             return time.time() < self.rebuy_cooldown.get(code, 0)
 
+    def update_below_vwap(self, code: str, is_below: bool) -> int:
+        """更新跌破 VWAP 持续时间并返回整分钟数。"""
+        with self._lock:
+            if not is_below:
+                self.below_vwap_since.pop(code, None)
+                return 0
+            started_at = self.below_vwap_since.setdefault(code, time.time())
+            return max(0, int((time.time() - started_at) / 60))
+
 
 def normalize_code(code: str) -> str:
     """统一为不带市场前缀的沪深 A 股 6 位代码。"""
@@ -443,17 +455,41 @@ def _build_market_data(mapped_quotes: dict[str, dict[str, Any]]) -> dict[str, di
     market_data: dict[str, dict[str, Any]] = {}
     for code, quote in mapped_quotes.items():
         name = str(quote.get("name", ""))
+        volume = float(quote.get("volume", 0) or 0)
+        amount = float(quote.get("amount", 0) or 0)
+        vwap = amount / volume if amount > 0 and volume > 0 else None
         market_data[code] = {
             "current_price": float(quote.get("price", 0) or 0),
             "prev_close": float(quote.get("prev_close", 0) or 0),
             "open": float(quote.get("open", 0) or 0),
             "high": float(quote.get("high", 0) or 0),
             "low": float(quote.get("low", 0) or 0),
-            "volume": float(quote.get("volume", 0) or 0),
+            "volume": volume,
+            "amount": amount,
+            "vwap": vwap,
             "is_st": "ST" in name.upper() or "退" in name,
             "is_suspended": float(quote.get("price", 0) or 0) <= 0,
         }
     return market_data
+
+
+def _previous_day_limit_up(hist: pd.DataFrame | None) -> bool:
+    """判断最近一个完整交易日是否接近涨停收盘。"""
+    if hist is None or len(hist) < 2 or "close" not in hist.columns:
+        return False
+    close = pd.to_numeric(hist["close"], errors="coerce").dropna()
+    if len(close) < 2 or float(close.iloc[-2]) <= 0:
+        return False
+    return float(close.iloc[-1]) / float(close.iloc[-2]) - 1 >= 0.095
+
+
+def _combo_entry_strategy_tag(result: dict[str, Any], hist: pd.DataFrame | None) -> str:
+    """根据入场形态标记 Combo、动量突破或涨停延续。"""
+    if _previous_day_limit_up(hist):
+        return "limitup_follow"
+    if "动量追涨" in str(result.get("reason", "")):
+        return "momentum_breakout"
+    return "combo_trend"
 
 
 def _build_realtime_hist(
@@ -517,12 +553,16 @@ def _submit_order(
         if not ok:
             recorder.record("execution_quality_warning", {"order": order.to_dict(), "reason": reason})
         logger.info(
-            "[成交] %s %s %s股 @ %.4f 策略=%s",
+            "[成交] %s %s(%s) %s股 @ %.4f strategy_tag=%s 策略=%s 原因=%s 指标=%s",
             order.action,
             order.code,
+            order.name or order.code,
             report.shares,
             report.actual_price,
+            order.strategy_tag,
             order.strategy,
+            order.reason,
+            order.metadata,
         )
     else:
         logger.warning("[拒单] %s %s %s", order.action, order.code, report.message)
@@ -769,7 +809,12 @@ def _run_daily_rps_rotation(
             min_avg_volume=0,
             name_map={name: name for name in industry_history},
         )
-        orders_raw = strategy.generate_orders(etf_history, broker.query_positions(), today)
+        is_rebalance_day = force or datetime.strptime(today, "%Y%m%d").weekday() == ETF_REBALANCE_WEEKDAY
+        orders_raw = (
+            strategy.generate_orders(etf_history, broker.query_positions(), today)
+            if is_rebalance_day
+            else []
+        )
 
         fallback_prices, fallback_market_data = _latest_history_market_data(etf_history)
         quote_prices, _, quote_market_data = _get_current_quotes(loader, list(set(etf_codes + [o["code"] for o in orders_raw])))
@@ -817,6 +862,7 @@ def _run_daily_rps_rotation(
                 shares=shares,
                 date=today,
                 strategy=str(raw_order.get("strategy", "ETF/行业RPS轮动")),
+                strategy_tag=str(raw_order.get("strategy_tag", "rps_rotation")),
                 reason=str(raw_order.get("reason", "")),
                 source="daily_rps_rotation",
                 metadata={
@@ -827,7 +873,7 @@ def _run_daily_rps_rotation(
             )
             # 二次持仓去重: 防止 generate_orders 和执行之间状态变化
             current_positions = broker.query_positions()
-            if code in current_positions:
+            if order.action == "buy" and code in current_positions:
                 logger.info("RPS 跳过已持仓 ETF: %s", code)
                 continue
             report, _ = _submit_order(order, broker, risk_ctrl, market_data, recorder)
@@ -951,29 +997,32 @@ def _handle_position_exits(
     shared: SharedState | None = None,
     combo: ComboSignalStrategy | None = None,
 ) -> None:
-    """处理持仓止损/止盈(策略卖出 / 硬止损 / 移动止损 / 时间止损 / 止盈)。
-
-    ETF 持仓也走趋势退出(移动止损/MA20跌破/止盈),不再由 RPS 排名踢出。
-    """
+    """按 ``strategy_tag`` 处理持仓退出并记录结构化卖出原因。"""
     import config.settings as _cfg
 
     today = today_yyyymmdd()
     for code, pos in positions.items():
-
         if shared is not None and shared.is_exit_cooling_down(code):
             continue
 
         current = prices.get(code) or pos.get("current_price") or pos.get("avg_cost", 0)
         avg_cost = float(pos.get("avg_cost", 0) or 0)
-        shares = int(pos.get("shares", 0) or 0)
+        shares = int(pos.get("total_qty", pos.get("shares", 0)) or 0)
         if current <= 0 or avg_cost <= 0 or shares <= 0:
             continue
 
-        # 汇总退出判定所需输入:Combo 信号、MA20、峰值价、持有天数
+        # 卖出判断的第一步固定检查 T+1，后续即使记录到风险信号也不提交卖单。
+        sellable_qty = broker.portfolio.get_sellable_qty(code, today)
+        t1_locked = sellable_qty <= 0
+        strategy_tag = str(pos.get("strategy_tag", "combo_trend"))
+
         combo_sell = False
         combo_reason = ""
         ma20 = None
+        ma60 = None
         atr = None
+        rsi = None
+        hist = None
         try:
             if is_etf(code):
                 hist = loader.get_etf_history(code, days=60)
@@ -986,98 +1035,102 @@ def _handle_position_exits(
                     sig = combo.check_realtime(rt_hist)
                     combo_sell = sig.get("signal") == "sell"
                     combo_reason = sig.get("reason", "策略信号")
+                    rsi = float(sig["rsi"]) if sig.get("rsi") is not None else None
             if rt_hist is not None and len(rt_hist) >= 20:
                 ma20 = float(pd.to_numeric(rt_hist["close"], errors="coerce").tail(20).mean())
+            if rt_hist is not None and len(rt_hist) >= 60:
+                ma60 = float(pd.to_numeric(rt_hist["close"], errors="coerce").tail(60).mean())
             if rt_hist is not None and {"high", "low", "close"} <= set(rt_hist.columns):
                 atr_value = calculate_atr(rt_hist, period=ATR_PERIOD).iloc[-1]
                 atr = float(atr_value) if pd.notna(atr_value) else None
         except Exception as exc:
             logger.warning("持仓退出指标检查失败: %s %s", code, exc, exc_info=True)
 
-        peak_price = float(pos.get("peak_price", avg_cost) or avg_cost)
+        peak_price = float(pos.get("highest_price", pos.get("peak_price", avg_cost)) or avg_cost)
+        quote_high = float(market_data.get(code, {}).get("high", 0) or 0)
+        intraday_high = max(
+            float(pos.get("intraday_high_price", current) or current),
+            quote_high,
+            float(current),
+        )
         holding_days = _holding_days(pos.get("buy_date"), today)
+        md = market_data.get(code, {})
+        vwap = float(md.get("vwap")) if md.get("vwap") else None
+        below_vwap_minutes = 0
+        if shared is not None and vwap is not None:
+            below_vwap_minutes = shared.update_below_vwap(code, float(current) < vwap)
 
-        # T+1: 今日买入的持仓跳过退出评估,不可卖出
-        if holding_days <= 0:
-            continue
-
-        # 开盘保护: 开盘后 N 分钟内不执行止损,避免跳空误触发(止盈不受影响)
-        now_ts = now_local()
-        market_open_today = now_ts.replace(hour=9, minute=30, second=0, microsecond=0)
-        minutes_since_open = (now_ts - market_open_today).total_seconds() / 60
-        opening_protect = 0 < minutes_since_open <= _cfg.OPENING_STOP_PROTECT_MINUTES
-
-        decision = evaluate_exit(
+        decision = evaluate_position_exit(
             avg_cost=avg_cost,
             price=float(current),
-            peak_price=peak_price,
+            strategy_tag=strategy_tag,
+            sellable_qty=shares if t1_locked else sellable_qty,
+            highest_price=peak_price,
+            intraday_high_price=intraday_high,
             ma20=ma20,
+            ma60=ma60,
             atr=atr,
+            rsi=rsi,
             holding_days=holding_days,
             combo_sell=combo_sell,
             combo_reason=combo_reason,
+            previous_close=float(md.get("prev_close", 0) or 0) or None,
+            vwap=vwap,
+            below_vwap_minutes=below_vwap_minutes,
         )
 
-        # 开盘保护期内,只允许止盈,不允许止损
-        if decision is not None and opening_protect:
-            strategy_name = decision[0]
-            if "止损" in strategy_name and "止盈" not in strategy_name:
-                logger.info(
-                    "[开盘保护] %s(%s) 触发%s但开盘%.0f分钟内跳过",
-                    pos.get("name", code), code, strategy_name, minutes_since_open,
+        # 普通股票保留开盘急速止盈；涨停延续和 ETF 明确排除。
+        now_ts = now_local()
+        market_open_today = now_ts.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_since_open = (now_ts - market_open_today).total_seconds() / 60
+        profit_pct = float(current) / avg_cost - 1
+        if (
+            not decision.should_sell
+            and strategy_tag in {"combo_trend", "momentum_breakout"}
+            and not is_etf(code)
+            and 0 < minutes_since_open <= _cfg.OPEN_FAST_TAKE_PROFIT_MINUTES
+            and profit_pct >= _cfg.OPEN_FAST_TAKE_PROFIT_PCT
+        ):
+            decision = ExitDecision(
+                "sell",
+                "OPEN_FAST_TAKE_PROFIT",
+                f"开盘 {minutes_since_open:.0f} 分钟盈利 {profit_pct:.2%}",
+                {**decision.indicators, "minutes_since_open": minutes_since_open},
+            )
+
+        if t1_locked:
+            if decision.should_sell:
+                payload = {
+                    "code": code,
+                    "strategy_tag": strategy_tag,
+                    "sell_reason": decision.sell_reason,
+                    "detail": decision.detail,
+                    "message": "T+1 locked, signal recorded but cannot sell",
+                }
+                recorder.record("t1_locked_exit_signal", payload)
+                logger.warning(
+                    "T+1 locked, signal recorded but cannot sell: %s(%s) strategy_tag=%s sell_reason=%s",
+                    pos.get("name", code), code, strategy_tag, decision.sell_reason,
                 )
-                decision = None
-
-        # 开盘急速止盈: 开盘后 N 分钟内，持仓盈利超阈值则立即卖出
-        # 例外：如果前一日涨停（今日高开是正常延续），不触发急速止盈
-        if decision is None and avg_cost > 0:
-            profit_pct = (float(current) / avg_cost - 1) * 100
-            now_ts = now_local()
-            market_open_today = now_ts.replace(hour=9, minute=30, second=0, microsecond=0)
-            minutes_since_open = (now_ts - market_open_today).total_seconds() / 60
-            if (0 < minutes_since_open <= _cfg.OPENING_TAKEPROFIT_MINUTES
-                    and profit_pct >= _cfg.OPENING_TAKEPROFIT_PCT):
-                # 检查前一日是否涨停（9.5% 以上涨幅）
-                prev_limit_up = False
-                try:
-                    if is_etf(code):
-                        prev_hist = loader.get_etf_history(code, days=3)
-                    else:
-                        prev_hist = loader.get_stock_data(normalize_code(code), days=3)
-                    if prev_hist is not None and len(prev_hist) >= 2:
-                        prev_close = float(prev_hist.iloc[-2]["close"])
-                        prev_open = float(prev_hist.iloc[-2]["open"])
-                        if prev_open > 0 and (prev_close / prev_open - 1) >= 0.095:
-                            prev_limit_up = True
-                except Exception:
-                    pass
-                if not prev_limit_up:
-                    decision = ("开盘急速止盈",
-                                f"开盘{minutes_since_open:.0f}分钟 盈利{profit_pct:.1f}%≥{_cfg.OPENING_TAKEPROFIT_PCT}%")
-                    logger.info(
-                        "[开盘止盈] %s(%s) 盈利%.1f%% 开盘%.0f分钟",
-                        pos.get("name", code), code, profit_pct, minutes_since_open,
-                    )
-                else:
-                    logger.info(
-                        "[开盘止盈跳过] %s(%s) 前日涨停，今日高开%.1f%%，不触发急速止盈",
-                        pos.get("name", code), code, profit_pct,
-                    )
-
-        if decision is None:
+                if shared is not None:
+                    shared.set_exit_cooldown(code, seconds=300)
             continue
 
-        strategy, reason = decision
+        if not decision.should_sell:
+            continue
+
         order = OrderIntent(
             code=code,
             name=str(pos.get("name", code)),
             action="sell",
             price=float(current),
-            shares=shares,
+            shares=sellable_qty,
             date=today,
-            strategy=strategy,
-            reason=reason,
+            strategy="分层退出策略",
+            strategy_tag=strategy_tag,
+            reason=decision.sell_reason,
             source="watch_thread",
+            metadata={"detail": decision.detail, **decision.indicators},
         )
         report = _submit_exit_order(order, broker, risk_ctrl, market_data, recorder, shared)
         # 卖出成交后进入再买冷却,杜绝"卖出→立刻买回"的日内刷单
@@ -1186,12 +1239,15 @@ def _handle_candidate_entries(
             shares=shares,
             date=today,
             strategy="全市场扫描+组合策略",
+            strategy_tag=_combo_entry_strategy_tag(result, hist),
             reason=str(result["reason"]),
             source="watch_thread",
             metadata={
                 "rsi": result.get("rsi"),
                 "volume_ratio": result.get("volume_ratio"),
                 "cash_buffer": CASH_BUFFER,
+                "position_ratio": (shares * price / total_value) if total_value > 0 else 0.0,
+                "min_lot_check_passed": True,
             },
         )
         result_code, _ = _submit_order(order, broker, risk_ctrl, market_data, recorder)
@@ -1244,6 +1300,7 @@ def _handle_candidate_entries(
                 shares=shares,
                 date=today,
                 strategy="最低仓位补仓",
+                strategy_tag="combo_trend",
                 reason="持仓比例不足30%",
                 source="watch_thread",
             )

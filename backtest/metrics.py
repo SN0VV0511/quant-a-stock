@@ -77,6 +77,43 @@ def compute_performance_metrics(
     buy_count = len([t for t in trades if t.get("action") == "buy"])
     sell_count = len([t for t in trades if t.get("action") == "sell"])
     total_cost = sum(t.get("cost", 0) for t in trades)
+    sell_trades = [t for t in trades if t.get("action") == "sell"]
+    gross_profit = sum(max(float(t.get("profit", 0) or 0), 0.0) for t in sell_trades)
+    fee_to_gross_profit = total_cost / gross_profit if gross_profit > 0 else 0.0
+    average_holding_days = (
+        float(np.mean([float(t.get("holding_days", 0) or 0) for t in sell_trades]))
+        if sell_trades
+        else 0.0
+    )
+    average_nav = float(df["total_value"].mean()) if not df.empty else 0.0
+    traded_amount = sum(float(t.get("amount", 0) or 0) for t in trades)
+    turnover_rate = traded_amount / average_nav if average_nav > 0 else 0.0
+
+    fly_away_trades = [
+        t for t in sell_trades
+        if float(t.get("price", 0) or 0) > 0
+        and float(t.get("post_sell_3d_high", 0) or 0) / float(t["price"]) - 1 > 0.05
+    ]
+    fly_away_rate = len(fly_away_trades) / len(sell_trades) if sell_trades else 0.0
+
+    stop_trades = [
+        t for t in sell_trades
+        if t.get("sell_reason") in {"CATASTROPHIC_STOP_LOSS", "ATR_STOP_LOSS"}
+    ]
+    effective_stops = [
+        t for t in stop_trades
+        if float(t.get("post_sell_3d_close", t.get("price", 0)) or 0)
+        < float(t.get("price", 0) or 0)
+    ]
+    stop_effectiveness = len(effective_stops) / len(stop_trades) if stop_trades else 0.0
+
+    reason_contribution: dict[str, float] = {}
+    for trade in sell_trades:
+        reason = str(trade.get("sell_reason") or "UNKNOWN")
+        reason_contribution[reason] = round(
+            reason_contribution.get(reason, 0.0) + float(trade.get("profit", 0) or 0),
+            2,
+        )
 
     return {
         "initial_capital": round(initial_capital, 2),
@@ -92,6 +129,16 @@ def compute_performance_metrics(
         "buy_count": buy_count,
         "sell_count": sell_count,
         "total_cost": round(total_cost, 2),
+        "gross_profit": round(gross_profit, 2),
+        "fee_to_gross_profit": round(fee_to_gross_profit, 4),
+        "average_holding_days": round(average_holding_days, 2),
+        "turnover_rate": round(turnover_rate, 4),
+        "fly_away_count": len(fly_away_trades),
+        "fly_away_rate": round(fly_away_rate, 4),
+        "stop_count": len(stop_trades),
+        "stop_effective_count": len(effective_stops),
+        "stop_effectiveness": round(stop_effectiveness, 4),
+        "sell_reason_contribution": reason_contribution,
         "trading_days": trading_days,
         "risk_events": len(risk_events),
     }
@@ -118,6 +165,11 @@ def format_summary(metrics: dict[str, Any]) -> str:
         f"  买入:       {metrics['buy_count']:>12d}",
         f"  卖出:       {metrics['sell_count']:>12d}",
         f"总交易成本:   {metrics['total_cost']:>12,.2f} 元",
+        f"手续费/毛利润: {metrics.get('fee_to_gross_profit', 0):>12.2%}",
+        f"平均持仓天数: {metrics.get('average_holding_days', 0):>12.2f} 天",
+        f"换手率:       {metrics.get('turnover_rate', 0):>12.2%}",
+        f"卖飞率:       {metrics.get('fly_away_rate', 0):>12.2%}",
+        f"止损有效率:   {metrics.get('stop_effectiveness', 0):>12.2%}",
         f"交易日数:     {metrics['trading_days']:>12d}",
         f"风控触发:     {metrics['risk_events']:>12d} 次",
         "=" * 46,

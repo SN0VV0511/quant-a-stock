@@ -226,6 +226,7 @@ def rebalance(broker: PaperBrokerAdapter, loader: AKDataLoader, risk: RiskContro
             code=code, name=str(pos.get("name", code)), action="sell",
             price=price, shares=int(pos.get("shares", 0)), date=date_str,
             strategy="小市值调仓", reason="调出目标池", source="smallcap_runner",
+            strategy_tag="smallcap_value",
         )
         _submit(intent, broker, risk, md, recorder, dry_run)
 
@@ -246,6 +247,7 @@ def rebalance(broker: PaperBrokerAdapter, loader: AKDataLoader, risk: RiskContro
             code=code, name=str(t.get("name", code)), action="buy",
             price=price, shares=shares, date=date_str,
             strategy="全市场扫描+小市值价值", reason=f"小市值价值 rank{t['rank']}",
+            strategy_tag="smallcap_value",
             source="smallcap_runner", metadata={"score": t.get("score")},
         )
         _submit(intent, broker, risk, md, recorder, dry_run)

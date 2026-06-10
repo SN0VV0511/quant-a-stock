@@ -24,6 +24,7 @@ from config.settings import (
     MAX_SINGLE_ETF,
     MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION,
+    CASH_BUFFER,
     is_etf,
     is_supported_trading_target,
 )
@@ -146,9 +147,10 @@ def _check_state(state: dict[str, Any], result: HealthcheckResult) -> None:
     total_value = float(cash or 0.0) + position_value
     if total_value > 0:
         total_position_ratio = position_value / total_value
-        if total_position_ratio > MAX_TOTAL_POSITION + RATIO_TOLERANCE:
+        effective_total_limit = min(MAX_TOTAL_POSITION, 1 - CASH_BUFFER)
+        if total_position_ratio > effective_total_limit + RATIO_TOLERANCE:
             result.fail(
-                f"总仓位超限: {total_position_ratio:.2%} > {MAX_TOTAL_POSITION:.2%}"
+                f"总仓位超限: {total_position_ratio:.2%} > {effective_total_limit:.2%}"
             )
 
         for code, value in position_values.items():
@@ -156,12 +158,7 @@ def _check_state(state: dict[str, Any], result: HealthcheckResult) -> None:
             max_ratio = MAX_SINGLE_ETF if is_etf(code) else MAX_SINGLE_STOCK
             shares = positions.get(code, {}).get("shares", 0)
             if ratio > max_ratio + RATIO_TOLERANCE:
-                if shares == LOT_SIZE:
-                    result.warn(
-                        f"单票仓位超过上限但为最低一手: {code} {ratio:.2%} > {max_ratio:.2%}"
-                    )
-                else:
-                    result.fail(f"单票仓位超限: {code} {ratio:.2%} > {max_ratio:.2%}")
+                result.fail(f"单票仓位超限: {code} {ratio:.2%} > {max_ratio:.2%}")
 
     result.metrics.update({
         "cash": round(float(cash or 0.0), 2),

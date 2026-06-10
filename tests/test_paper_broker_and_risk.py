@@ -249,3 +249,50 @@ def test_qmt_adapter_defaults_to_dry_run_and_blocks_live() -> None:
     live = QmtBrokerAdapter(live_enabled=True)
     with pytest.raises(NotImplementedError):
         live.connect()
+
+
+def test_min_lot_exceeding_single_position_limit_is_rejected(tmp_path) -> None:
+    """高价股一手金额超过单票上限时不得放宽买入。"""
+    broker = _paper_broker(tmp_path)
+    risk = RiskController()
+    order = OrderIntent(
+        code="600000",
+        action="buy",
+        price=100.0,
+        shares=100,
+        name="高价样本",
+        strategy="全市场扫描+组合策略",
+        strategy_tag="combo_trend",
+        date="20260528",
+    )
+    approved, rejected = risk.filter_order_intents(
+        [order],
+        broker.portfolio,
+        {"600000": {"current_price": 100, "prev_close": 99, "is_st": False, "is_suspended": False}},
+    )
+    assert approved == []
+    assert "MIN_LOT_EXCEEDS_POSITION_LIMIT" in rejected[0].reason
+
+
+def test_drawdown_circuit_requires_two_recovery_days() -> None:
+    """最大回撤熔断应锁存，并在连续两个恢复交易日后解锁。"""
+    class FakePortfolio:
+        def __init__(self) -> None:
+            self.drawdown = 0.07
+
+        def get_total_value(self) -> float:
+            return 50_000.0
+
+        def get_drawdown(self) -> float:
+            return self.drawdown
+
+    portfolio = FakePortfolio()
+    risk = RiskController()
+    exceeded, _ = risk.check_max_drawdown(portfolio)
+    assert exceeded is True
+
+    portfolio.drawdown = 0.03
+    risk.set_daily_start(portfolio, date="20260611")
+    assert risk.check_max_drawdown(portfolio)[0] is True
+    risk.set_daily_start(portfolio, date="20260612")
+    assert risk.check_max_drawdown(portfolio)[0] is False

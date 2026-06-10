@@ -1,82 +1,148 @@
-"""持仓退出规则 evaluate_exit 测试:验证优先级与各类止损/止盈触发。
-
-通过 monkeypatch 临时改写 exit_rules 模块内已绑定的阈值常量,验证各分支。
-"""
-
-import importlib
+"""分层退出规则测试。"""
 
 import strategies.exit_rules as er
 
 
-def test_no_exit_when_flat():
-    # 持平、无信号:不离场
-    assert er.evaluate_exit(avg_cost=10, price=10.2, peak_price=10.2) is None
+def test_t1_locked_records_hold() -> None:
+    """T+1 不可卖时必须返回锁定状态。"""
+    out = er.evaluate_position_exit(avg_cost=10, price=9, sellable_qty=0)
+    assert out.should_sell is False
+    assert out.sell_reason == "T1_LOCKED"
 
 
-def test_hard_stop_loss():
-    # 亏损超过 STOP_LOSS_PCT(默认 7%)
-    out = er.evaluate_exit(avg_cost=10, price=9.0, peak_price=10)
-    assert out is not None and out[0] == "止损"
+def test_catastrophic_and_atr_stop_priority(monkeypatch) -> None:
+    """灾难止损优先于 ATR，ATR 优先于弱势信号。"""
+    disaster = er.evaluate_position_exit(avg_cost=10, price=9, atr=0.2, combo_sell=True)
+    assert disaster.sell_reason == "CATASTROPHIC_STOP_LOSS"
 
-
-def test_atr_stop_tightens_fixed_stop(monkeypatch):
-    # ATR 可用时,小波动标的应在小于固定 7% 的亏损处动态止损
     monkeypatch.setattr(er, "ENABLE_ATR_STOP", True)
-    monkeypatch.setattr(er, "ATR_STOP_MULTIPLIER", 1.2)
-    monkeypatch.setattr(er, "ATR_STOP_MAX_PCT", 0.07)
-    out = er.evaluate_exit(avg_cost=10, price=9.70, peak_price=10, atr=0.2)
-    assert out is not None and out[0] == "ATR止损"
+    atr_stop = er.evaluate_position_exit(avg_cost=10, price=9.7, atr=0.2)
+    assert atr_stop.sell_reason == "ATR_STOP_LOSS"
 
 
-def test_combo_sell_has_top_priority():
-    # 即使盈利,Combo 卖出信号优先
-    out = er.evaluate_exit(avg_cost=10, price=12, peak_price=12, combo_sell=True,
-                           combo_reason="RSI超买")
-    assert out[0] == "策略卖出"
-    assert "RSI超买" in out[1]
+def test_combo_only_defends_loss_or_tiny_profit() -> None:
+    """Combo 只防守浮亏或微利，盈利趋势票不能被直接卖出。"""
+    weak = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.05,
+        combo_sell=True,
+        combo_reason="MA5/20死叉",
+    )
+    assert weak.sell_reason == "COMBO_DEFENSIVE_EXIT"
+
+    profitable = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.2,
+        ma20=10.1,
+        combo_sell=True,
+        combo_reason="MA5/20死叉 + RSI超买78",
+    )
+    assert profitable.should_sell is False
 
 
-def test_trailing_stop_triggers_after_activation():
-    # 峰值 12(相对成本 +20% 已越过激活线 5%),当前 11 自峰值回撤 8.3% > 8%
-    out = er.evaluate_exit(avg_cost=10, price=11.0, peak_price=12.0)
-    assert out is not None and out[0] == "移动止损"
+def test_rsi_overbought_never_directly_sells() -> None:
+    """仅 RSI 超买不能触发 Combo 防守卖出。"""
+    out = er.evaluate_position_exit(
+        avg_cost=10,
+        price=9.98,
+        combo_sell=True,
+        combo_reason="RSI超买82",
+        rsi=82,
+    )
+    assert out.should_sell is False
 
 
-def test_trailing_stop_not_active_below_activation():
-    # 峰值仅 10.2(相对成本 +2% < 激活线 5%),不启用移动止损;且未触发其他规则
-    out = er.evaluate_exit(avg_cost=10, price=10.0, peak_price=10.2)
-    assert out is None
+def test_rsi_tightens_trailing_take_profit() -> None:
+    """RSI 越高，允许回吐比例越低。"""
+    normal = er.evaluate_position_exit(avg_cost=10, price=11.3, highest_price=12, rsi=70)
+    tightened = er.evaluate_position_exit(avg_cost=10, price=11.3, highest_price=12, rsi=81)
+    assert normal.should_sell is False
+    assert tightened.sell_reason == "TRAILING_TAKE_PROFIT"
+    assert tightened.indicators["trailing_giveback"] == 0.25
 
 
-def test_take_profit_requires_below_ma20():
-    # 盈利 12% 达标但价格在 MA20 之上 → 不止盈
-    assert er.evaluate_exit(avg_cost=10, price=11.2, peak_price=11.2, ma20=11.0) is None
-    # 盈利达标且跌破 MA20 → 止盈(用未触发移动止损的峰值)
-    out = er.evaluate_exit(avg_cost=10, price=11.2, peak_price=11.3, ma20=11.5)
-    assert out is not None and out[0] == "止盈"
+def test_limitup_follow_skips_fixed_profit_and_uses_intraday_drawdown() -> None:
+    """涨停延续票只在日内高点明显回撤后移动止盈。"""
+    hold = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.8,
+        strategy_tag="limitup_follow",
+        intraday_high_price=10.9,
+        previous_close=10,
+    )
+    assert hold.should_sell is False
+
+    sell = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.45,
+        strategy_tag="limitup_follow",
+        intraday_high_price=10.9,
+        previous_close=10,
+    )
+    assert sell.sell_reason == "LIMITUP_FOLLOW_TRAILING_STOP"
 
 
-def test_atr_take_profit_requires_target_then_ma20_break(monkeypatch):
-    # 曾经达到 2.5ATR 目标,当前虽未达固定 10% 止盈,但跌破 MA20 应锁定利润
-    monkeypatch.setattr(er, "ENABLE_ATR_TAKE_PROFIT", True)
-    monkeypatch.setattr(er, "ATR_TAKE_PROFIT_MULTIPLIER", 2.5)
-    out = er.evaluate_exit(avg_cost=10, price=10.8, peak_price=11.4, ma20=11.0, atr=0.5)
-    assert out is not None and out[0] == "ATR止盈"
+def test_limitup_follow_vwap_break() -> None:
+    """涨停延续票持续跌破 VWAP 时退出。"""
+    out = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.2,
+        strategy_tag="limitup_follow",
+        vwap=10.3,
+        below_vwap_minutes=3,
+    )
+    assert out.sell_reason == "VWAP_BREAK"
 
 
-def test_time_stop_disabled_by_default():
-    # 默认 TIME_STOP_DAYS=0,长期持有微亏也不触发时间止损
-    out = er.evaluate_exit(avg_cost=10, price=9.8, peak_price=10.0, holding_days=999)
-    assert out is None  # -2% 未达硬止损,时间止损禁用
+def test_etf_ignores_stock_atr_combo_and_trailing() -> None:
+    """ETF 不使用股票 ATR、Combo、RSI 和移动止盈。"""
+    hold = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.5,
+        highest_price=12,
+        strategy_tag="etf_rotation",
+        atr=2,
+        combo_sell=True,
+        combo_reason="MA5/20死叉",
+        rsi=90,
+        ma20=10.4,
+        ma60=10.0,
+    )
+    assert hold.should_sell is False
+
+    trend_exit = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.2,
+        strategy_tag="etf_rotation",
+        ma20=10.3,
+        ma60=10.1,
+    )
+    assert trend_exit.sell_reason == "ETF_ROTATION_EXIT"
 
 
-def test_time_stop_when_enabled(monkeypatch):
+def test_smallcap_value_ignores_short_term_combo_and_trailing() -> None:
+    """价值持仓不被短线 Combo 和移动止盈洗掉。"""
+    out = er.evaluate_position_exit(
+        avg_cost=10,
+        price=10.5,
+        highest_price=12,
+        strategy_tag="smallcap_value",
+        combo_sell=True,
+        combo_reason="MA5/20死叉",
+        ma20=11,
+    )
+    assert out.should_sell is False
+
+
+def test_time_stop_when_enabled(monkeypatch) -> None:
+    """时间止损在配置启用后生效。"""
     monkeypatch.setattr(er, "TIME_STOP_DAYS", 10)
     monkeypatch.setattr(er, "TIME_STOP_MIN_PROFIT", 0.0)
-    out = er.evaluate_exit(avg_cost=10, price=9.8, peak_price=10.0, holding_days=15)
-    assert out is not None and out[0] == "时间止损"
+    out = er.evaluate_position_exit(avg_cost=10, price=9.8, holding_days=15)
+    assert out.sell_reason == "TIME_STOP"
 
 
-def test_invalid_inputs_return_none():
-    assert er.evaluate_exit(avg_cost=0, price=10) is None
-    assert er.evaluate_exit(avg_cost=10, price=0) is None
+def test_invalid_inputs_hold() -> None:
+    """非法价格不生成卖单。"""
+    assert er.evaluate_position_exit(avg_cost=0, price=10).should_sell is False
+    assert er.evaluate_position_exit(avg_cost=10, price=0).should_sell is False

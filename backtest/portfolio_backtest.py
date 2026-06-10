@@ -37,7 +37,7 @@ from backtest.metrics import compute_performance_metrics, format_summary
 from risk.control import RiskController
 from rules.position import PositionManager
 from strategies.combo_signal import ComboSignalStrategy
-from strategies.exit_rules import evaluate_exit
+from strategies.exit_rules import evaluate_position_exit
 from strategies.indicators import calculate_atr
 from strategies.market_regime import is_risk_on
 from strategies.market_scanner import score_candidates
@@ -142,7 +142,7 @@ class PortfolioBacktester:
             prev_close = self._prices_on(frames, prev_date, "close") if prev_date else {}
 
             # 当日开盘前记录日初市值(供单日亏损风控)
-            risk.set_daily_start(portfolio)
+            risk.set_daily_start(portfolio, date=date)
 
             # 1) 执行昨日生成的订单:T+1 开盘价撮合
             if pending_orders:
@@ -153,7 +153,7 @@ class PortfolioBacktester:
                 pending_orders = []
 
             # 2) 按收盘价盯市并记录净值
-            portfolio.update_prices(close_today)
+            portfolio.update_prices(close_today, date=date)
             portfolio.save_snapshot(date, close_today)  # 更新峰值,供回撤风控
             total_value = portfolio.get_total_value(close_today)
             daily_values.append({
@@ -169,6 +169,7 @@ class PortfolioBacktester:
                     frames, date, close_today, portfolio, i, index_frame,
                 )
 
+        self._enrich_post_exit_prices(all_trades, frames)
         results = compute_performance_metrics(
             daily_values, all_trades, risk_events, self.initial_capital
         )
@@ -251,13 +252,23 @@ class PortfolioBacktester:
             peak_price = float(pos.get("peak_price", avg_cost) or avg_cost)
             holding_days = _holding_days(pos.get("buy_date"), date)
             exit_reason = self._exit_reason(
-                frames, code, date, price, avg_cost, peak_price, holding_days
+                frames,
+                code,
+                date,
+                price,
+                avg_cost,
+                peak_price,
+                holding_days,
+                str(pos.get("strategy_tag", "combo_trend")),
+                portfolio.get_sellable_qty(code, date),
             )
             if exit_reason:
-                strategy, reason = exit_reason
                 orders.append({
                     "code": code, "action": "sell", "name": pos.get("name", code),
-                    "strategy": strategy, "reason": reason,
+                    "strategy": "分层退出策略",
+                    "strategy_tag": pos.get("strategy_tag", "combo_trend"),
+                    "reason": exit_reason.sell_reason,
+                    "exit_detail": exit_reason.detail,
                 })
 
         sell_codes = {o["code"] for o in orders}
@@ -275,44 +286,64 @@ class PortfolioBacktester:
                 continue
             sig = self.combo.check_realtime(sl)
             if sig.get("signal") == "buy":
+                strategy_tag = "momentum_breakout" if "动量追涨" in str(sig.get("reason", "")) else "combo_trend"
+                close = pd.to_numeric(sl["close"], errors="coerce").dropna()
+                if len(close) >= 2 and float(close.iloc[-2]) > 0 and float(close.iloc[-1]) / float(close.iloc[-2]) - 1 >= 0.095:
+                    strategy_tag = "limitup_follow"
                 orders.append({
                     "code": code, "action": "buy", "name": frames[code]["name"],
-                    "strategy": _BUY_STRATEGY, "reason": str(sig.get("reason", "")),
+                    "strategy": _BUY_STRATEGY,
+                    "strategy_tag": strategy_tag,
+                    "reason": str(sig.get("reason", "")),
                 })
         return orders
 
     def _exit_reason(
         self, frames: dict, code: str, date: str, price: float, avg_cost: float,
-        peak_price: float, holding_days: int,
-    ) -> tuple[str, str] | None:
-        """判断持仓是否触发退出,复用共享退出规则 evaluate_exit。"""
+        peak_price: float,
+        holding_days: int,
+        strategy_tag: str,
+        sellable_qty: int,
+    ):
+        """判断持仓是否触发退出，复用共享分层退出规则。"""
         sl = self._slice(frames[code], date)
         combo_sell = False
         combo_reason = ""
         ma20 = None
+        ma60 = None
         atr = None
+        rsi = None
         if sl is not None and len(sl) >= 25:
             sig = self.combo.check_realtime(sl)
             combo_sell = sig.get("signal") == "sell"
             combo_reason = str(sig.get("reason", "策略信号"))
+            rsi = float(sig["rsi"]) if sig.get("rsi") is not None else None
         if sl is not None and len(sl) >= 20:
             ma20 = float(pd.to_numeric(sl["close"], errors="coerce").tail(20).mean())
+        if sl is not None and len(sl) >= 60:
+            ma60 = float(pd.to_numeric(sl["close"], errors="coerce").tail(60).mean())
         if sl is not None and {"high", "low", "close"} <= set(sl.columns):
             from config.settings import ATR_PERIOD
 
             atr_value = calculate_atr(sl, period=ATR_PERIOD).iloc[-1]
             atr = float(atr_value) if pd.notna(atr_value) else None
 
-        return evaluate_exit(
+        decision = evaluate_position_exit(
             avg_cost=avg_cost,
             price=price,
-            peak_price=peak_price,
+            strategy_tag=strategy_tag,
+            sellable_qty=sellable_qty,
+            highest_price=peak_price,
+            intraday_high_price=float(sl["high"].iloc[-1]) if sl is not None and "high" in sl.columns else price,
             ma20=ma20,
+            ma60=ma60,
             atr=atr,
+            rsi=rsi,
             holding_days=holding_days,
             combo_sell=combo_sell,
             combo_reason=combo_reason,
         )
+        return decision if decision.should_sell else None
 
     # ==================== 订单执行 ====================
 
@@ -369,7 +400,7 @@ class PortfolioBacktester:
                 pos = portfolio.get_position(code)
                 if not pos:
                     continue
-                order["shares"] = pos["shares"]
+                order["shares"] = portfolio.get_sellable_qty(code, date)
             else:
                 total_value = portfolio.get_total_value(open_today)
                 order["shares"] = portfolio.rules.calc_lot_size(
@@ -401,21 +432,32 @@ class PortfolioBacktester:
             code, price = order["code"], order["price"]
             if order["action"] == "buy":
                 res = portfolio.buy(code, order.get("name", code), price,
-                                    order["shares"], date, order.get("strategy", "backtest"))
+                                    order["shares"], date, order.get("strategy", "backtest"),
+                                    strategy_tag=order.get("strategy_tag", "combo_trend"),
+                                    trigger_reason=order.get("reason", ""))
                 if res.get("success"):
                     all_trades.append({
                         "date": date, "code": code, "action": "buy",
                         "price": price, "shares": res["shares"],
                         "cost": res["cost_detail"]["total"],
+                        "amount": round(price * res["shares"], 2),
+                        "strategy_tag": order.get("strategy_tag", "combo_trend"),
                     })
             else:
+                position_before_sell = dict(portfolio.get_position(code) or {})
                 res = portfolio.sell(code, price, order["shares"], date,
-                                     order.get("strategy", "backtest"))
+                                     order.get("strategy", "backtest"),
+                                     sell_reason=order.get("reason", ""),
+                                     indicators={"detail": order.get("exit_detail", "")})
                 if res.get("success"):
                     all_trades.append({
                         "date": date, "code": code, "action": "sell",
                         "price": price, "shares": res["shares"],
                         "profit": res["profit"], "cost": res["cost_detail"]["total"],
+                        "amount": round(price * res["shares"], 2),
+                        "strategy_tag": position_before_sell.get("strategy_tag", "combo_trend"),
+                        "sell_reason": order.get("reason", ""),
+                        "holding_days": _holding_days(position_before_sell.get("buy_date"), date),
                     })
 
     # ==================== 数据辅助 ====================
@@ -460,6 +502,23 @@ class PortfolioBacktester:
             if pd.notna(val) and float(val) > 0:
                 out[code] = float(val)
         return out
+
+    @staticmethod
+    def _enrich_post_exit_prices(all_trades: list[dict[str, Any]], frames: dict) -> None:
+        """补充卖出后三个交易日行情，供卖飞率和止损有效率统计。"""
+        for trade in all_trades:
+            if trade.get("action") != "sell" or trade.get("code") not in frames:
+                continue
+            frame = frames[trade["code"]]
+            index = frame["pos"].get(_norm_date(trade.get("date", "")))
+            if index is None:
+                continue
+            future = frame["df"].iloc[index + 1:index + 4]
+            if future.empty:
+                continue
+            high_col = "high" if "high" in future.columns else "close"
+            trade["post_sell_3d_high"] = float(pd.to_numeric(future[high_col], errors="coerce").max())
+            trade["post_sell_3d_close"] = float(pd.to_numeric(future["close"], errors="coerce").iloc[-1])
 
     def _new_portfolio(self) -> PositionManager:
         """用临时状态文件创建持仓管理器,避免污染真实虚拟盘状态。"""

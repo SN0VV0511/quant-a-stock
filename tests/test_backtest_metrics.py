@@ -60,3 +60,39 @@ def test_trade_counts():
     assert m["sell_count"] == 1
     assert m["total_trades"] == 3
     assert m["total_cost"] == 15
+
+
+def test_review_metrics_and_reason_contribution():
+    """复盘指标应覆盖卖飞、止损有效率、持仓天数、换手和原因贡献。"""
+    trades = [
+        {"action": "buy", "amount": 10_000, "cost": 5},
+        {
+            "action": "sell",
+            "price": 10,
+            "amount": 11_000,
+            "profit": 1_000,
+            "cost": 5,
+            "holding_days": 5,
+            "sell_reason": "TRAILING_TAKE_PROFIT",
+            "post_sell_3d_high": 10.6,
+            "post_sell_3d_close": 10.4,
+        },
+        {
+            "action": "sell",
+            "price": 9,
+            "amount": 9_000,
+            "profit": -500,
+            "cost": 5,
+            "holding_days": 3,
+            "sell_reason": "ATR_STOP_LOSS",
+            "post_sell_3d_high": 9.1,
+            "post_sell_3d_close": 8.5,
+        },
+    ]
+    metrics = compute_performance_metrics(_daily([100_000, 100_500]), trades, [], 100_000)
+    assert metrics["fly_away_rate"] == 0.5
+    assert metrics["stop_effectiveness"] == 1.0
+    assert metrics["average_holding_days"] == 4.0
+    assert metrics["turnover_rate"] > 0
+    assert metrics["fee_to_gross_profit"] == 0.015
+    assert metrics["sell_reason_contribution"]["ATR_STOP_LOSS"] == -500

@@ -9,6 +9,7 @@ from datetime import datetime
 from config.settings import (
     INITIAL_CAPITAL, MAX_TOTAL_POSITION, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     CASH_BUFFER, DAILY_LOSS_THRESHOLD, MAX_DRAWDOWN_THRESHOLD, LOT_SIZE,
+    DRAWDOWN_RECOVERY_DAYS,
     is_etf, is_supported_trading_target, DEFAULT_UNIVERSE,
 )
 from trading.models import OrderIntent, RiskDecision
@@ -24,6 +25,9 @@ class RiskController:
         self._daily_start_value = None
         self._strategy_returns = {}  # strategy -> [daily_returns]
         self._audit_log = []        # 参数变更审计
+        self._drawdown_latched = False
+        self._drawdown_recovery_days = 0
+        self._last_drawdown_review_date = None
 
     # ==================== 第一层：资金管理 ====================
 
@@ -42,10 +46,8 @@ class RiskController:
 
         if order["action"] == "buy":
             order_amount = order["price"] * order["shares"]
-            # 根据策略来源判断是否为 ETF 代理
-            strategy_name = order.get("strategy", "")
-            is_etf_proxy = "ETF" in strategy_name or "动量" in strategy_name
-            is_etf_flag = is_etf(order["code"]) or is_etf_proxy
+            strategy_tag = order.get("strategy_tag", "combo_trend")
+            is_etf_flag = is_etf(order["code"]) or strategy_tag in {"etf_rotation", "rps_rotation"}
 
             # 检查现金
             if order_amount > cash * (1 - CASH_BUFFER):
@@ -53,15 +55,27 @@ class RiskController:
 
             # 检查单票上限
             max_ratio = MAX_SINGLE_ETF if is_etf_flag else MAX_SINGLE_STOCK
+            min_lot_value = order["price"] * LOT_SIZE
+            max_position_value = total_value * max_ratio
+            if min_lot_value > max_position_value:
+                logger.warning(
+                    "最小一手检查拒绝 %s: price=%.3f lot_value=%.2f total_asset=%.2f limit=%.2f",
+                    order["code"],
+                    order["price"],
+                    min_lot_value,
+                    total_value,
+                    max_position_value,
+                )
+                return False, (
+                    "MIN_LOT_EXCEEDS_POSITION_LIMIT: "
+                    f"价格{order['price']:.3f},一手{min_lot_value:.2f},"
+                    f"总资产{total_value:.2f},单票上限{max_position_value:.2f}"
+                )
             within_limit, reason = portfolio.check_position_limit(
                 order["code"], order_amount, total_value, max_ratio_override=max_ratio
             )
             if not within_limit:
-                # 如果是最低一手（100股），放宽限制
-                if order["shares"] == LOT_SIZE:
-                    logger.info(f"{order['code']} 单手超出仓位限制，已放宽")
-                else:
-                    return False, reason
+                return False, reason
 
             # 检查总仓位
             within_total, ratio = portfolio.check_total_position_limit(order_amount)
@@ -136,8 +150,11 @@ class RiskController:
             pos = portfolio.get_position(code)
             if not pos:
                 return False, f"标的 {code} 无持仓"
-            if order.get("shares", 0) > pos["shares"]:
-                order["shares"] = pos["shares"]
+            sellable_qty = portfolio.get_sellable_qty(
+                code, order.get("date", datetime.now().strftime("%Y%m%d"))
+            )
+            if order.get("shares", 0) > sellable_qty:
+                order["shares"] = sellable_qty
 
         # 6. 价格合理性
         if order.get("price", 0) <= 0:
@@ -206,7 +223,10 @@ class RiskController:
             (exceeded, drawdown)
         """
         drawdown = portfolio.get_drawdown()
-        exceeded = drawdown >= threshold
+        if drawdown >= threshold:
+            self._drawdown_latched = True
+            self._drawdown_recovery_days = 0
+        exceeded = drawdown >= threshold or self._drawdown_latched
 
         if exceeded:
             logger.warning(f"最大回撤触发: {drawdown:.2%} >= {threshold:.2%}")
@@ -241,11 +261,14 @@ class RiskController:
         """
         exceeded, loss_pct = self.check_daily_loss(portfolio)
         if exceeded:
-            return True, f"单日亏损 {loss_pct:.2%} 超过阈值 {DAILY_LOSS_THRESHOLD:.2%}，需降仓"
+            return True, f"单日亏损 {loss_pct:.2%} 超过阈值 {DAILY_LOSS_THRESHOLD:.2%}，停止新买入"
 
         exceeded, drawdown = self.check_max_drawdown(portfolio)
         if exceeded:
-            return True, f"回撤 {drawdown:.2%} 超过阈值 {MAX_DRAWDOWN_THRESHOLD:.2%}，需降仓"
+            return True, (
+                f"回撤 {drawdown:.2%} 超过阈值 {MAX_DRAWDOWN_THRESHOLD:.2%}，"
+                "停止新买入且总仓位上限降至30%"
+            )
 
         return False, ""
 
@@ -277,9 +300,23 @@ class RiskController:
 
         return False, ""
 
-    def set_daily_start(self, portfolio):
-        """记录当日开盘时的市值"""
+    def set_daily_start(self, portfolio, date=None):
+        """记录日初市值，并推进最大回撤熔断的恢复交易日计数。"""
         self._daily_start_value = portfolio.get_total_value()
+        review_date = str(date or datetime.now().strftime("%Y%m%d")).replace("-", "")[:8]
+        drawdown = portfolio.get_drawdown()
+        if drawdown >= MAX_DRAWDOWN_THRESHOLD:
+            self._drawdown_latched = True
+            self._drawdown_recovery_days = 0
+            self._last_drawdown_review_date = review_date
+            return
+        if self._drawdown_latched and review_date != self._last_drawdown_review_date:
+            self._drawdown_recovery_days += 1
+            self._last_drawdown_review_date = review_date
+            if self._drawdown_recovery_days >= DRAWDOWN_RECOVERY_DAYS:
+                self._drawdown_latched = False
+                self._drawdown_recovery_days = 0
+                logger.info("最大回撤熔断已连续恢复 %d 个交易日，恢复正常买入", DRAWDOWN_RECOVERY_DAYS)
 
     def filter_orders(self, orders, portfolio, market_data=None):
         """批量过滤订单

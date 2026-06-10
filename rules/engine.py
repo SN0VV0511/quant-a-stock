@@ -180,10 +180,9 @@ class TradingRules:
         # 考虑单票上限（如果 total_value 提供）
         if total_value and total_value > 0:
             max_amount = total_value * max_ratio
-            # 如果单手价格超过仓位上限，放宽到可以买一手
             one_lot_cost = price * LOT_SIZE
-            if one_lot_cost > max_amount and usable_cash >= one_lot_cost:
-                max_amount = one_lot_cost
+            if one_lot_cost > max_amount:
+                return 0
             usable_cash = min(usable_cash, max_amount)
 
         # 扣除预估交易成本（约千分之五用于佣金+过户费等）
@@ -192,10 +191,6 @@ class TradingRules:
         # 计算可买股数，向下取整到 100 的整数倍
         max_shares = int(net_cash / price)
         lot_shares = (max_shares // LOT_SIZE) * LOT_SIZE
-
-        # 如果计算结果为 0 但能买一手，放宽到一手
-        if lot_shares == 0 and usable_cash >= price * LOT_SIZE:
-            lot_shares = LOT_SIZE
 
         return lot_shares
 

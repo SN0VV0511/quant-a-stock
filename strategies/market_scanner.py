@@ -16,11 +16,17 @@ from config.settings import (
     SCAN_MIN_PRICE,
     SCAN_MIN_VOLUME,
     SCAN_MIN_AVG_VOLUME,
+    SCAN_MIN_AVG_AMOUNT,
     SCAN_LIMIT_PCT,
     SCAN_MAX_HIST_FETCH,
     SCORE_WEIGHT_MOMENTUM,
     SCORE_WEIGHT_MOMENTUM_20,
     SCORE_WEIGHT_VOLATILITY,
+    MAX_PRICE_MA20_RATIO,
+    MAX_PRICE_MA60_RATIO,
+    MAX_5D_GAIN,
+    MAX_60D_GAIN,
+    MAX_YTD_GAIN,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +52,7 @@ def score_candidates(
     momentum_period=60,
     name_map=None,
     min_avg_volume=SCAN_MIN_AVG_VOLUME,
+    min_avg_amount=SCAN_MIN_AVG_AMOUNT,
     weights=None,
 ):
     """对给定历史数据做横截面动量打分并排序(纯函数,无网络/IO)。
@@ -76,6 +83,8 @@ def score_candidates(
     w_mom, w_mom20, w_vol = weights
 
     raw = []
+    liquidity_filtered = 0
+    acceleration_filtered = 0
     for code, df in history_map.items():
         if df is None or len(df) < momentum_period + 1:
             continue
@@ -87,6 +96,7 @@ def score_candidates(
         volume_col = pd.to_numeric(df["volume"], errors="coerce").dropna()
         avg_vol = volume_col.tail(20).mean() if len(volume_col) >= 20 else 0
         if avg_vol < min_avg_volume:
+            liquidity_filtered += 1
             continue
 
         # 统一价格口径:全部使用历史收盘序列,不混入实时价
@@ -103,6 +113,39 @@ def score_candidates(
         ma60 = float(close.tail(60).mean()) if len(close) >= 60 else float(close.mean())
         ma_passed = close_now > ma20 > ma60
 
+        if "amount" in df.columns:
+            amount = pd.to_numeric(df["amount"], errors="coerce").dropna()
+            avg_amount = float(amount.tail(20).mean()) if len(amount) >= 20 else 0.0
+        else:
+            aligned_close = pd.to_numeric(df["close"], errors="coerce")
+            aligned_volume = pd.to_numeric(df["volume"], errors="coerce")
+            avg_amount = float((aligned_close * aligned_volume).dropna().tail(20).mean())
+        if avg_amount < min_avg_amount:
+            liquidity_filtered += 1
+            continue
+
+        gain_5d = close_now / float(close.iloc[-6]) - 1 if len(close) >= 6 else 0.0
+        gain_60d = close_now / float(close.iloc[-61]) - 1 if len(close) >= 61 else momentum
+        ytd_base = float(close.iloc[0])
+        if "date" in df.columns:
+            dates = pd.to_datetime(df["date"], errors="coerce")
+            valid = pd.DataFrame({"date": dates, "close": pd.to_numeric(df["close"], errors="coerce")}).dropna()
+            if not valid.empty:
+                current_year = valid["date"].iloc[-1].year
+                current_year_rows = valid[valid["date"].dt.year == current_year]
+                if not current_year_rows.empty:
+                    ytd_base = float(current_year_rows["close"].iloc[0])
+        gain_ytd = close_now / ytd_base - 1 if ytd_base > 0 else 0.0
+        if (
+            close_now / ma20 > MAX_PRICE_MA20_RATIO
+            or close_now / ma60 > MAX_PRICE_MA60_RATIO
+            or gain_5d > MAX_5D_GAIN
+            or gain_60d > MAX_60D_GAIN
+            or gain_ytd > MAX_YTD_GAIN
+        ):
+            acceleration_filtered += 1
+            continue
+
         returns = close.pct_change().dropna().tail(20)
         volatility = float(returns.std() * np.sqrt(252)) if len(returns) > 0 else 999.0
 
@@ -117,8 +160,17 @@ def score_candidates(
             "ma_passed": ma_passed,
             "volatility": round(volatility, 4),
             "avg_volume": int(avg_vol),
+            "avg_amount": round(avg_amount, 2),
+            "gain_5d": round(gain_5d, 4),
+            "gain_60d": round(gain_60d, 4),
+            "gain_ytd": round(gain_ytd, 4),
         })
 
+    logger.info(
+        "候选过滤统计: 流动性不足 %d 只,短期极端加速 %d 只",
+        liquidity_filtered,
+        acceleration_filtered,
+    )
     if not raw:
         return []
 
@@ -237,7 +289,7 @@ class MarketScanner:
         fetch_codes = [s["code"] for s in pre_filtered]
         name_map = {s["code"]: s["name"] for s in pre_filtered}
         logger.info(f"开始批量加载 {len(fetch_codes)} 只股票历史数据...")
-        history_map = self.loader.get_batch_history(fetch_codes, days=momentum_period + 30)
+        history_map = self.loader.get_batch_history(fetch_codes, days=max(momentum_period + 30, 260))
 
         final = score_candidates(
             history_map,

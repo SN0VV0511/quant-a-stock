@@ -115,6 +115,8 @@ class PaperBrokerAdapter(BrokerAdapter):
                     order.shares,
                     trade_date,
                     order.strategy or "paper",
+                    strategy_tag=order.strategy_tag,
+                    trigger_reason=order.reason,
                 )
             else:
                 result = self.portfolio.sell(
@@ -123,6 +125,8 @@ class PaperBrokerAdapter(BrokerAdapter):
                     order.shares,
                     trade_date,
                     order.strategy or "paper",
+                    sell_reason=order.reason,
+                    indicators=order.metadata,
                 )
 
             if not result.get("success"):
@@ -139,6 +143,8 @@ class PaperBrokerAdapter(BrokerAdapter):
                 amount=round(order.price * int(result.get("shares", order.shares)), 2),
                 cost=float(result.get("cost_detail", {}).get("total", 0.0)),
                 strategy=order.strategy,
+                strategy_tag=order.strategy_tag,
+                sell_reason=order.reason if order.action == "sell" else "",
                 message="虚拟盘成交",
                 profit=result.get("profit"),
                 date=trade_date,
@@ -171,6 +177,8 @@ class PaperBrokerAdapter(BrokerAdapter):
             shares=order.shares,
             amount=0.0,
             strategy=order.strategy,
+            strategy_tag=order.strategy_tag,
+            sell_reason=order.reason if order.action == "sell" else "",
             message=message,
             date=order.date,
         )

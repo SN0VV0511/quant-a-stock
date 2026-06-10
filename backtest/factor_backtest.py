@@ -75,6 +75,7 @@ class FactorBacktester(PortfolioBacktester):
                 "code": code, "action": "sell",
                 "name": holdings[code].get("name", code),
                 "strategy": "小市值调仓", "reason": "调出目标池",
+                "strategy_tag": "smallcap_value",
             })
         # 调入:目标但未持有
         for t in target:
@@ -82,6 +83,7 @@ class FactorBacktester(PortfolioBacktester):
                 orders.append({
                     "code": t["code"], "action": "buy", "name": t.get("name", t["code"]),
                     "strategy": _BUY_STRATEGY, "reason": f"小市值价值 rank{t['rank']}",
+                    "strategy_tag": "smallcap_value",
                 })
         return orders
 

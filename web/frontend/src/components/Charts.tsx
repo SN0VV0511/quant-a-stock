@@ -135,6 +135,8 @@ export function EquityCharts({ points, reducedMotion }: EquityChartsProps) {
     return () => {
       equityChart.current?.destroy();
       ddChart.current?.destroy();
+      equityChart.current = null;
+      ddChart.current = null;
     };
   }, []);
 
@@ -222,7 +224,10 @@ export function AllocationChart({ cash, positions, reducedMotion }: AllocationCh
   }, [cash, positions, reducedMotion]);
 
   useEffect(() => {
-    return () => chartRef.current?.destroy();
+    return () => {
+      chartRef.current?.destroy();
+      chartRef.current = null;
+    };
   }, []);
 
   const hasPositions = positions.length > 0;
@@ -306,7 +311,10 @@ export function BacktestChart({ series, reducedMotion }: BacktestChartProps) {
   }, [reducedMotion, series]);
 
   useEffect(() => {
-    return () => chartRef.current?.destroy();
+    return () => {
+      chartRef.current?.destroy();
+      chartRef.current = null;
+    };
   }, []);
 
   return (

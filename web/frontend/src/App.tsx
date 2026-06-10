@@ -13,6 +13,7 @@ import {
   Search,
   ShieldCheck,
   Terminal,
+  Trophy,
   TrendingUp,
   UserLock,
   Zap
@@ -21,9 +22,10 @@ import { api } from "./lib/api";
 import { formatCurrency, formatNumber, formatPercent, toneByValue } from "./lib/format";
 import { usePolling } from "./hooks/usePolling";
 import { useReducedMotion } from "./hooks/useReducedMotion";
+import { buildProfitRanking } from "./lib/profitRanking";
 import { AllocationChart, BacktestChart, EquityCharts } from "./components/Charts";
 import { HudCard } from "./components/HudCard";
-import type { BacktestSeries, Candidate, ObservationResponse, RpsOrder, RpsSignal, Trade } from "./types";
+import type { BacktestSeries, Candidate, ObservationResponse, Position, RpsOrder, RpsSignal, Trade } from "./types";
 
 const todayKey = () => new Date().toISOString().slice(0, 10).replace(/-/g, "");
 
@@ -354,7 +356,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
         />
         <KpiCard
           label="候选股"
-          value={`${candidates.data?.candidates.length ?? 0}`}
+          value={`${candidates.data?.candidates?.length ?? 0}`}
           sub={candidates.data?.updated_at ? `更新 ${String(candidates.data.updated_at).slice(11)}` : "--"}
           tone="accent"
         />
@@ -362,16 +364,12 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
 
       <section className="dashboard-grid">
         <HudCard
-          className="span-8"
+          className="span-12"
           title="净值曲线 / 回撤"
           icon={<TrendingUp size={18} />}
-          meta={equity.data?.points.length ? `${equity.data.points.length} 个快照` : equity.error ?? "--"}
+          meta={equity.data?.points?.length ? `${equity.data.points.length} 个快照` : equity.error ?? "--"}
         >
-          {equity.data?.points.length ? <EquityCharts points={equity.data.points} reducedMotion={reducedMotion} /> : <EmptyState text="暂无净值数据，运行虚拟盘后生成快照。" />}
-        </HudCard>
-
-        <HudCard title="观察期 / 健康检查" icon={<ShieldCheck size={18} />} meta={healthMeta(observation.data)}>
-          <ObservationPanel data={observation.data} error={observation.error} />
+          {equity.data?.points?.length ? <EquityCharts points={equity.data.points} reducedMotion={reducedMotion} /> : <EmptyState text="暂无净值数据，运行虚拟盘后生成快照。" />}
         </HudCard>
 
         <HudCard title="候选股雷达" icon={<Search size={18} />} meta={candidates.data?.updated_at || "--"}>
@@ -419,6 +417,15 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
         >
           <DateFilter dates={trades.data?.dates ?? []} selected={selectedDate} onSelect={setSelectedDate} />
           <TradeList trades={visibleTrades} />
+        </HudCard>
+
+        <HudCard
+          className="profit-ranking-card"
+          title="持仓战绩榜"
+          icon={<Trophy size={18} />}
+          meta="腾讯实时行情"
+        >
+          <ProfitRanking positions={portfolioData?.positions ?? []} />
         </HudCard>
 
         <HudCard className="span-12" title="策略回测对比" icon={<FlaskConical size={18} />} meta={backtestMeta(backtest.data)}>
@@ -563,6 +570,43 @@ function PositionList({ items }: { items: Array<{ code: string; name: string; sh
   );
 }
 
+function ProfitRanking({ positions }: { positions: Position[] }) {
+  const ranking = buildProfitRanking(positions);
+  if (!ranking.length) {
+    return <EmptyState text="暂无持仓，成交后显示实时盈亏排名。" />;
+  }
+
+  const maxAbsProfit = Math.max(...ranking.map((item) => Math.abs(item.profit)), 1);
+  return (
+    <div className="profit-ranking" aria-label="持仓盈亏排名">
+      <div className="profit-ranking__legend">
+        <span>按浮动盈亏金额排序</span>
+        <span>盈利红 · 亏损绿</span>
+      </div>
+      {ranking.map((item) => {
+        const positive = item.profit >= 0;
+        const width = Math.max(6, Math.abs(item.profit) / maxAbsProfit * 100);
+        return (
+          <div className={`profit-rank-row rank-level-${item.rankLevel}`} key={item.code}>
+            <span className="profit-rank-row__label">{item.rankLabel}</span>
+            <div className="profit-rank-row__stock">
+              <strong>{item.name || item.code}</strong>
+              <span>{item.code} · {item.shares} 股</span>
+              <span className="profit-rank-row__bar" aria-hidden="true">
+                <i className={positive ? "is-profit" : "is-loss"} style={{ width: `${width}%` }} />
+              </span>
+            </div>
+            <div className={`profit-rank-row__value ${positive ? "is-profit" : "is-loss"}`}>
+              <strong>{positive ? "+" : ""}{formatNumber(item.profit, 2)}</strong>
+              <span>{formatPercent(item.profit_pct)}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function TradeList({ trades }: { trades: Trade[] }) {
   if (!trades.length) return <EmptyState text="暂无交易" />;
   return (
@@ -703,4 +747,3 @@ export function App() {
   const [authenticated, setAuthenticated] = useState(() => window.location.pathname !== "/quantify/login");
   return authenticated ? <DashboardView onLogout={() => setAuthenticated(false)} /> : <LoginView onLogin={() => setAuthenticated(true)} />;
 }
-

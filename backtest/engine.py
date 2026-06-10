@@ -105,7 +105,7 @@ class BacktestEngine:
                 continue
 
             # 记录日初市值
-            self.risk_ctrl.set_daily_start(portfolio)
+            self.risk_ctrl.set_daily_start(portfolio, date=date)
 
             # 获取当前持仓
             current_positions = portfolio.get_all_positions()
@@ -185,7 +185,9 @@ class BacktestEngine:
                 if order["action"] == "buy":
                     result = portfolio.buy(
                         code, name, price, order["shares"],
-                        date, order.get("strategy", "backtest")
+                        date, order.get("strategy", "backtest"),
+                        strategy_tag=order.get("strategy_tag", "combo_trend"),
+                        trigger_reason=order.get("reason", ""),
                     )
                     if result["success"]:
                         all_trades.append({
@@ -200,7 +202,8 @@ class BacktestEngine:
                 elif order["action"] == "sell":
                     result = portfolio.sell(
                         code, price, order["shares"],
-                        date, order.get("strategy", "backtest")
+                        date, order.get("strategy", "backtest"),
+                        sell_reason=order.get("reason", "STRATEGY_REBALANCE_EXIT"),
                     )
                     if result["success"]:
                         all_trades.append({
@@ -328,6 +331,7 @@ class BacktestEngine:
                     "price": sig.get("close", 0),
                     "reason": sig.get("reason", ""),
                     "strategy": sig.get("strategy", ""),
+                    "strategy_tag": sig.get("strategy_tag", "combo_trend"),
                 })
             elif sig["signal"] == "sell" and sig["code"] in current_positions:
                 pos = current_positions[sig["code"]]
@@ -338,6 +342,7 @@ class BacktestEngine:
                     "price": sig.get("close", 0),
                     "reason": sig.get("reason", ""),
                     "strategy": sig.get("strategy", ""),
+                    "strategy_tag": sig.get("strategy_tag", "combo_trend"),
                 })
         return orders
 

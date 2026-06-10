@@ -87,6 +87,21 @@ class ReportGenerator:
                 if t.get("profit") is not None:
                     pnl_sign = "+" if t["profit"] >= 0 else ""
                     lines.append(f"    盈亏: {pnl_sign}{t['profit']:,.2f} 元")
+                    lines.append(
+                        f"    strategy_tag={t.get('strategy_tag', 'combo_trend')} "
+                        f"sell_reason={t.get('sell_reason', 'UNKNOWN')}"
+                    )
+
+            reason_pnl = {}
+            for trade in trades:
+                if trade.get("direction") != "sell" and trade.get("action") != "sell":
+                    continue
+                reason = trade.get("sell_reason", "UNKNOWN")
+                reason_pnl[reason] = reason_pnl.get(reason, 0.0) + float(trade.get("profit", 0) or 0)
+            if reason_pnl:
+                lines.append("  卖出原因收益贡献:")
+                for reason, profit in sorted(reason_pnl.items()):
+                    lines.append(f"    {reason}: {profit:+,.2f} 元")
 
         # 风控事件
         if risk_events:

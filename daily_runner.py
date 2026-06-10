@@ -80,7 +80,7 @@ class DailyRunner:
             result["is_trading_day"] = True
 
             # 2. 记录日初市值
-            self.risk_ctrl.set_daily_start(self.portfolio)
+            self.risk_ctrl.set_daily_start(self.portfolio, date=date_str)
             logger.info(f"日初市值: {self.portfolio.get_total_value():,.2f} 元")
 
             # 3. 更新行情数据
@@ -111,8 +111,10 @@ class DailyRunner:
             all_orders = []
 
             try:
-                etf_orders = self.rps_strategy.generate_orders(
-                    etf_data, current_positions, date_str
+                etf_orders = (
+                    self.rps_strategy.generate_orders(etf_data, current_positions, date_str)
+                    if datetime.strptime(date_str, "%Y%m%d").weekday() == 0
+                    else []
                 )
                 all_orders.extend(etf_orders)
                 logger.info(f"ETF/RPS 策略生成 {len(etf_orders)} 个订单")
@@ -143,6 +145,7 @@ class DailyRunner:
                                     "price": 0,
                                     "reason": f"扫描调仓卖出（不在Top5）",
                                     "strategy": "全市场扫描",
+                                    "strategy_tag": pos.get("strategy_tag", "combo_trend"),
                                 })
                         # 买入新扫描到的股票
                         for r in scan_results:
@@ -155,6 +158,7 @@ class DailyRunner:
                                     "price": r["price"],
                                     "reason": f"扫描选入 #{r['rank']} 动量={r['momentum']:+.2%}",
                                     "strategy": "全市场扫描",
+                                    "strategy_tag": "momentum_breakout",
                                 })
                     else:
                         logger.warning("扫描无结果")
@@ -180,6 +184,7 @@ class DailyRunner:
                                             "price": cur_price,
                                             "reason": f"止损卖出（亏损 {pnl:.1%}，跌出Top5）",
                                             "strategy": "全市场扫描",
+                                            "strategy_tag": pos.get("strategy_tag", "combo_trend"),
                                         })
 
                 all_orders.extend(scanner_orders)
@@ -191,8 +196,8 @@ class DailyRunner:
             for order in all_orders:
                 if order["action"] == "buy" and order.get("shares", 0) <= 0:
                     # 根据策略来源判断仓位限制
-                    strategy_name = order.get("strategy", "")
-                    if "ETF" in strategy_name or "动量" in strategy_name:
+                    strategy_tag = order.get("strategy_tag", "combo_trend")
+                    if strategy_tag in {"etf_rotation", "rps_rotation"}:
                         max_ratio = MAX_SINGLE_ETF
                     else:
                         max_ratio = MAX_SINGLE_STOCK
@@ -241,7 +246,9 @@ class DailyRunner:
                 if order["action"] == "buy":
                     trade_result = self.portfolio.buy(
                         code, name, price, order["shares"],
-                        date_str, order.get("strategy", "daily")
+                        date_str, order.get("strategy", "daily"),
+                        strategy_tag=order.get("strategy_tag", "combo_trend"),
+                        trigger_reason=order.get("reason", ""),
                     )
                     if trade_result["success"]:
                         today_trades.append({
@@ -253,13 +260,15 @@ class DailyRunner:
                             "amount": round(price * trade_result["shares"], 2),
                             "cost": trade_result["cost_detail"]["total"],
                             "strategy": order.get("strategy", ""),
+                            "strategy_tag": order.get("strategy_tag", "combo_trend"),
                         })
                         logger.info(f"买入 {name}({code}) {trade_result['shares']}股 @ {price:.3f}")
 
                 elif order["action"] == "sell":
                     trade_result = self.portfolio.sell(
                         code, price, order["shares"],
-                        date_str, order.get("strategy", "daily")
+                        date_str, order.get("strategy", "daily"),
+                        sell_reason=order.get("reason", "STRATEGY_REBALANCE_EXIT"),
                     )
                     if trade_result["success"]:
                         today_trades.append({
@@ -271,6 +280,8 @@ class DailyRunner:
                             "amount": round(price * trade_result["shares"], 2),
                             "profit": trade_result["profit"],
                             "strategy": order.get("strategy", ""),
+                            "strategy_tag": order.get("strategy_tag", "combo_trend"),
+                            "sell_reason": order.get("reason", "STRATEGY_REBALANCE_EXIT"),
                         })
                         logger.info(f"卖出 {name}({code}) {trade_result['shares']}股 @ {price:.3f} 盈亏 {trade_result['profit']:+,.2f}")
 

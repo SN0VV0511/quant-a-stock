@@ -252,7 +252,16 @@ def _set_auth_cookie(handler):
 class QuantHandler(SimpleHTTPRequestHandler):
 
     def _require_auth(self) -> bool:
-        """需要认证的路由调用此方法。未登录返回 False 并发送 401。"""
+        """页面鉴权：未登录时重定向到登录页。"""
+        if _check_auth(self):
+            return True
+        self.send_response(302)
+        self.send_header("Location", "login")
+        self.end_headers()
+        return False
+
+    def _require_api_auth(self) -> bool:
+        """API 鉴权：未登录时返回结构化 401。"""
         if _check_auth(self):
             return True
         self.send_response(401)
@@ -298,7 +307,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         }
 
         if path in api_routes:
-            if not self._require_auth():
+            if not self._require_api_auth():
                 return
             api_routes[path]()
             return
@@ -374,7 +383,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/scan/trigger":
-            if not self._require_auth():
+            if not self._require_api_auth():
                 return
             self._json_response(self._api_scan_trigger())
             return
@@ -828,7 +837,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime_type or "application/octet-stream")
         self.send_header("Content-Length", len(body))
-        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         self.end_headers()
         if write_body:
             self.wfile.write(body)

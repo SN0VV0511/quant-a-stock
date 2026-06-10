@@ -6,7 +6,7 @@ import pandas as pd
 from strategies.market_scanner import score_candidates, _zscore
 
 
-def _hist(trend_pct, n=70, volume=2_000_000, base=10.0):
+def _hist(trend_pct, n=70, volume=4_000_000, base=10.0):
     """构造收盘价从 base 线性变动 trend_pct 的历史数据。"""
     closes = np.linspace(base, base * (1 + trend_pct), n)
     return pd.DataFrame({"close": closes, "volume": [volume] * n})
@@ -25,7 +25,7 @@ def test_higher_momentum_ranks_first():
 
 def test_low_volume_filtered_out():
     history = {
-        "600000": _hist(0.5, volume=2_000_000),
+        "600000": _hist(0.5, volume=4_000_000),
         "600001": _hist(0.5, volume=100),   # 均量过低,应被剔除
     }
     ranked = score_candidates(history, top_n=5, momentum_period=60, min_avg_volume=500_000)

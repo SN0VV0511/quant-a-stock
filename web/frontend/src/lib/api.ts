@@ -23,7 +23,11 @@ export class ApiError extends Error {
   }
 }
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+async function requestJson<T>(
+  path: string,
+  init?: RequestInit,
+  redirectOnUnauthorized = true
+): Promise<T> {
   const response = await fetch(path, {
     credentials: "same-origin",
     ...init,
@@ -34,7 +38,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
-    if (response.status === 401) {
+    if (response.status === 401 && redirectOnUnauthorized) {
       // cookie 过期，跳转到登录页
       window.location.href = "/quantify/login";
       throw new ApiError("未登录，正在跳转...", 401);
@@ -57,7 +61,7 @@ export const api = {
     return requestJson<LoginResponse>(`${BASE}/api/login`, {
       method: "POST",
       body: JSON.stringify({ password })
-    });
+    }, false);
   },
   logout(): Promise<LoginResponse> {
     return requestJson<LoginResponse>(`${BASE}/api/logout`, { method: "POST", body: "{}" });
@@ -66,7 +70,7 @@ export const api = {
     return requestJson<LoginResponse>(`${BASE}/api/change-password`, {
       method: "POST",
       body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
-    });
+    }, false);
   },
   status(): Promise<StatusResponse> {
     return requestJson<StatusResponse>(`${BASE}/api/status`);

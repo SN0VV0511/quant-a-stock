@@ -1,6 +1,14 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
+const apiProxy = {
+  "/quantify/api": {
+    target: "http://127.0.0.1:8888",
+    changeOrigin: true,
+    rewrite: (path: string) => path.replace(/^\/quantify/, "")
+  }
+};
+
 export default defineConfig({
   plugins: [react()],
   base: "/quantify/",
@@ -21,9 +29,10 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    proxy: {
-      "/api": "http://127.0.0.1:8888"
-    }
+    proxy: apiProxy
+  },
+  preview: {
+    proxy: apiProxy
   },
   test: {
     environment: "jsdom",

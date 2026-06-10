@@ -10,7 +10,16 @@ import pandas as pd
 import numpy as np
 
 from config.settings import (
-    DEFAULT_STOCK_POOL, MAX_SINGLE_STOCK, is_chinext, INITIAL_CAPITAL,
+    DEFAULT_STOCK_POOL,
+    INITIAL_CAPITAL,
+    MAX_5D_GAIN,
+    MAX_60D_GAIN,
+    MAX_PRICE_MA20_RATIO,
+    MAX_PRICE_MA60_RATIO,
+    MAX_SINGLE_STOCK,
+    MAX_YTD_GAIN,
+    SCAN_MIN_AVG_AMOUNT,
+    is_chinext,
 )
 
 logger = logging.getLogger(__name__)
@@ -23,7 +32,7 @@ STOP_LOSS_PCT = 0.07        # 止损比例 7%
 TAKE_PROFIT_MA = True       # 跌破 MA20 止盈
 MAX_STOCKS = 4              # 最多持有股票数
 MIN_LISTED_DAYS = 120       # 最低上市天数
-MIN_AVG_AMOUNT = 5000000    # 最低日均成交额（5 万元）
+MIN_AVG_AMOUNT = SCAN_MIN_AVG_AMOUNT
 REBALANCE_DAY = -1           # 调仓日（-1=每个交易日）
 
 # 因子权重
@@ -123,10 +132,42 @@ class MainboardStockStrategy:
 
         # 流动性过滤
         recent = df.tail(20)
+        close = pd.to_numeric(df["close"], errors="coerce").dropna()
+        volume = pd.to_numeric(df["volume"], errors="coerce") if "volume" in df.columns else None
         if "amount" in recent.columns:
-            avg_amount = recent["amount"].mean()
-            if pd.notna(avg_amount) and avg_amount < MIN_AVG_AMOUNT:
-                return False, f"流动性不足（日均 {avg_amount:.0f}）"
+            avg_amount = float(pd.to_numeric(recent["amount"], errors="coerce").mean())
+        elif volume is not None:
+            avg_amount = float((pd.to_numeric(df["close"], errors="coerce") * volume).tail(20).mean())
+        else:
+            avg_amount = 0.0
+        if not pd.notna(avg_amount) or avg_amount < MIN_AVG_AMOUNT:
+            return False, f"流动性不足（日均成交额 {avg_amount:.0f}）"
+
+        if len(close) >= 61:
+            current = float(close.iloc[-1])
+            ma20 = float(close.tail(20).mean())
+            ma60 = float(close.tail(60).mean())
+            gain_5d = current / float(close.iloc[-6]) - 1
+            gain_60d = current / float(close.iloc[-61]) - 1
+            year_rows = df.copy()
+            year_rows["date"] = pd.to_datetime(year_rows["date"], errors="coerce")
+            valid_dates = year_rows["date"].dropna()
+            ytd_close = pd.Series(dtype=float)
+            if not valid_dates.empty:
+                current_year = valid_dates.iloc[-1].year
+                ytd_close = pd.to_numeric(
+                    year_rows.loc[year_rows["date"].dt.year == current_year, "close"], errors="coerce"
+                ).dropna()
+            ytd_base = float(ytd_close.iloc[0]) if not ytd_close.empty else float(close.iloc[0])
+            gain_ytd = current / ytd_base - 1 if ytd_base > 0 else 0.0
+            if (
+                current / ma20 > MAX_PRICE_MA20_RATIO
+                or current / ma60 > MAX_PRICE_MA60_RATIO
+                or gain_5d > MAX_5D_GAIN
+                or gain_60d > MAX_60D_GAIN
+                or gain_ytd > MAX_YTD_GAIN
+            ):
+                return False, "短期极端加速，超过位置过滤阈值"
 
         # 停牌过滤：最近一天成交量为 0
         if "volume" in df.columns:
@@ -149,6 +190,8 @@ class MainboardStockStrategy:
         """
         current_date_clean = current_date.replace("-", "")
         results = []
+        liquidity_filtered = 0
+        acceleration_filtered = 0
 
         for code, df in stock_data_dict.items():
             name = self.stock_pool.get(code, {}).get("name", code)
@@ -168,6 +211,10 @@ class MainboardStockStrategy:
             passed, reason = self.filter_stock(code, df_filtered, stock_info)
             if not passed:
                 logger.debug(f"{name}({code}): 过滤 - {reason}")
+                if "流动性不足" in reason:
+                    liquidity_filtered += 1
+                if "极端加速" in reason:
+                    acceleration_filtered += 1
                 continue
 
             # 计算各因子
@@ -199,6 +246,11 @@ class MainboardStockStrategy:
                 "raw_score": 0.0,
             })
 
+        logger.info(
+            "主板候选过滤统计: 流动性不足 %d 只,短期极端加速 %d 只",
+            liquidity_filtered,
+            acceleration_filtered,
+        )
         if not results:
             return results
 
@@ -356,6 +408,7 @@ class MainboardStockStrategy:
                         "price": sig.get("close", 0),
                         "reason": sig["reason"],
                         "strategy": self.name,
+                        "strategy_tag": "momentum_breakout",
                     })
             return orders
 
@@ -369,6 +422,7 @@ class MainboardStockStrategy:
                     "price": sig.get("close", 0),
                     "reason": sig["reason"],
                     "strategy": self.name,
+                    "strategy_tag": "momentum_breakout",
                 })
             elif sig["signal"] == "buy":
                 orders.append({
@@ -378,6 +432,7 @@ class MainboardStockStrategy:
                     "price": sig.get("close", 0),
                     "reason": sig["reason"],
                     "strategy": self.name,
+                    "strategy_tag": "momentum_breakout",
                 })
 
         return orders

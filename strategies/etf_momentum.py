@@ -214,33 +214,17 @@ class ETFRotationStrategy:
             return False, ""
 
         pnl_pct = (current_price - buy_price) / buy_price
+        if pnl_pct <= -0.12:
+            return True, f"ETF 极端风险退出（亏损 {pnl_pct:.2%}）"
 
-        # 止损
-        if pnl_pct <= -STOP_LOSS_PCT:
-            return True, f"触发止损（亏损 {pnl_pct:.2%}）"
-
-        # 跌破 20 日均线
-        if len(df_filtered) >= MA_SHORT:
+        if len(df_filtered) >= MA_LONG:
             ma20 = df_filtered["close"].rolling(window=MA_SHORT).mean().iloc[-1]
-            if current_price < ma20:
-                return True, f"跌破 MA20（价格 {current_price:.3f} < MA20 {ma20:.3f}）"
-
-        # 移动止盈:回吐盈利的 TRAILING_GIVE_BACK_RATIO 即离场
-        if pnl_pct >= TAKE_PROFIT_PCT:
-            hwm = self._high_water_marks.get(code, buy_price)
-            if current_price > hwm:
-                self._high_water_marks[code] = current_price
-                hwm = current_price
-
-            profit = hwm - buy_price
-            give_back = profit * TRAILING_GIVE_BACK_RATIO
-            stop_line = max(hwm - give_back, buy_price)
-            if current_price <= stop_line:
-                return True, f"移动止盈（回吐盈利 {TRAILING_GIVE_BACK_RATIO*100:.0f}%，盈利 {pnl_pct:.2%}）"
-
-        # 更新最高价
-        if code not in self._high_water_marks or current_price > self._high_water_marks[code]:
-            self._high_water_marks[code] = current_price
+            ma60 = df_filtered["close"].rolling(window=MA_LONG).mean().iloc[-1]
+            if current_price < ma20 or ma20 < ma60:
+                return True, (
+                    f"ETF_ROTATION_EXIT（价格 {current_price:.3f}, "
+                    f"MA20 {ma20:.3f}, MA60 {ma60:.3f}）"
+                )
 
         return False, ""
 
@@ -292,6 +276,7 @@ class ETFRotationStrategy:
                         "price": signal_map.get(code, {}).get("close", 0),
                         "reason": reason,
                         "strategy": self.name,
+                        "strategy_tag": "etf_rotation",
                     })
 
         # 周频调仓时执行信号
@@ -309,6 +294,7 @@ class ETFRotationStrategy:
                         "price": signal_map.get(code, {}).get("close", 0),
                         "reason": signal_map.get(code, {}).get("reason", "调仓卖出"),
                         "strategy": self.name,
+                        "strategy_tag": "etf_rotation",
                     })
 
             # 买入新标的
@@ -322,6 +308,7 @@ class ETFRotationStrategy:
                         "price": sig.get("close", 0),
                         "reason": sig.get("reason", "动量选入"),
                         "strategy": self.name,
+                        "strategy_tag": "etf_rotation",
                     })
 
         return orders

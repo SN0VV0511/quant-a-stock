@@ -12,16 +12,16 @@ describe("App login", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
-    window.history.replaceState({}, "", "/login");
+    window.history.replaceState({}, "", "/quantify/login");
   });
 
   it("登录表单提交成功后进入仪表盘", async () => {
-    window.history.replaceState({}, "", "/login");
+    window.history.replaceState({}, "", "/quantify/login");
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
-        if (url === "/api/login") {
+        if (url === "/quantify/api/login") {
           return new Response(JSON.stringify({ success: true }), { status: 200 });
         }
         return new Response(JSON.stringify({}), { status: 200 });
@@ -33,10 +33,25 @@ describe("App login", () => {
     fireEvent.click(screen.getByRole("button", { name: "进入终端" }));
 
     await waitFor(() => expect(screen.getByText("总市值")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("持仓战绩榜")).toBeInTheDocument());
+  });
+
+  it("接口返回空对象时仪表盘保持可用", async () => {
+    window.history.replaceState({}, "", "/quantify/");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }))
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("候选股")).toBeInTheDocument());
+    expect(screen.getByText("持仓战绩榜")).toBeInTheDocument();
+    expect(screen.getByText("暂无持仓，成交后显示实时盈亏排名。")).toBeInTheDocument();
   });
 
   it("新密码不足时给出内联错误", async () => {
-    window.history.replaceState({}, "", "/login");
+    window.history.replaceState({}, "", "/quantify/login");
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "修改密码" }));
     fireEvent.change(await screen.findByLabelText("旧密码"), { target: { value: "old" } });

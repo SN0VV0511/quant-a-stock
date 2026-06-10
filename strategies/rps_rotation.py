@@ -185,7 +185,6 @@ class RPSRotationStrategy:
         """
         signals = self.calculate_signals(history_map, current_date)
         selected_codes = {s["code"] for s in signals}
-        signal_map = {s["code"]: s for s in signals}
         tradable_codes = {
             code
             for code, meta in self.target_pool.items()
@@ -193,8 +192,21 @@ class RPSRotationStrategy:
         }
         orders: list[dict[str, Any]] = []
 
-        # ETF 退出不再由 RPS 排名触发，改为趋势退出(移动止损/MA20/止盈)
-        # 这里只生成买入信号
+        # 排名跌出候选范围时生成调仓卖出；执行层只在周频调仓日提交。
+        for code, position in current_portfolio.items():
+            normalized = code.lower().replace("sh", "").replace("sz", "").replace(".", "")
+            if normalized in tradable_codes and normalized not in selected_codes:
+                orders.append({
+                    "code": code,
+                    "name": position.get("name", code),
+                    "action": "sell",
+                    "shares": position.get("sellable_qty", position.get("shares", 0)),
+                    "price": position.get("current_price", 0),
+                    "strategy": self.name,
+                    "strategy_tag": "rps_rotation",
+                    "reason": "ETF_ROTATION_EXIT",
+                })
+
         for signal in signals:
             code = signal["code"]
             if code not in tradable_codes:
@@ -214,6 +226,7 @@ class RPSRotationStrategy:
                 "shares": 0,
                 "price": signal.get("price", 0),
                 "strategy": self.name,
+                "strategy_tag": "rps_rotation",
                 "reason": f"RPS {signal['rps']:.0f} rank{signal['rank']}",
             })
         return orders

@@ -12,6 +12,22 @@ from config.time_utils import format_local, today_yyyymmdd
 
 Action = Literal["buy", "sell"]
 ExecutionStatus = Literal["filled", "rejected", "cancelled", "submitted", "failed"]
+StrategyTag = Literal[
+    "combo_trend",
+    "momentum_breakout",
+    "limitup_follow",
+    "smallcap_value",
+    "etf_rotation",
+    "rps_rotation",
+]
+VALID_STRATEGY_TAGS: frozenset[str] = frozenset({
+    "combo_trend",
+    "momentum_breakout",
+    "limitup_follow",
+    "smallcap_value",
+    "etf_rotation",
+    "rps_rotation",
+})
 
 
 def _now_str() -> str:
@@ -47,6 +63,7 @@ class OrderIntent:
     source: str = "strategy"
     created_at: str = field(default_factory=_now_str)
     metadata: dict[str, Any] = field(default_factory=dict)
+    strategy_tag: StrategyTag = "combo_trend"
 
     def __post_init__(self) -> None:
         """校验订单意图的基础合法性。"""
@@ -58,6 +75,8 @@ class OrderIntent:
             raise ValueError(f"价格不能为负数: {self.price}")
         if self.shares < 0:
             raise ValueError(f"股数不能为负数: {self.shares}")
+        if self.strategy_tag not in VALID_STRATEGY_TAGS:
+            raise ValueError(f"不支持的策略标签: {self.strategy_tag}")
 
     @classmethod
     def from_order_dict(cls, order: dict[str, Any]) -> "OrderIntent":
@@ -72,8 +91,10 @@ class OrderIntent:
             reason=str(order.get("reason", "")),
             date=order.get("date"),
             source=str(order.get("source", "legacy")),
+            strategy_tag=order.get("strategy_tag", "combo_trend"),
             metadata={k: v for k, v in order.items() if k not in {
                 "code", "action", "price", "shares", "name", "strategy", "reason", "date", "source",
+                "strategy_tag",
             }},
         )
 
@@ -89,6 +110,8 @@ class OrderIntent:
             "strategy": self.strategy,
             "date": self.date,
             "source": self.source,
+            "strategy_tag": self.strategy_tag,
+            **self.metadata,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,6 +165,8 @@ class ExecutionReport:
     amount: float
     cost: float = 0.0
     strategy: str = ""
+    strategy_tag: StrategyTag = "combo_trend"
+    sell_reason: str = ""
     message: str = ""
     profit: float | None = None
     date: str | None = None
@@ -166,6 +191,8 @@ class ExecutionReport:
             "amount": round(self.amount, 2),
             "cost": round(self.cost, 2),
             "strategy": self.strategy,
+            "strategy_tag": self.strategy_tag,
+            "sell_reason": self.sell_reason,
             "status": self.status,
             "message": self.message,
         }
