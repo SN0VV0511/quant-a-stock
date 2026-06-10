@@ -69,8 +69,8 @@ def evaluate_exit(
 
     pnl_pct = (price - avg_cost) / avg_cost
 
-    # 1. 策略卖出
-    if combo_sell:
+    # 1. 策略卖出：仅在亏损或微利时作为智能止损，盈利时交给止盈/移动止损处理
+    if combo_sell and pnl_pct < 0.01:  # 盈利不足 1% 时才用 Combo 卖出止损
         return "策略卖出", combo_reason or "策略信号"
 
     # 2/3. 止损:ATR 可用时动态计算,并用固定止损限制最大容忍亏损

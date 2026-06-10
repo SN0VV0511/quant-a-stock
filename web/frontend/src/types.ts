@@ -54,6 +54,7 @@ export interface Trade {
 
 export interface TradesResponse {
   trades: Trade[];
+  dates: string[];
 }
 
 export interface Candidate {

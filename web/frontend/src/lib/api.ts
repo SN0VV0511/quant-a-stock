@@ -11,6 +11,8 @@ import type {
   TradesResponse
 } from "../types";
 
+const BASE = "/quantify";
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -32,6 +34,11 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
+    if (response.status === 401) {
+      // cookie 过期，跳转到登录页
+      window.location.href = "/quantify/login";
+      throw new ApiError("未登录，正在跳转...", 401);
+    }
     let message = `请求失败: HTTP ${response.status}`;
     try {
       const data = (await response.json()) as { error?: string };
@@ -47,45 +54,46 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   login(password: string): Promise<LoginResponse> {
-    return requestJson<LoginResponse>("/api/login", {
+    return requestJson<LoginResponse>(`${BASE}/api/login`, {
       method: "POST",
       body: JSON.stringify({ password })
     });
   },
   logout(): Promise<LoginResponse> {
-    return requestJson<LoginResponse>("/api/logout", { method: "POST", body: "{}" });
+    return requestJson<LoginResponse>(`${BASE}/api/logout`, { method: "POST", body: "{}" });
   },
   changePassword(oldPassword: string, newPassword: string): Promise<LoginResponse> {
-    return requestJson<LoginResponse>("/api/change-password", {
+    return requestJson<LoginResponse>(`${BASE}/api/change-password`, {
       method: "POST",
       body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
     });
   },
   status(): Promise<StatusResponse> {
-    return requestJson<StatusResponse>("/api/status");
+    return requestJson<StatusResponse>(`${BASE}/api/status`);
   },
   portfolio(): Promise<PortfolioResponse> {
-    return requestJson<PortfolioResponse>("/api/portfolio");
+    return requestJson<PortfolioResponse>(`${BASE}/api/portfolio`);
   },
-  trades(): Promise<TradesResponse> {
-    return requestJson<TradesResponse>("/api/trades");
+  trades(date?: string): Promise<TradesResponse> {
+    const qs = date ? `?date=${date}` : "";
+    return requestJson<TradesResponse>(`${BASE}/api/trades${qs}`);
   },
   candidates(): Promise<CandidatesResponse> {
-    return requestJson<CandidatesResponse>("/api/candidates");
+    return requestJson<CandidatesResponse>(`${BASE}/api/candidates`);
   },
   rps(): Promise<RpsResponse> {
-    return requestJson<RpsResponse>("/api/rps");
+    return requestJson<RpsResponse>(`${BASE}/api/rps`);
   },
   equity(): Promise<EquityResponse> {
-    return requestJson<EquityResponse>("/api/equity");
+    return requestJson<EquityResponse>(`${BASE}/api/equity`);
   },
   logs(lines: number): Promise<LogsResponse> {
-    return requestJson<LogsResponse>(`/api/logs?lines=${lines}&file=live_today`);
+    return requestJson<LogsResponse>(`${BASE}/api/logs?lines=${lines}&file=live_today`);
   },
   observation(): Promise<ObservationResponse> {
-    return requestJson<ObservationResponse>("/api/observation");
+    return requestJson<ObservationResponse>(`${BASE}/api/observation`);
   },
   backtest(): Promise<BacktestResponse> {
-    return requestJson<BacktestResponse>("/api/backtest");
+    return requestJson<BacktestResponse>(`${BASE}/api/backtest`);
   }
 };

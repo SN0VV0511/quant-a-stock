@@ -58,7 +58,7 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
       const response = await api.login(password);
       if (response.success) {
         onLogin();
-        window.history.replaceState({}, "", "/");
+        window.history.replaceState({}, "", "/quantify/");
       } else {
         setMessage(response.error ?? "密码错误，请重试");
       }
@@ -244,10 +244,11 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
   const [logLines, setLogLines] = useState(100);
   const [autoScroll, setAutoScroll] = useState(true);
   const [showRejected, setShowRejected] = useState(false);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
 
   const status = usePolling(api.status, 5000);
   const portfolio = usePolling(api.portfolio, 5000);
-  const trades = usePolling(api.trades, 5000);
+  const trades = usePolling(useCallback(() => api.trades(selectedDate ?? undefined), [selectedDate]), 5000);
   const candidates = usePolling(api.candidates, 5000);
   const rps = usePolling(api.rps, 5000);
   const equity = usePolling(api.equity, 5000);
@@ -258,7 +259,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
   const logout = async () => {
     await api.logout();
     onLogout();
-    window.history.replaceState({}, "", "/login");
+    window.history.replaceState({}, "", "/quantify/login");
   };
 
   const lastRefresh = Math.max(
@@ -416,6 +417,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
             </label>
           }
         >
+          <DateFilter dates={trades.data?.dates ?? []} selected={selectedDate} onSelect={setSelectedDate} />
           <TradeList trades={visibleTrades} />
         </HudCard>
 
@@ -438,11 +440,25 @@ function EmptyState({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>;
 }
 
+// v2 cache-bust
+function DateFilter({ dates, selected, onSelect }: { dates: string[]; selected: string | null; onSelect: (d: string | null) => void }) {
+  if (!dates.length) return null;
+  const fmt = (d: string) => `${d.slice(4, 6)}/${d.slice(6, 8)}`;
+  return (
+    <div className="date-filter">
+      <button className={selected === null ? "chip active" : "chip"} onClick={() => onSelect(null)} type="button">全部</button>
+      {dates.map((d) => (
+        <button key={d} className={selected === d ? "chip active" : "chip"} onClick={() => onSelect(d)} type="button">{fmt(d)}</button>
+      ))}
+    </div>
+  );
+}
+
 function CandidateList({ items }: { items: Candidate[] }) {
   if (!items.length) return <EmptyState text="等待扫描..." />;
   return (
     <div className="list-stack">
-      {items.slice(0, 12).map((item) => (
+      {items.map((item) => (
         <div className="data-row" key={item.code}>
           <span className="rank">#{item.rank}</span>
           <div className="row-main">
@@ -551,7 +567,7 @@ function TradeList({ trades }: { trades: Trade[] }) {
   if (!trades.length) return <EmptyState text="暂无交易" />;
   return (
     <div className="list-stack">
-      {trades.slice(0, 40).map((trade, index) => {
+      {trades.slice(0, 100).map((trade, index) => {
         const rejected = trade.status === "rejected";
         const buy = (trade.action ?? trade.direction) === "buy";
         return (
@@ -684,6 +700,7 @@ function backtestMeta(data: unknown) {
 }
 
 export function App() {
-  const [authenticated, setAuthenticated] = useState(() => window.location.pathname !== "/login");
+  const [authenticated, setAuthenticated] = useState(() => window.location.pathname !== "/quantify/login");
   return authenticated ? <DashboardView onLogout={() => setAuthenticated(false)} /> : <LoginView onLogin={() => setAuthenticated(true)} />;
 }
+

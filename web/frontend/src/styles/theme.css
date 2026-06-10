@@ -223,6 +223,13 @@ button:disabled {
   box-shadow: var(--shadow-glow);
 }
 
+.date-filter {
+  display: flex;
+  gap: 6px;
+  padding: 8px 0 4px;
+  flex-wrap: wrap;
+}
+
 .ghost-action:hover {
   transform: translateY(-1px);
 }

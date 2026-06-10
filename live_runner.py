@@ -41,6 +41,7 @@ from config.settings import (  # noqa: E402
     MAX_TOTAL_POSITION,
     MIN_POSITION_RATIO,
     REBUY_COOLDOWN_SECONDS,
+    ENTRY_INTERVAL_SECONDS,
     REPORT_DIR,
     RPS_HISTORY_DAYS,
     RPS_STATE_FILE,
@@ -278,6 +279,7 @@ class SharedState:
         self.rejected_stocks: dict[str, float] = {}  # 代码 -> 冷却结束时间戳
         self.rejected_exits: dict[str, float] = {}
         self.rebuy_cooldown: dict[str, float] = {}  # 卖出后再买冷却 代码 -> 冷却结束时间戳
+        self.last_entry_time: float = 0  # 上次买入时间戳,用于建仓间隔控制
         self.last_scan_time: datetime | None = None
         self.scanning = False
         self.risk_on = True  # 大盘择时状态,由扫描线程刷新
@@ -340,10 +342,28 @@ class SharedState:
         with self._lock:
             self.rejected_exits[code] = time.time() + seconds
 
-    def mark_rebuy_cooldown(self, code: str, seconds: int) -> None:
-        """标记某标的刚被卖出,在冷却期内禁止再次开仓(防止日内来回刷单)。"""
+    def set_exit_cooldown_until_close(self, code: str) -> None:
+        """跌停等极端情况:冷却到收盘,当天不再尝试卖出。"""
         with self._lock:
-            self.rebuy_cooldown[code] = time.time() + seconds
+            now = now_local()
+            close_time = now.replace(hour=15, minute=0, second=0, microsecond=0)
+            if now >= close_time:
+                close_time += timedelta(days=1)
+            self.rejected_exits[code] = close_time.timestamp()
+
+    def mark_rebuy_cooldown(self, code: str, seconds: int) -> None:
+        """标记某标的刚被卖出,在冷却期内禁止再次开仓(防止日内来回刷单)。
+        seconds=0 表示当天不再买回(收盘后自动重置)。"""
+        with self._lock:
+            if seconds <= 0:
+                # 当天不再买回:冷却到明天 9:30
+                now = now_local()
+                tomorrow_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                if now >= tomorrow_open:
+                    tomorrow_open += timedelta(days=1)
+                self.rebuy_cooldown[code] = tomorrow_open.timestamp()
+            else:
+                self.rebuy_cooldown[code] = time.time() + seconds
 
     def is_rebuy_cooling_down(self, code: str) -> bool:
         """判断某标的是否仍处于卖出后的再买冷却期。"""
@@ -475,8 +495,9 @@ def _submit_order(
     risk_ctrl: RiskController,
     market_data: dict[str, dict[str, Any]],
     recorder: EventRecorder,
-) -> ExecutionReport | None:
-    """执行标准订单：记录信号、风控审批、虚拟成交。"""
+) -> tuple[ExecutionReport | None, str]:
+    """执行标准订单：记录信号、风控审批、虚拟成交。
+    返回 (report, reject_reason)。"""
     recorder.record("signal", order.to_dict())
     approved, rejected = risk_ctrl.filter_order_intents([order], broker.portfolio, market_data)
     for decision in rejected:
@@ -484,7 +505,7 @@ def _submit_order(
         logger.info("风控拒绝: %s(%s) %s - %s", order.name or order.code, order.code, order.action, decision.reason)
 
     if not approved:
-        return None
+        return None, rejected[0].reason if rejected else ""
 
     decision = RiskDecision(order=order, approved=True, reason="通过")
     recorder.record("risk_approved", decision.to_dict())
@@ -505,7 +526,7 @@ def _submit_order(
         )
     else:
         logger.warning("[拒单] %s %s %s", order.action, order.code, report.message)
-    return report
+    return report, ""
 
 
 def _get_current_quotes(
@@ -809,7 +830,7 @@ def _run_daily_rps_rotation(
             if code in current_positions:
                 logger.info("RPS 跳过已持仓 ETF: %s", code)
                 continue
-            report = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+            report, _ = _submit_order(order, broker, risk_ctrl, market_data, recorder)
             submitted_orders.append({
                 "code": order.code,
                 "name": order.name,
@@ -934,6 +955,8 @@ def _handle_position_exits(
 
     ETF 持仓也走趋势退出(移动止损/MA20跌破/止盈),不再由 RPS 排名踢出。
     """
+    import config.settings as _cfg
+
     today = today_yyyymmdd()
     for code, pos in positions.items():
 
@@ -974,6 +997,16 @@ def _handle_position_exits(
         peak_price = float(pos.get("peak_price", avg_cost) or avg_cost)
         holding_days = _holding_days(pos.get("buy_date"), today)
 
+        # T+1: 今日买入的持仓跳过退出评估,不可卖出
+        if holding_days <= 0:
+            continue
+
+        # 开盘保护: 开盘后 N 分钟内不执行止损,避免跳空误触发(止盈不受影响)
+        now_ts = now_local()
+        market_open_today = now_ts.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_since_open = (now_ts - market_open_today).total_seconds() / 60
+        opening_protect = 0 < minutes_since_open <= _cfg.OPENING_STOP_PROTECT_MINUTES
+
         decision = evaluate_exit(
             avg_cost=avg_cost,
             price=float(current),
@@ -985,21 +1018,51 @@ def _handle_position_exits(
             combo_reason=combo_reason,
         )
 
+        # 开盘保护期内,只允许止盈,不允许止损
+        if decision is not None and opening_protect:
+            strategy_name = decision[0]
+            if "止损" in strategy_name and "止盈" not in strategy_name:
+                logger.info(
+                    "[开盘保护] %s(%s) 触发%s但开盘%.0f分钟内跳过",
+                    pos.get("name", code), code, strategy_name, minutes_since_open,
+                )
+                decision = None
+
         # 开盘急速止盈: 开盘后 N 分钟内，持仓盈利超阈值则立即卖出
+        # 例外：如果前一日涨停（今日高开是正常延续），不触发急速止盈
         if decision is None and avg_cost > 0:
-            import config.settings as _cfg
             profit_pct = (float(current) / avg_cost - 1) * 100
             now_ts = now_local()
             market_open_today = now_ts.replace(hour=9, minute=30, second=0, microsecond=0)
             minutes_since_open = (now_ts - market_open_today).total_seconds() / 60
             if (0 < minutes_since_open <= _cfg.OPENING_TAKEPROFIT_MINUTES
                     and profit_pct >= _cfg.OPENING_TAKEPROFIT_PCT):
-                decision = ("开盘急速止盈",
-                            f"开盘{minutes_since_open:.0f}分钟 盈利{profit_pct:.1f}%≥{_cfg.OPENING_TAKEPROFIT_PCT}%")
-                logger.info(
-                    "[开盘止盈] %s(%s) 盈利%.1f%% 开盘%.0f分钟",
-                    pos.get("name", code), code, profit_pct, minutes_since_open,
-                )
+                # 检查前一日是否涨停（9.5% 以上涨幅）
+                prev_limit_up = False
+                try:
+                    if is_etf(code):
+                        prev_hist = loader.get_etf_history(code, days=3)
+                    else:
+                        prev_hist = loader.get_stock_data(normalize_code(code), days=3)
+                    if prev_hist is not None and len(prev_hist) >= 2:
+                        prev_close = float(prev_hist.iloc[-2]["close"])
+                        prev_open = float(prev_hist.iloc[-2]["open"])
+                        if prev_open > 0 and (prev_close / prev_open - 1) >= 0.095:
+                            prev_limit_up = True
+                except Exception:
+                    pass
+                if not prev_limit_up:
+                    decision = ("开盘急速止盈",
+                                f"开盘{minutes_since_open:.0f}分钟 盈利{profit_pct:.1f}%≥{_cfg.OPENING_TAKEPROFIT_PCT}%")
+                    logger.info(
+                        "[开盘止盈] %s(%s) 盈利%.1f%% 开盘%.0f分钟",
+                        pos.get("name", code), code, profit_pct, minutes_since_open,
+                    )
+                else:
+                    logger.info(
+                        "[开盘止盈跳过] %s(%s) 前日涨停，今日高开%.1f%%，不触发急速止盈",
+                        pos.get("name", code), code, profit_pct,
+                    )
 
         if decision is None:
             continue
@@ -1030,10 +1093,13 @@ def _submit_exit_order(
     recorder: EventRecorder,
     shared: SharedState | None,
 ) -> ExecutionReport | None:
-    """提交卖出订单，并在风控拒绝时进入冷却期。"""
-    report = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+    """提交卖出订单，并在风控拒绝时进入冷却期。跌停等极端情况冷却到收盘。"""
+    report, reject_reason = _submit_order(order, broker, risk_ctrl, market_data, recorder)
     if report is None and shared is not None:
-        shared.set_exit_cooldown(order.code)
+        if "跌停" in reject_reason:
+            shared.set_exit_cooldown_until_close(order.code)
+        else:
+            shared.set_exit_cooldown(order.code)
     return report
 
 
@@ -1106,6 +1172,11 @@ def _handle_candidate_entries(
             })
             continue
 
+        # 建仓间隔控制:每笔买入至少间隔 N 秒,避免一分钟打满仓位
+        now_entry = time.time()
+        if shared.last_entry_time > 0 and (now_entry - shared.last_entry_time) < ENTRY_INTERVAL_SECONDS:
+            continue
+
         name = next((s["name"] for s in stocks if s["code"] == code), code)
         order = OrderIntent(
             code=code,
@@ -1123,7 +1194,9 @@ def _handle_candidate_entries(
                 "cash_buffer": CASH_BUFFER,
             },
         )
-        result_code = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+        result_code, _ = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+        if result_code is not None and result_code.is_success:
+            shared.last_entry_time = time.time()  # 记录买入时间,控制建仓节奏
         if result_code is None:
             # Risk rejected — cooldown for 5 minutes
             shared.rejected_stocks[code] = time.time() + 300
@@ -1174,7 +1247,7 @@ def _handle_candidate_entries(
                 reason="持仓比例不足30%",
                 source="watch_thread",
             )
-            result_code = _submit_order(order, broker, risk_ctrl, market_data, recorder)
+            result_code, _ = _submit_order(order, broker, risk_ctrl, market_data, recorder)
             if result_code is None:
                 shared.rejected_stocks[code] = time.time() + 300
 
@@ -1387,8 +1460,25 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     """命令行入口。"""
     args = _parse_args()
+
+    # PID 锁：防止重复启动
+    pid_file = os.path.join(DATA_DIR, "live_runner.pid")
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file) as f:
+                old_pid = int(f.read().strip())
+            if old_pid != os.getpid():  # 不是自己（os.execv 重启后 PID 不变）
+                os.kill(old_pid, 0)  # 检查进程是否存在
+                logger.error("live_runner 已在运行 (PID=%d)，退出", old_pid)
+                return
+        except (OSError, ValueError):
+            pass  # 旧进程已死，继续
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
+
     if not args.ignore_calendar and not is_trading_day():
         logger.info("今天不是交易日，退出")
+        _cleanup_pid(pid_file)
         return
 
     broker = create_broker(args.broker)
@@ -1422,7 +1512,8 @@ def main() -> None:
         loader.close()
         broker.close()
         time.sleep(wait_seconds)
-        # 休眠结束后重新启动
+        # 休眠结束后重新启动（exec 不改变 PID，先清理 PID 文件避免误判重复）
+        _cleanup_pid(pid_file)
         os.execv(sys.executable, [sys.executable] + sys.argv)
         return
 
@@ -1476,16 +1567,21 @@ def main() -> None:
     t_scan.start()
 
     try:
+        _last_status_key = ""
         while now_local() < market_close:
             time.sleep(30)
             snapshot = broker.query_snapshot()
-            logger.info(
-                "[状态] 总资产=%.2f 收益=%.2f%% 持仓=%s只 候选=%s只",
-                snapshot.total_value,
-                snapshot.pnl_pct * 100,
-                snapshot.position_count,
-                len(shared.get_candidates()),
-            )
+            cand_count = len(shared.get_candidates())
+            status_key = f"{snapshot.total_value:.2f}_{snapshot.position_count}_{cand_count}"
+            if status_key != _last_status_key:
+                logger.info(
+                    "[状态] 总资产=%.2f 收益=%.2f%% 持仓=%s只 候选=%s只",
+                    snapshot.total_value,
+                    snapshot.pnl_pct * 100,
+                    snapshot.position_count,
+                    cand_count,
+                )
+                _last_status_key = status_key
     finally:
         logger.info("===== 收盘 =====")
         t_watch.join(timeout=30)
@@ -1494,6 +1590,15 @@ def main() -> None:
         loader.close()
         broker.close()
         logger.info("盯盘结束")
+        _cleanup_pid(pid_file)
+
+
+def _cleanup_pid(pid_file: str) -> None:
+    """清理 PID 文件。"""
+    try:
+        os.remove(pid_file)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

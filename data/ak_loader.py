@@ -626,11 +626,14 @@ class AKDataLoader:
 
         return None
 
-    def get_batch_history(self, codes, days=120, max_batch=5000):
+    def get_batch_history(self, codes, days=120, max_batch=5000, timeout_per_stock=30):
         """批量获取历史数据（ThreadPoolExecutor 并发加载）"""
         result = {}
         total = min(len(codes), max_batch)
         target_codes = codes[:max_batch]
+
+        # 先确保登录态，避免 4 个 worker 同时抢 _bs_lock 导致死锁
+        self._ensure_login()
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             future_map = {
@@ -638,11 +641,12 @@ class AKDataLoader:
                 for code in target_codes
             }
             done_count = 0
-            for future in as_completed(future_map):
+            batch_timeout = max(60, len(target_codes) * timeout_per_stock // 4)
+            for future in as_completed(future_map, timeout=batch_timeout):
                 code = future_map[future]
                 done_count += 1
                 try:
-                    df = future.result()
+                    df = future.result(timeout=5)
                     if df is not None and not df.empty:
                         result[code] = df
                 except Exception as e:
@@ -722,7 +726,7 @@ class AKDataLoader:
             return df
         return None
 
-    def get_batch_history_ext(self, codes, days=40, max_batch=5000):
+    def get_batch_history_ext(self, codes, days=40, max_batch=5000, timeout_per_stock=30):
         """并发批量获取扩展字段历史。"""
         result = {}
         target = codes[:max_batch]
@@ -733,7 +737,7 @@ class AKDataLoader:
                 code = future_map[future]
                 done += 1
                 try:
-                    df = future.result()
+                    df = future.result(timeout=timeout_per_stock)
                     if df is not None and not df.empty:
                         result[code] = df
                 except Exception:
@@ -903,7 +907,7 @@ class AKDataLoader:
             for future in as_completed(future_map):
                 code = future_map[future]
                 try:
-                    df = future.result()
+                    df = future.result(timeout=30)
                     if df is not None and not df.empty:
                         result[code] = df
                 except Exception as exc:
@@ -1025,7 +1029,7 @@ class AKDataLoader:
             for future in as_completed(future_map):
                 name = future_map[future]
                 try:
-                    df = future.result()
+                    df = future.result(timeout=30)
                     if df is not None and not df.empty:
                         result[name] = df
                 except Exception as exc:

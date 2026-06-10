@@ -228,6 +228,12 @@ class MarketScanner:
             logger.info(f"粗筛后 {len(pre_filtered)} 只,取成交量前 {SCAN_MAX_HIST_FETCH} 只")
             pre_filtered = pre_filtered[:SCAN_MAX_HIST_FETCH]
 
+        # 基本面过滤（在拉历史 K 线之前）
+        import config.settings as _settings
+        if _settings.SCAN_ENABLE_FUNDAMENTAL_FILTER:
+            from strategies.fundamental_filter import apply_fundamental_filters
+            pre_filtered = apply_fundamental_filters(pre_filtered)
+
         fetch_codes = [s["code"] for s in pre_filtered]
         name_map = {s["code"]: s["name"] for s in pre_filtered}
         logger.info(f"开始批量加载 {len(fetch_codes)} 只股票历史数据...")

@@ -41,7 +41,7 @@ ROOT_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
+            with open(STATE_FILE, "r", encoding="utf-8", errors="replace") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("读取账户状态失败: %s", exc)
@@ -52,7 +52,7 @@ def load_trade_log():
     trades = []
     if os.path.exists(TRADE_LOG_FILE):
         try:
-            with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+            with open(TRADE_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -99,7 +99,7 @@ def load_rps_state():
             "orders": [],
         }
     try:
-        with open(RPS_STATE_FILE, "r", encoding="utf-8") as f:
+        with open(RPS_STATE_FILE, "r", encoding="utf-8", errors="replace") as f:
             data = json.load(f)
         data["available"] = True
         return data
@@ -141,7 +141,7 @@ def load_reports():
             if fname.endswith(".txt"):
                 fpath = os.path.join(REPORT_DIR, fname)
                 try:
-                    with open(fpath, "r", encoding="utf-8") as f:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
                     reports.append({"date": fname.replace(".txt", "").replace("daily_", ""), "content": content})
                 except Exception:
@@ -252,12 +252,21 @@ def _set_auth_cookie(handler):
 class QuantHandler(SimpleHTTPRequestHandler):
 
     def _require_auth(self) -> bool:
-        """需要认证的路由调用此方法。未登录返回 False 并发送登录页。"""
+        """需要认证的路由调用此方法。未登录返回 False 并发送 401。"""
         if _check_auth(self):
             return True
-        self.send_response(302)
-        self.send_header("Location", "login")
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        self.wfile.write(json.dumps({"error": "未登录", "needLogin": True}).encode())
+        return False
+
+    def _require_auth_or_redirect(self) -> bool:
+        """页面路由专用:未登录时返回登录页而非 JSON,让 React 能加载。"""
+        if _check_auth(self):
+            return True
+        self._serve_spa("login.html")
         return False
 
     def do_GET(self):
@@ -265,7 +274,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        # 登录页不需要认证
+        # 登录页不需要认证（优先 React SPA）
         if path == "/login":
             return self._serve_spa("login.html")
 
@@ -296,7 +305,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
         # 静态文件 / 主页
         if path in ("/", "/index.html"):
-            if not self._require_auth():
+            if not self._require_auth_or_redirect():
                 return
             return self._serve_spa("index.html")
 
@@ -314,11 +323,20 @@ class QuantHandler(SimpleHTTPRequestHandler):
             return self._serve_spa("login.html", write_body=False)
 
         if path in ("/", "/index.html"):
-            if not self._require_auth():
+            if not self._require_auth_or_redirect():
                 return
             return self._serve_spa("index.html", write_body=False)
 
         self.send_error(404)
+
+    def do_OPTIONS(self):
+        """CORS 预检请求支持。"""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def do_POST(self):
         global _DASHBOARD_PASSWORD_HASH
@@ -335,6 +353,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             if hashlib.sha256(pwd.encode()).hexdigest() == _DASHBOARD_PASSWORD_HASH:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
                 _set_auth_cookie(self)
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True}).encode())
@@ -345,6 +364,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/logout":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header(
                 "Set-Cookie",
                 "quant_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
@@ -360,8 +380,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/change-password":
-            if not self._require_auth():
-                return
+            # 不要求认证：未登录状态下也可用旧密码修改新密码
             old_pwd = data.get("old_password", "")
             new_pwd = data.get("new_password", "")
             if not new_pwd or len(new_pwd) < 6:
@@ -404,9 +423,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
         positions_value = 0
         position_list = []
         for code, pos in positions.items():
-            current = prices.get(code, pos.get("current_price", pos.get("avg_cost", 0)))
+            current = prices.get(code, pos.get("current_price", pos.get("cost", 0)))
             shares = pos.get("shares", 0)
-            avg_cost = pos.get("avg_cost", 0)
+            avg_cost = pos.get("avg_cost", pos.get("cost", 0))
             value = shares * current
             positions_value += value
             pnl = (current - avg_cost) / avg_cost if avg_cost > 0 else 0
@@ -438,12 +457,18 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
     def _api_trades(self):
         trades = load_trade_log()
+        # 支持 ?date=YYYYMMDD 参数
+        query_date = None
+        if "?date=" in self.path:
+            query_date = self.path.split("?date=")[-1].split("&")[0]
+            if len(query_date) == 8:
+                query_date = query_date[:8]
         # 合并 trade_events.jsonl 中被风控拒绝的订单
         today = datetime.now().strftime("%Y%m%d")
         events_file = os.path.join(DATA_DIR, "trade_events.jsonl")
         if os.path.exists(events_file):
             try:
-                with open(events_file, "r", encoding="utf-8") as f:
+                with open(events_file, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -497,7 +522,12 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 code = t.get("code", "")
                 raw = normalize_code(code)
                 t["name"] = name_map.get(raw, "")
-        return {"trades": trades[-50:]}
+        # 提取所有日期列表
+        all_dates = sorted(set(t.get("date", "") for t in trades if t.get("date")), reverse=True)
+        # 按日期过滤
+        if query_date:
+            trades = [t for t in trades if t.get("date") == query_date]
+        return {"trades": trades[-200:], "dates": all_dates}
 
     def _api_scan(self):
         """从 live_today.log 中提取扫描结果"""
@@ -506,7 +536,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             return result
 
         try:
-            with open(LIVE_TODAY_LOG, "r", encoding="utf-8") as f:
+            with open(LIVE_TODAY_LOG, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
 
             stocks = []
@@ -574,7 +604,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             return {"logs": [], "file": log_file}
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 all_lines = f.readlines()
             # 返回最后 N 行
             tail_lines = all_lines[-lines_count:]
@@ -598,7 +628,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         last_log_time = ""
         if os.path.exists(LIVE_TODAY_LOG):
             try:
-                with open(LIVE_TODAY_LOG, "r", encoding="utf-8") as f:
+                with open(LIVE_TODAY_LOG, "r", encoding="utf-8", errors="replace") as f:
                     for line in reversed(f.readlines()):
                         if "[INFO]" in line:
                             parts = line.split(" [INFO] ")
@@ -613,7 +643,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         scan_active = False
         if os.path.exists(LIVE_TODAY_LOG):
             try:
-                with open(LIVE_TODAY_LOG, "r", encoding="utf-8") as f:
+                with open(LIVE_TODAY_LOG, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
                 watch_active = "盯盘线启动" in content and "盯盘线退出" not in content.split("盯盘线启动")[-1]
                 scan_active = "扫描线启动" in content and "扫描线退出" not in content.split("扫描线启动")[-1]
@@ -651,7 +681,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         # 1. 收盘快照
         if os.path.exists(SNAPSHOT_LOG_FILE):
             try:
-                with open(SNAPSHOT_LOG_FILE, "r", encoding="utf-8") as f:
+                with open(SNAPSHOT_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -672,7 +702,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if os.path.exists(TRADE_EVENTS_FILE):
             try:
                 peak = INITIAL_CAPITAL
-                with open(TRADE_EVENTS_FILE, "r", encoding="utf-8") as f:
+                with open(TRADE_EVENTS_FILE, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -725,7 +755,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if not os.path.exists(path):
             return {**status.to_dict(), "series": []}
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
             data.update(status.to_dict())
             data["available"] = True
@@ -761,7 +791,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if not os.path.exists(path):
             self.send_error(404)
             return
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             body = f.read().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -773,7 +803,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         """优先服务 React 构建产物；缺失时回退到旧模板，便于未构建环境运行。"""
         index_path = os.path.join(DIST_DIR, "index.html")
         if os.path.exists(index_path):
-            with open(index_path, "r", encoding="utf-8") as f:
+            with open(index_path, "r", encoding="utf-8", errors="replace") as f:
                 body = f.read().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -798,7 +828,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime_type or "application/octet-stream")
         self.send_header("Content-Length", len(body))
-        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         if write_body:
             self.wfile.write(body)
