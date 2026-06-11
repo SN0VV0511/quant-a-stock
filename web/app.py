@@ -62,25 +62,23 @@ def load_trade_log():
     state = load_state()
     state_trades = state.get("trades", [])
     if state_trades:
+        # 去重 key 只用 date+code+action+shares，不用 time/price
+        # 同一笔交易在 trade_log.json 和 portfolio_state.json 中时间和价格可能略有差异
         known = {
             (
                 t.get("date"),
-                t.get("time"),
                 t.get("code"),
                 t.get("action") or t.get("direction"),
                 t.get("shares"),
-                t.get("price"),
             )
             for t in trades
         }
         for trade in state_trades:
             key = (
                 trade.get("date"),
-                trade.get("time"),
                 trade.get("code"),
                 trade.get("action") or trade.get("direction"),
                 trade.get("shares"),
-                trade.get("price"),
             )
             if key not in known:
                 trades.append(trade)
@@ -295,6 +293,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         api_routes = {
             "/api/portfolio": lambda: self._json_response(self._api_portfolio()),
             "/api/trades": lambda: self._json_response(self._api_trades()),
+            "/api/profit-ranking": lambda: self._json_response(self._api_profit_ranking()),
             "/api/scan": lambda: self._json_response(self._api_scan()),
             "/api/reports": lambda: self._json_response(self._api_reports()),
             "/api/logs": lambda: self._json_response(self._api_logs(params)),
@@ -537,6 +536,47 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if query_date:
             trades = [t for t in trades if t.get("date") == query_date]
         return {"trades": trades[-200:], "dates": all_dates}
+
+    def _api_profit_ranking(self):
+        """历史战绩榜：按已平仓股票累计收益率排名。"""
+        trades = load_trade_log()
+        from collections import defaultdict
+        stock = defaultdict(lambda: {
+            "name": "", "buy_amount": 0, "sell_amount": 0,
+            "buy_fee": 0, "sell_fee": 0, "shares_bought": 0, "shares_sold": 0,
+        })
+        for t in trades:
+            code = t["code"]
+            stock[code]["name"] = t.get("name", code)
+            if t["action"] == "buy":
+                stock[code]["buy_amount"] += t["amount"]
+                stock[code]["buy_fee"] += t.get("cost", 0)
+                stock[code]["shares_bought"] += t["shares"]
+            elif t["action"] == "sell":
+                stock[code]["sell_amount"] += t["amount"]
+                stock[code]["sell_fee"] += t.get("cost", 0)
+                stock[code]["shares_sold"] += t["shares"]
+
+        ranking = []
+        for code, s in stock.items():
+            if s["shares_sold"] <= 0:
+                continue
+            total_cost = s["buy_amount"] + s["buy_fee"]
+            total_revenue = s["sell_amount"] - s["sell_fee"]
+            net = total_revenue - total_cost
+            roi = net / total_cost if total_cost > 0 else 0
+            ranking.append({
+                "code": code,
+                "name": s["name"],
+                "net_profit": round(net, 2),
+                "roi": round(roi, 4),
+                "buy_amount": round(s["buy_amount"], 2),
+                "sell_amount": round(s["sell_amount"], 2),
+                "shares_traded": s["shares_sold"],
+            })
+
+        ranking.sort(key=lambda x: x["roi"], reverse=True)
+        return {"ranking": ranking}
 
     def _api_scan(self):
         """从 live_today.log 中提取扫描结果"""
@@ -837,7 +877,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime_type or "application/octet-stream")
         self.send_header("Content-Length", len(body))
-        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("Cache-Control", "public, max-age=3600")
         self.end_headers()
         if write_body:
             self.wfile.write(body)

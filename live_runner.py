@@ -1079,10 +1079,29 @@ def _handle_position_exits(
             below_vwap_minutes=below_vwap_minutes,
         )
 
-        # 普通股票保留开盘急速止盈；涨停延续和 ETF 明确排除。
+        # 开盘保护: 开盘后 N 分钟内不执行止损,避免跳空误触发(止盈不受影响)
+        # 例外: 跌幅已接近跌停(>=8%)时跳过保护,直接执行止损
         now_ts = now_local()
         market_open_today = now_ts.replace(hour=9, minute=30, second=0, microsecond=0)
         minutes_since_open = (now_ts - market_open_today).total_seconds() / 60
+        opening_protect = 0 < minutes_since_open <= _cfg.OPENING_STOP_PROTECT_MINUTES
+        if decision.should_sell and opening_protect:
+            if "止损" in decision.sell_reason and "止盈" not in decision.sell_reason:
+                prev_close = float(md.get("prev_close", 0) or 0)
+                near_limit_down = prev_close > 0 and (float(current) / prev_close - 1) <= -0.08
+                if near_limit_down:
+                    logger.info(
+                        "[开盘保护] %s(%s) 跌幅%.1f%%接近跌停,跳过保护直接止损",
+                        pos.get("name", code), code, (float(current) / prev_close - 1) * 100,
+                    )
+                else:
+                    logger.info(
+                        "[开盘保护] %s(%s) 触发%s但开盘%.0f分钟内跳过",
+                        pos.get("name", code), code, decision.sell_reason, minutes_since_open,
+                    )
+                    decision = ExitDecision("hold", "", "", {})
+
+        # 普通股票保留开盘急速止盈；涨停延续和 ETF 明确排除。
         profit_pct = float(current) / avg_cost - 1
         if (
             not decision.should_sell

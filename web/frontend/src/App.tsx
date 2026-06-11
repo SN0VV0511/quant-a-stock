@@ -22,10 +22,9 @@ import { api } from "./lib/api";
 import { formatCurrency, formatNumber, formatPercent, toneByValue } from "./lib/format";
 import { usePolling } from "./hooks/usePolling";
 import { useReducedMotion } from "./hooks/useReducedMotion";
-import { buildProfitRanking } from "./lib/profitRanking";
 import { AllocationChart, BacktestChart, EquityCharts } from "./components/Charts";
 import { HudCard } from "./components/HudCard";
-import type { BacktestSeries, Candidate, ObservationResponse, Position, RpsOrder, RpsSignal, Trade } from "./types";
+import type { BacktestSeries, Candidate, ObservationResponse, Position, ProfitRankItem, RpsOrder, RpsSignal, Trade } from "./types";
 
 const todayKey = () => new Date().toISOString().slice(0, 10).replace(/-/g, "");
 
@@ -253,6 +252,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
   const trades = usePolling(useCallback(() => api.trades(selectedDate ?? undefined), [selectedDate]), 5000);
   const candidates = usePolling(api.candidates, 5000);
   const rps = usePolling(api.rps, 5000);
+  const profitRanking = usePolling(api.profitRanking, 30000);
   const equity = usePolling(api.equity, 5000);
   const logs = usePolling(useCallback(() => api.logs(logLines), [logLines]), 5000);
   const observation = usePolling(api.observation, 60000);
@@ -402,7 +402,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
 
         <HudCard title="持仓分布" icon={<Briefcase size={18} />} meta={`${portfolioData?.position_count ?? 0} 只`}>
           <AllocationChart cash={portfolioData?.cash ?? 0} positions={portfolioData?.positions ?? []} reducedMotion={reducedMotion} />
-          <PositionList items={portfolioData?.positions ?? []} />
+          <PositionList items={portfolioData?.positions ?? []} cash={portfolioData?.cash ?? 0} totalValue={portfolioData?.total_value ?? 0} />
         </HudCard>
 
         <HudCard
@@ -423,9 +423,9 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
           className="profit-ranking-card"
           title="持仓战绩榜"
           icon={<Trophy size={18} />}
-          meta="腾讯实时行情"
+          meta="历史累计收益率"
         >
-          <ProfitRanking positions={portfolioData?.positions ?? []} />
+          <ProfitRanking ranking={profitRanking.data?.ranking ?? []} />
         </HudCard>
 
         <HudCard className="span-12" title="策略回测对比" icon={<FlaskConical size={18} />} meta={backtestMeta(backtest.data)}>
@@ -453,10 +453,16 @@ function DateFilter({ dates, selected, onSelect }: { dates: string[]; selected: 
   const fmt = (d: string) => `${d.slice(4, 6)}/${d.slice(6, 8)}`;
   return (
     <div className="date-filter">
-      <button className={selected === null ? "chip active" : "chip"} onClick={() => onSelect(null)} type="button">全部</button>
-      {dates.map((d) => (
-        <button key={d} className={selected === d ? "chip active" : "chip"} onClick={() => onSelect(d)} type="button">{fmt(d)}</button>
-      ))}
+      <select
+        className="date-select"
+        value={selected ?? ""}
+        onChange={(e) => onSelect(e.target.value || null)}
+      >
+        <option value="">全部</option>
+        {dates.map((d) => (
+          <option key={d} value={d}>{fmt(d)}</option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -550,55 +556,90 @@ function OrderRow({ order }: { order: RpsOrder }) {
   );
 }
 
-function PositionList({ items }: { items: Array<{ code: string; name: string; shares: number; avg_cost: number; current_price: number; profit_pct: number }> }) {
-  if (!items.length) return null;
+function PositionList({ items, cash, totalValue }: { items: Array<{ code: string; name: string; shares: number; avg_cost: number; current_price: number; profit_pct: number; value: number }>; cash: number; totalValue: number }) {
+  if (!items.length) return <EmptyState text="暂无持仓" />;
+  const totalPositionValue = items.reduce((sum, item) => sum + (item.value || 0), 0);
+  const cashRatio = totalValue > 0 ? (cash / totalValue * 100).toFixed(1) : '0';
+  const positionRatio = totalValue > 0 ? (totalPositionValue / totalValue * 100).toFixed(1) : '0';
   return (
-    <div className="list-stack compact-list">
-      {items.map((item) => (
-        <div className="data-row" key={item.code}>
-          <div className="row-main">
-            <strong>{item.name || item.code}</strong>
-            <span>{item.shares} 股 · 成本 {formatCurrency(item.avg_cost, 3)}</span>
-          </div>
-          <div className="row-right">
-            <strong>{formatCurrency(item.current_price, 3)}</strong>
-            <span className={toneClass(item.profit_pct)}>{formatPercent(item.profit_pct)}</span>
-          </div>
+    <div className="position-detail">
+      <div className="position-summary">
+        <div className="position-summary__item">
+          <span className="position-summary__label">总资产</span>
+          <strong>{formatCurrency(totalValue)}</strong>
         </div>
-      ))}
+        <div className="position-summary__item">
+          <span className="position-summary__label">现金</span>
+          <strong>{formatCurrency(cash)}</strong>
+          <span className="muted">({cashRatio}%)</span>
+        </div>
+        <div className="position-summary__item">
+          <span className="position-summary__label">持仓</span>
+          <strong>{formatCurrency(totalPositionValue)}</strong>
+          <span className="muted">({positionRatio}%)</span>
+        </div>
+        <div className="position-summary__item">
+          <span className="position-summary__label">持仓数</span>
+          <strong>{items.length} 只</strong>
+        </div>
+      </div>
+      <div className="list-stack compact-list">
+        {items.map((item) => {
+          const weight = totalValue > 0 ? ((item.value || 0) / totalValue * 100).toFixed(1) : '0';
+          return (
+            <div className="data-row" key={item.code}>
+              <div className="row-main">
+                <strong>{item.name || item.code}</strong>
+                <span>{item.shares} 股 · 成本 {formatCurrency(item.avg_cost, 3)}</span>
+              </div>
+              <div className="row-right">
+                <strong>{formatCurrency(item.current_price, 3)}</strong>
+                <span className={toneClass(item.profit_pct)}>{formatPercent(item.profit_pct)}</span>
+                <span className="muted" style={{ fontSize: '10px' }}>{weight}%</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
-function ProfitRanking({ positions }: { positions: Position[] }) {
-  const ranking = buildProfitRanking(positions);
+function ProfitRanking({ ranking }: { ranking: ProfitRankItem[] }) {
   if (!ranking.length) {
-    return <EmptyState text="暂无持仓，成交后显示实时盈亏排名。" />;
+    return <EmptyState text="暂无已平仓记录，完成交易后显示战绩排名。" />;
   }
 
-  const maxAbsProfit = Math.max(...ranking.map((item) => Math.abs(item.profit)), 1);
+  const maxAbsRoi = Math.max(...ranking.map((item) => Math.abs(item.roi)), 0.001);
+  const LABELS = ["夯爆了", "夯", "人上人", "npc", "拉", "拉爆了"];
+  const assignLabel = (index: number, total: number) => {
+    if (total <= 1) return LABELS[0];
+    const level = Math.round(index * (LABELS.length - 1) / (total - 1));
+    return LABELS[level];
+  };
+
   return (
-    <div className="profit-ranking" aria-label="持仓盈亏排名">
+    <div className="profit-ranking" aria-label="历史战绩排名">
       <div className="profit-ranking__legend">
-        <span>按浮动盈亏金额排序</span>
+        <span>按累计收益率排序（已平仓）</span>
         <span>盈利红 · 亏损绿</span>
       </div>
-      {ranking.map((item) => {
-        const positive = item.profit >= 0;
-        const width = Math.max(6, Math.abs(item.profit) / maxAbsProfit * 100);
+      {ranking.map((item, index) => {
+        const positive = item.roi >= 0;
+        const width = Math.max(6, Math.abs(item.roi) / maxAbsRoi * 100);
         return (
-          <div className={`profit-rank-row rank-level-${item.rankLevel}`} key={item.code}>
-            <span className="profit-rank-row__label">{item.rankLabel}</span>
+          <div className={`profit-rank-row rank-level-${index}`} key={item.code}>
+            <span className="profit-rank-row__label">{assignLabel(index, ranking.length)}</span>
             <div className="profit-rank-row__stock">
               <strong>{item.name || item.code}</strong>
-              <span>{item.code} · {item.shares} 股</span>
+              <span>{item.code} · {item.shares_traded} 股</span>
               <span className="profit-rank-row__bar" aria-hidden="true">
                 <i className={positive ? "is-profit" : "is-loss"} style={{ width: `${width}%` }} />
               </span>
             </div>
             <div className={`profit-rank-row__value ${positive ? "is-profit" : "is-loss"}`}>
-              <strong>{positive ? "+" : ""}{formatNumber(item.profit, 2)}</strong>
-              <span>{formatPercent(item.profit_pct)}</span>
+              <strong>{positive ? "+" : ""}{formatNumber(item.net_profit, 2)}</strong>
+              <span>{formatPercent(item.roi)}</span>
             </div>
           </div>
         );
@@ -620,10 +661,12 @@ function TradeList({ trades }: { trades: Trade[] }) {
             <span className={rejected ? "badge reject" : buy ? "badge buy" : "badge sell"}>{rejected ? "拒" : buy ? "买" : "卖"}</span>
             <div className="row-main">
               <strong>{trade.name || trade.code}</strong>
-              <span>{trade.shares ?? 0} 股 · {rejected ? trade.reject_reason || trade.reason || "风控拒绝" : "已记录"}</span>
+              <span>{trade.shares ?? 0} 股{rejected ? " · " + (trade.reject_reason || trade.reason || "风控拒绝") : ""}</span>
             </div>
             <div className="row-right">
               <strong>{formatCurrency(trade.price ?? trade.actual_price, 3)}</strong>
+              <span>{formatCurrency(trade.amount, 0)}</span>
+              {!rejected && trade.strategy && <span className="muted" style={{ fontSize: '10px' }}>{trade.strategy}</span>}
             </div>
           </div>
         );

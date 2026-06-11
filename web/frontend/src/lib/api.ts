@@ -6,6 +6,7 @@ import type {
   LogsResponse,
   ObservationResponse,
   PortfolioResponse,
+  ProfitRankingResponse,
   RpsResponse,
   StatusResponse,
   TradesResponse
@@ -99,5 +100,8 @@ export const api = {
   },
   backtest(): Promise<BacktestResponse> {
     return requestJson<BacktestResponse>(`${BASE}/api/backtest`);
+  },
+  profitRanking(): Promise<ProfitRankingResponse> {
+    return requestJson<ProfitRankingResponse>(`${BASE}/api/profit-ranking`);
   }
 };

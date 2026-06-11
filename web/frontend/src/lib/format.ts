@@ -1,8 +1,3 @@
-const currencyFormatter = new Intl.NumberFormat("zh-CN", {
-  maximumFractionDigits: 0,
-  minimumFractionDigits: 0
-});
-
 /**
  * 格式化金额，统一处理接口返回的空值和异常值。
  */
@@ -10,7 +5,11 @@ export function formatCurrency(value: number | null | undefined, digits = 0): st
   if (value === null || value === undefined || Number.isNaN(value)) {
     return "--";
   }
-  return `¥${currencyFormatter.format(Number(value.toFixed(digits)))}`;
+  const formatter = new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+  return `¥${formatter.format(Number(value.toFixed(digits)))}`;
 }
 
 /**

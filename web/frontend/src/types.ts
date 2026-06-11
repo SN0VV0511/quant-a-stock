@@ -50,6 +50,22 @@ export interface Trade {
   status?: string;
   reject_reason?: string;
   reason?: string;
+  amount?: number;
+  strategy?: string;
+}
+
+export interface ProfitRankItem {
+  code: string;
+  name: string;
+  net_profit: number;
+  roi: number;
+  buy_amount: number;
+  sell_amount: number;
+  shares_traded: number;
+}
+
+export interface ProfitRankingResponse {
+  ranking: ProfitRankItem[];
 }
 
 export interface TradesResponse {
