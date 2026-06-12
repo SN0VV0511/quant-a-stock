@@ -80,6 +80,9 @@ def test_daily_rps_rotation_places_paper_orders(monkeypatch, tmp_path) -> None:
     rps_state_path = tmp_path / "rps_state.json"
     event_path = tmp_path / "events.jsonl"
     monkeypatch.setattr("live_runner.RPS_STATE_FILE", str(rps_state_path))
+    # 固定为交易时段内时间:_run_daily_rps_rotation 用 now_local() 判断收盘,
+    # 否则测试在收盘后(>15:00)运行时会被"已过收盘跳过"分支误杀(时间依赖缺陷)。
+    monkeypatch.setattr("live_runner.now_local", lambda: datetime(2026, 6, 2, 10, 0, 0))
 
     broker = PaperBrokerAdapter(
         state_file=str(state_path),
