@@ -386,11 +386,14 @@ class PositionManager:
         else:
             max_ratio = MAX_SINGLE_STOCK
 
-        # 当前该标的持仓市值
+        # 当前该标的持仓市值:按现价计算,避免标的上涨后实际市值已超单票上限,
+        # 却因成本价口径偏低被误判为未超、继续放行加仓(与分母 total_value 的现价
+        # 口径保持一致)。缺现价时回退成本价,使新建仓(尚无现价)行为与原逻辑一致。
         current_pos_value = 0.0
         if code in self.state["positions"]:
             pos = self.state["positions"][code]
-            current_pos_value = pos["avg_cost"] * pos["shares"]
+            ref_price = pos.get("current_price") or pos.get("avg_cost", 0)
+            current_pos_value = ref_price * pos["shares"]
 
         new_ratio = (current_pos_value + amount) / total_value
         if new_ratio > max_ratio:

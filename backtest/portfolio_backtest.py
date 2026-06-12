@@ -30,8 +30,6 @@ import pandas as pd
 from config.settings import (
     INITIAL_CAPITAL,
     MAX_SINGLE_STOCK,
-    STOP_LOSS_PCT,
-    TAKE_PROFIT_PCT,
 )
 from backtest.metrics import compute_performance_metrics, format_summary
 from risk.control import RiskController
@@ -76,8 +74,6 @@ class PortfolioBacktester:
         momentum_period: int = 60,
         rebalance_every: int = 1,
         max_single_stock: float = MAX_SINGLE_STOCK,
-        stop_loss_pct: float = STOP_LOSS_PCT,
-        take_profit_pct: float = TAKE_PROFIT_PCT,
     ) -> None:
         """
         Args:
@@ -86,16 +82,15 @@ class PortfolioBacktester:
             momentum_period: 动量周期(交易日)。
             rebalance_every: 每隔多少个交易日重算候选池(1=每日)。
             max_single_stock: 单票仓位上限。
-            stop_loss_pct: 固定止损线。
-            take_profit_pct: 止盈触发线(配合跌破 MA20)。
+
+        注:退出统一走 ``evaluate_position_exit``(分层退出规则),不再接收
+        固定 stop_loss_pct/take_profit_pct——它们此前从未参与退出决策,是误导性死参数。
         """
         self.initial_capital = initial_capital
         self.top_n = top_n
         self.momentum_period = momentum_period
         self.rebalance_every = max(1, rebalance_every)
         self.max_single_stock = max_single_stock
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
         self.combo = ComboSignalStrategy()
 
     # ==================== 纯函数回测核心 ====================

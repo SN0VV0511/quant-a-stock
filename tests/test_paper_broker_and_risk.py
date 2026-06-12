@@ -296,3 +296,29 @@ def test_drawdown_circuit_requires_two_recovery_days() -> None:
     assert risk.check_max_drawdown(portfolio)[0] is True
     risk.set_daily_start(portfolio, date="20260612")
     assert risk.check_max_drawdown(portfolio)[0] is False
+
+
+def test_position_limit_uses_current_price_not_cost(tmp_path) -> None:
+    """单票仓位限制应按现价计算:上涨后实际市值超限时,加仓必须被拒。
+
+    回归 A3:旧实现用成本价 avg_cost*shares 估算持仓市值,标的上涨后实际市值
+    已超单票上限,却因成本口径偏低被误判未超、放行加仓,导致单票集中度失控。
+    """
+    from rules.position import PositionManager
+
+    pm = PositionManager(
+        state_file=str(tmp_path / "state.json"),
+        trade_log_file=str(tmp_path / "trade_log.json"),
+        snapshot_log_file=str(tmp_path / "snapshots.jsonl"),
+    )
+    # 成本价 5、现价 13、持有 600 股:现价市值 7800,成本市值仅 3000。
+    pm.state["positions"]["600000"] = {
+        "name": "测试", "shares": 600, "total_qty": 600, "sellable_qty": 600,
+        "avg_cost": 5.0, "current_price": 13.0,
+        "buy_date": "20260101", "strategy_tag": "combo_trend",
+    }
+    total_value = 54795.0  # cash + 现价市值
+    # 再加一手约 1300 元:按现价 (7800+1300)/54795=16.6% 超 15% 上限,应拒绝;
+    # 旧成本口径 (3000+1300)/54795=7.8% 会错误放行。
+    within, _ = pm.check_position_limit("600000", 1300, total_value=total_value)
+    assert within is False

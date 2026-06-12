@@ -73,12 +73,13 @@ ATR_PERIOD = 14                 # ATR 回看周期
 ENABLE_ATR_STOP = True          # 启用 ATR 动态止损,固定止损仅作为最大亏损保护
 ATR_STOP_MULTIPLIER = 1.2       # ATR 止损倍数,小资金默认取 1~1.5 中间偏稳健
 ATR_STOP_MAX_PCT = STOP_LOSS_PCT  # ATR 止损最宽不超过固定止损线
-ENABLE_ATR_TAKE_PROFIT = True   # 达到 ATR 目标后,跌破 MA20 时锁定利润
-ATR_TAKE_PROFIT_MULTIPLIER = 2.5  # ATR 止盈目标倍数,对应 2~3 倍 ATR 区间
-TRAILING_GIVE_BACK_RATIO = 0.4   # 移动止损:回吐盈利的 40% 即离场(例:赚10个点吐4个点)
-TRAILING_ACTIVATE_PCT = 0.05    # 移动止损激活线:峰值相对成本盈利达 5% 后才启用,避免买入即被噪声扫出
-TRAILING_STOP_PCT = 0.04        # 移动止损回撤阈值:自峰值回撤 4% 即离场
-ENABLE_TRAILING_STOP = True     # 是否启用移动止损
+# 移动止盈(回吐式):盈利达 TRAILING_ACTIVATE_PCT 后启用,自峰值回吐已实现盈利的
+# TRAILING_GIVE_BACK_RATIO 即离场,RSI 越高回吐比例越紧(实现见 strategies/exit_rules.py)。
+# 注:原 ENABLE_ATR_TAKE_PROFIT / ATR_TAKE_PROFIT_MULTIPLIER / TRAILING_STOP_PCT
+# 为从未接线的死参数,已移除,避免误以为"ATR 止盈"或"自峰值回撤 4%"在生效。
+TRAILING_GIVE_BACK_RATIO = 0.4   # 移动止盈:回吐盈利的 40% 即离场(例:赚10个点吐4个点)
+TRAILING_ACTIVATE_PCT = 0.05    # 移动止盈激活线:峰值相对成本盈利达 5% 后才启用,避免买入即被噪声扫出
+ENABLE_TRAILING_STOP = True     # 是否启用移动止盈(回吐式)
 TIME_STOP_DAYS = 0              # 时间止损:持有(自然日)达此值且仍不达预期则清仓;0=禁用
 TIME_STOP_MIN_PROFIT = 0.0      # 时间止损的"达标"盈亏阈值,低于此值才触发
 COMBO_DEFENSIVE_PROFIT_THRESHOLD = 0.01
