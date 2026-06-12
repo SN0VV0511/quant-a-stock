@@ -25,6 +25,7 @@ import pandas as pd
 import config.settings as cfg
 from backtest.portfolio_backtest import PortfolioBacktester
 from backtest.factor_backtest import FactorBacktester
+from backtest.rps_backtest import RPSBacktester
 from data.ak_loader import AKDataLoader
 from data.loader import DataLoader
 
@@ -146,7 +147,10 @@ def _calc_rps(values: list[float]) -> float:
 
 def _run_rps_backtest(etf_hist: dict, industry_hist: dict,
                       days: list[str]) -> dict:
-    """ETF/RPS 日频轮动回测。
+    """[DEPRECATED] 已由 backtest.rps_backtest.RPSBacktester 取代,不再被调用。
+
+    旧平行实现:与实盘零共享(lookback=60+行业加权、close 成交、无 T+1/风控/分层退出),
+    回测数字对实盘无参考价值。保留备查,后续清理删除。
 
     每天: 计算 ETF 动量 RPS + 行业动量 RPS 加权,选 top 2 ETF 等权持有。
     按 close 价成交,扣 0.03% 成本。
@@ -303,25 +307,66 @@ def _row(label, r):
     return " | ".join(f"{fmt.format(v):>10}" for v, fmt, _ in cols)
 
 
-def _print_window(title, history, days, etf_hist=None, industry_hist=None):
+# 默认 sleeve 资金配额(各策略独立分配、互不挤占现金):动量40% 小市值40% ETF/RPS20%
+DEFAULT_SLEEVES = {"momentum": 0.4, "smallcap": 0.4, "rps": 0.2}
+
+
+def _combine_sleeves(mom, fac, rps, weights):
+    """按 sleeve 权重把各策略每日净值加权为组合曲线,并计算组合绩效。
+
+    模拟"账户按 sleeve 独立分配给各策略、互不挤占现金"的组合表现,用于评估资金
+    配额方案——对照当前三策略混用一个账户、谁先发信号谁占钱的实盘形态。
+    """
+    parts = [(mom, weights.get("momentum", 0)),
+             (fac, weights.get("smallcap", 0)),
+             (rps, weights.get("rps", 0))]
+    parts = [(r, w) for r, w in parts if r and w > 0 and r.get("daily_values")]
+    if not parts:
+        return None
+    wsum = sum(w for _, w in parts)
+    ratio_maps = []
+    all_dates: set[str] = set()
+    for r, w in parts:
+        m = {dv["date"]: dv["total_value"] / cfg.INITIAL_CAPITAL for dv in r["daily_values"]}
+        all_dates.update(m)
+        ratio_maps.append((m, w / wsum))
+    daily_values = []
+    last = [1.0] * len(ratio_maps)
+    for d in sorted(all_dates):
+        combo = 0.0
+        for i, (m, w) in enumerate(ratio_maps):
+            if d in m:
+                last[i] = m[d]
+            combo += last[i] * w
+        daily_values.append({"date": d, "total_value": round(combo * cfg.INITIAL_CAPITAL, 2)})
+    all_trades = []
+    for r, _ in parts:
+        all_trades.extend(r.get("trades", []))
+    from backtest.metrics import compute_performance_metrics
+    return compute_performance_metrics(daily_values, all_trades, [], cfg.INITIAL_CAPITAL)
+
+
+def _print_window(title, history, days, etf_hist=None, industry_hist=None, sleeves=None):
     print(f"\n=== {title}（{len(days)} 个交易日） ===")
     print(" | ".join(f"{h:>10}" for h in
                       ["策略", "总收益", "最大回撤", "夏普", "卡尔玛", "胜率", "交易数"]))
     print("-" * 80)
     mom = PortfolioBacktester(initial_capital=cfg.INITIAL_CAPITAL, top_n=10).run(history, days)
     fac = FactorBacktester(initial_capital=cfg.INITIAL_CAPITAL).run(history, days)
-    rps = None
-    if etf_hist and industry_hist:
-        rps = _run_rps_backtest(etf_hist, industry_hist, days)
+    # ETF/RPS 复用实盘内核(RPSBacktester);行业指数实盘只观察不交易,故回测也不参与下单
+    rps = RPSBacktester().run(etf_hist, days) if etf_hist else None
     print(_row("动量Combo", mom))
     print(_row("小市值价值", fac))
     if rps:
         print(_row("ETF/RPS轮动", rps))
-    return mom, fac, rps
+    combo = _combine_sleeves(mom, fac, rps, sleeves or DEFAULT_SLEEVES)
+    if combo:
+        print(_row("组合(sleeve)", combo))
+    return mom, fac, rps, combo
 
 
-def _save_ab(title, mom, fac, rps=None):
-    """将三条曲线写入 reports/backtest_latest.json 供仪表盘展示。"""
+def _save_ab(title, mom, fac, rps=None, combo=None):
+    """将各策略曲线 + sleeve 组合写入 reports/backtest_latest.json 供仪表盘展示。"""
     import json
     from datetime import datetime as _dt
 
@@ -338,6 +383,8 @@ def _save_ab(title, mom, fac, rps=None):
     all_series = [series("动量Combo", mom), series("小市值价值", fac)]
     if rps:
         all_series.append(series("ETF/RPS轮动", rps))
+    if combo:
+        all_series.append(series("组合(sleeve)", combo))
 
     payload = {
         "generated_at": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -356,7 +403,7 @@ def main():
 
     # 回测窗口滚动到当前日期
     today = datetime.now().strftime("%Y%m%d")
-    full_lo = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")  # 近2年
+    full_lo = (datetime.now() - timedelta(days=1080)).strftime("%Y%m%d")  # 近3年,覆盖更多市况
     full_hi = today
     # 近期窗口：最近 6 个月
     recent_lo = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
@@ -380,9 +427,9 @@ def main():
                   etf_hist, industry_hist)
     recent_days = _trading_days(history, recent_lo, full_hi)
     recent_title = f"近期窗口 {recent_lo[:4]}-{recent_lo[4:6]}~{full_hi[:4]}-{full_hi[4:6]}"
-    mom, fac, rps = _print_window(recent_title, history, recent_days,
-                                   etf_hist, industry_hist)
-    _save_ab(recent_title, mom, fac, rps)
+    mom, fac, rps, combo = _print_window(recent_title, history, recent_days,
+                                          etf_hist, industry_hist)
+    _save_ab(recent_title, mom, fac, rps, combo)
 
 
 if __name__ == "__main__":
