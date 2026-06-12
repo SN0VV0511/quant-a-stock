@@ -175,7 +175,8 @@ MIN_POSITION_RATIO = 0.3        # 最低仓位比例,低于此值视为空仓
 
 # ==================== ETF / 行业 RPS 轮动参数 ====================
 RPS_LOOKBACK_DAYS = 20          # RPS 回看周期(日频)
-RPS_MIN_SCORE = 85.0            # 入选最低相对强弱分位
+RPS_MIN_SCORE = 0.0             # 入选分位下限:小池子(ETF/行业)横截面分位会被高阈值卡死,
+                                # 改由"趋势确认+绝对正动量"过滤(见 rps_rotation),此处设 0 不额外卡分位
 RPS_TOP_N = 3                   # 每日最多持有/买入数量
 RPS_MIN_AVG_VOLUME = 500_000    # 20 日均量下限
 RPS_HISTORY_DAYS = 120          # RPS 拉取历史行情天数

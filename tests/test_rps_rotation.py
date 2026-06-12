@@ -72,3 +72,23 @@ def test_industry_index_rps_signals_do_not_generate_orders() -> None:
 
     assert [s["code"] for s in signals] == ["证券"]
     assert orders == []
+
+
+def test_small_pool_selects_top_n_not_blocked_by_percentile() -> None:
+    """回归 B2:小池子不应被高分位阈值卡死。
+
+    10 只均上涨且站上 MA20 的标的、top_n=3:旧逻辑按横截面分位 + min_rps=85
+    只能选出分位 >=85 的 2 只(分位最高也仅 ~89);新逻辑用"趋势+绝对正动量"
+    过滤,应按动量降序选满 3 只。
+    """
+    history = {f"S{i}": _hist(f"S{i}", 0.05 + i * 0.03) for i in range(10)}
+    ranked = calculate_rps_scores(history, lookback=20, top_n=3)
+    assert len(ranked) == 3
+    assert [r["code"] for r in ranked] == ["S9", "S8", "S7"]
+
+
+def test_downtrend_pool_selects_nothing() -> None:
+    """普跌池:全部下跌时绝对动量过滤应使其空仓避险(不被相对最强者诱导买入)。"""
+    history = {f"D{i}": _hist(f"D{i}", -0.02 - i * 0.02) for i in range(5)}
+    ranked = calculate_rps_scores(history, lookback=20, top_n=3)
+    assert ranked == []

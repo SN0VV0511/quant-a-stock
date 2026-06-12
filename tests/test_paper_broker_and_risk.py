@@ -322,3 +322,52 @@ def test_position_limit_uses_current_price_not_cost(tmp_path) -> None:
     # 旧成本口径 (3000+1300)/54795=7.8% 会错误放行。
     within, _ = pm.check_position_limit("600000", 1300, total_value=total_value)
     assert within is False
+
+
+def test_drawdown_deleverage_target_ratio() -> None:
+    """回撤熔断激活且仓位超 30% 时返回应削减比例;否则 0(A4)。"""
+    class _FakePortfolio:
+        def __init__(self, drawdown, cash, total):
+            self._dd, self._cash, self._total = drawdown, cash, total
+        def get_total_value(self, prices=None):
+            return self._total
+        def get_drawdown(self, value=None):
+            return self._dd
+        def get_cash(self):
+            return self._cash
+
+    # 回撤 7% 触发 + 仓位 (50000-20000)/50000=60% → 削减 (0.60-0.30)/0.60 = 0.5
+    assert RiskController().drawdown_deleverage_target_ratio(
+        _FakePortfolio(0.07, 20000.0, 50000.0)) == 0.5
+    # 回撤未触发(2%)→ 0
+    assert RiskController().drawdown_deleverage_target_ratio(
+        _FakePortfolio(0.02, 20000.0, 50000.0)) == 0.0
+    # 回撤触发但仓位已低于 30%(20%)→ 0
+    assert RiskController().drawdown_deleverage_target_ratio(
+        _FakePortfolio(0.07, 40000.0, 50000.0)) == 0.0
+
+
+def test_drawdown_deleverage_reduces_oversized_position(tmp_path) -> None:
+    """A4: 回撤熔断激活且仓位超限时,对存量同比例减仓(执行层集成测试)。"""
+    from live_runner import _handle_drawdown_deleverage
+
+    broker = _paper_broker(tmp_path)
+    # 直接构造高仓位 + 大回撤状态:成本100、现价80、300股;现金6000;峰值50000
+    # → 总值 6000+300*80=30000,回撤 (50000-30000)/50000=40%>6%,仓位 24000/30000=80%>30%
+    broker.portfolio.state["positions"]["600000"] = {
+        "name": "测试", "shares": 300, "total_qty": 300, "sellable_qty": 300,
+        "avg_cost": 100.0, "current_price": 80.0, "buy_date": "20260101",
+        "strategy_tag": "combo_trend", "buy_lots": [{"date": "20260101", "qty": 300}],
+    }
+    broker.portfolio.state["cash"] = 6000.0
+    broker.portfolio.state["peak_value"] = 50000.0
+    risk = RiskController()
+    recorder = EventRecorder(path=str(tmp_path / "events.jsonl"))
+    prices = {"600000": 80.0}
+    market_data = {"600000": {"current_price": 80.0, "prev_close": 81.0,
+                              "is_st": False, "is_suspended": False}}
+
+    _handle_drawdown_deleverage(broker, risk, prices, market_data, recorder, shared=SharedState())
+
+    remaining = broker.query_positions().get("600000", {}).get("shares", 0)
+    assert remaining < 300  # 已对存量减仓

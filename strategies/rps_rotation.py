@@ -108,8 +108,17 @@ def calculate_rps_scores(
     for i, row in enumerate(rows):
         row["rps"] = rps_scores[i]
 
-    selected = [r for r in rows if float(r["rps"]) >= min_rps and r["trend_ok"]]
-    selected.sort(key=lambda r: (float(r["rps"]), float(r["momentum"])), reverse=True)
+    # 小池子(如 10 只 ETF / 8 个行业)用横截面分位卡高阈值会几乎选不出标的:
+    # n=10 时最高分位也仅 ~89,min_rps=85 实际只能入选 2 只,与 top_n=3 矛盾。
+    # 改用"趋势确认(站上 MA20)+ 绝对正动量"作为入选门槛,普跌市自然空仓避险;
+    # 再按绝对动量排序取 top_n。min_rps 保留为可选分位下限(默认 0 时不额外过滤)。
+    selected = [
+        r for r in rows
+        if r["trend_ok"]
+        and float(r["momentum"]) > 0
+        and float(r["rps"]) >= min_rps
+    ]
+    selected.sort(key=lambda r: (float(r["momentum"]), float(r["rps"])), reverse=True)
     final = selected[:top_n]
     for i, row in enumerate(final):
         row["rank"] = i + 1

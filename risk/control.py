@@ -9,7 +9,7 @@ from datetime import datetime
 from config.settings import (
     INITIAL_CAPITAL, MAX_TOTAL_POSITION, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     CASH_BUFFER, DAILY_LOSS_THRESHOLD, MAX_DRAWDOWN_THRESHOLD, LOT_SIZE,
-    DRAWDOWN_RECOVERY_DAYS,
+    DRAWDOWN_RECOVERY_DAYS, DRAWDOWN_REDUCED_POSITION_LIMIT,
     is_etf, is_supported_trading_target, DEFAULT_UNIVERSE,
 )
 from trading.models import OrderIntent, RiskDecision
@@ -271,6 +271,32 @@ class RiskController:
             )
 
         return False, ""
+
+    def drawdown_deleverage_target_ratio(self, portfolio, current_prices=None):
+        """回撤熔断激活且持仓超目标时,返回应削减的持仓比例(0~1);否则 0。
+
+        与 should_reduce_position(仅拦截新买入)互补:本方法用于主动对**存量**
+        减仓止血——这是 A4 修复点。例:当前仓位 60%、目标上限
+        DRAWDOWN_REDUCED_POSITION_LIMIT=30%,返回 (0.60-0.30)/0.60 = 0.5,
+        即每个持仓按 50% 同比例削减(同比例减仓中性,不引入选股偏好)。
+
+        Args:
+            portfolio: 持仓管理器。
+            current_prices: 现价字典,按市值口径计算当前仓位。
+
+        Returns:
+            float: 需削减的持仓比例,0 表示无需减仓。
+        """
+        exceeded, _ = self.check_max_drawdown(portfolio)
+        if not exceeded:
+            return 0.0
+        total_value = portfolio.get_total_value(current_prices)
+        if total_value <= 0:
+            return 0.0
+        position_ratio = (total_value - portfolio.get_cash()) / total_value
+        if position_ratio <= DRAWDOWN_REDUCED_POSITION_LIMIT:
+            return 0.0
+        return round((position_ratio - DRAWDOWN_REDUCED_POSITION_LIMIT) / position_ratio, 4)
 
     def should_pause_strategy(self, strategy_name, recent_returns):
         """是否暂停某策略

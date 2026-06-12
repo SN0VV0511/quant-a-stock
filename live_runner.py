@@ -971,6 +971,7 @@ def watch_thread(
                 shared=shared,
                 combo=combo,
             )
+            _handle_drawdown_deleverage(broker, risk_ctrl, prices, market_data, recorder, shared=shared)
             _handle_candidate_entries(broker, shared, prices, loader, combo, risk_ctrl, market_data, recorder)
 
             if now.minute != last_snapshot_minute and now.minute % 5 == 0:
@@ -1175,6 +1176,57 @@ def _submit_exit_order(
     return report
 
 
+def _handle_drawdown_deleverage(
+    broker: PaperBrokerAdapter,
+    risk_ctrl: RiskController,
+    prices: dict[str, float],
+    market_data: dict[str, dict[str, Any]],
+    recorder: EventRecorder,
+    shared: SharedState | None = None,
+) -> None:
+    """回撤熔断激活时,对存量持仓按目标比例同比例减仓止血(A4)。
+
+    与风控"仅拦截新买入"互补:回撤超阈值时主动把总仓位降到
+    DRAWDOWN_REDUCED_POSITION_LIMIT。受 T+1/跌停限制,当轮减不动的部分留待
+    后续轮次(熔断锁存期间持续生效),避免一次性割肉冲击。
+    """
+    ratio = risk_ctrl.drawdown_deleverage_target_ratio(broker.portfolio, prices)
+    if ratio <= 0:
+        return
+    today = today_yyyymmdd()
+    for code, pos in list(broker.query_positions().items()):
+        if shared is not None and shared.is_exit_cooling_down(code):
+            continue
+        sellable = broker.portfolio.get_sellable_qty(code, today)
+        if sellable <= 0:
+            continue
+        total_qty = int(pos.get("total_qty", pos.get("shares", 0)) or 0)
+        reduce_qty = int((total_qty * ratio) // LOT_SIZE * LOT_SIZE)
+        reduce_qty = min(reduce_qty, sellable)
+        if reduce_qty < LOT_SIZE:
+            continue
+        price = prices.get(code) or pos.get("current_price") or pos.get("avg_cost", 0)
+        if not price or price <= 0:
+            continue
+        order = OrderIntent(
+            code=code,
+            name=str(pos.get("name", code)),
+            action="sell",
+            price=float(price),
+            shares=reduce_qty,
+            date=today,
+            strategy="回撤降仓",
+            strategy_tag=str(pos.get("strategy_tag", "combo_trend")),
+            reason="DRAWDOWN_DELEVERAGE",
+            source="watch_thread",
+            metadata={"deleverage_ratio": ratio},
+        )
+        recorder.record("drawdown_deleverage", {
+            "code": code, "reduce_qty": reduce_qty, "ratio": ratio,
+        })
+        _submit_exit_order(order, broker, risk_ctrl, market_data, recorder, shared)
+
+
 def _handle_candidate_entries(
     broker: PaperBrokerAdapter,
     shared: SharedState,
@@ -1294,6 +1346,18 @@ def _handle_candidate_entries(
 
             price = prices.get(code)
             if price is None or price <= 0:
+                continue
+
+            # B3: 补仓也必须通过 Combo 买入信号确认,不能只凭涨幅排名追高凑仓位
+            fill_hist = shared.get_hist(code)
+            if fill_hist is None or len(fill_hist) < 25:
+                fill_hist = loader.get_stock_data(normalize_code(code), days=60)
+                if fill_hist is not None:
+                    shared.update_hist(code, fill_hist)
+            if fill_hist is None or len(fill_hist) < 25:
+                continue
+            rt_hist = _build_realtime_hist(fill_hist, price, market_data.get(code))
+            if combo.check_realtime(rt_hist).get("signal") != "buy":
                 continue
 
             shares = broker.portfolio.rules.calc_lot_size(
