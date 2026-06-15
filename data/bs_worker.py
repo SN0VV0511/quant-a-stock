@@ -8,6 +8,7 @@
     query_all_stock <date>
     query_stock_basic <code>
     query_history <bs_code> <start> <end>
+    query_history_batch <start> <end> <bs_code> [bs_code...]
 
 输出: JSON 到 stdout
 """
@@ -15,9 +16,19 @@
 import contextlib
 import io
 import json
+import os
+import socket
 import sys
 
+# 必须在导入 baostock 前设置，确保其底层 socket 继承有限超时。
+socket.setdefaulttimeout(
+    float(os.getenv("BAOSTOCK_SOCKET_TIMEOUT_SECONDS", "8"))
+)
+
 import baostock as bs
+
+
+HISTORY_FIELDS = "date,open,high,low,close,volume,amount,preclose,pctChg"
 
 
 @contextlib.contextmanager
@@ -35,9 +46,11 @@ def _suppress_stdout():
 
 
 def _ensure_login():
-    """Login to BaoStock (suppressing its stdout noise)."""
+    """登录 BaoStock，失败时显式抛错。"""
     with _suppress_stdout():
-        bs.login()
+        result = bs.login()
+    if result.error_code != "0":
+        raise ConnectionError(f"BaoStock 登录失败: {result.error_code} {result.error_msg}")
 
 
 def cmd_login():
@@ -68,12 +81,12 @@ def cmd_query_stock_basic(code):
     return {"error_code": rs.error_code, "rows": rows}
 
 
-def cmd_query_history(bs_code, start, end):
-    _ensure_login()
+def _query_history(bs_code, start, end):
+    """在当前登录会话中查询一只股票历史行情。"""
     with _suppress_stdout():
         rs = bs.query_history_k_data_plus(
             bs_code,
-            "date,open,high,low,close,volume,amount,preclose,pctChg",
+            HISTORY_FIELDS,
             start_date=start,
             end_date=end,
             frequency="d",
@@ -82,7 +95,36 @@ def cmd_query_history(bs_code, start, end):
         rows = []
         while rs.error_code == "0" and rs.next():
             rows.append(rs.get_row_data())
-    return {"error_code": rs.error_code, "rows": rows}
+    return {
+        "error_code": rs.error_code,
+        "error_msg": getattr(rs, "error_msg", ""),
+        "rows": rows,
+    }
+
+
+def cmd_query_history(bs_code, start, end):
+    """登录后查询一只股票历史行情。"""
+    _ensure_login()
+    return _query_history(bs_code, start, end)
+
+
+def cmd_query_history_batch(start, end, *bs_codes):
+    """一次登录连续查询多只股票，消除逐股进程启动与登录开销。"""
+    if not bs_codes:
+        return {"results": {}}
+
+    _ensure_login()
+    results = {}
+    for bs_code in bs_codes:
+        try:
+            results[bs_code] = _query_history(bs_code, start, end)
+        except Exception as exc:
+            results[bs_code] = {
+                "error_code": "WORKER_ERROR",
+                "error_msg": str(exc),
+                "rows": [],
+            }
+    return {"results": results}
 
 
 # 扩展字段:含换手率/估值/ST/停牌,供小市值价值选股使用
@@ -120,6 +162,7 @@ COMMANDS = {
     "query_all_stock": cmd_query_all_stock,
     "query_stock_basic": cmd_query_stock_basic,
     "query_history": cmd_query_history,
+    "query_history_batch": cmd_query_history_batch,
     "query_history_ext": cmd_query_history_ext,
 }
 

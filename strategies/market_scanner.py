@@ -299,7 +299,7 @@ class MarketScanner:
 
         # 按成交量降序优先扫描活跃股,限制历史拉取数量上限
         pre_filtered.sort(key=lambda x: x["volume"], reverse=True)
-        if len(pre_filtered) > SCAN_MAX_HIST_FETCH:
+        if SCAN_MAX_HIST_FETCH > 0 and len(pre_filtered) > SCAN_MAX_HIST_FETCH:
             logger.info(f"粗筛后 {len(pre_filtered)} 只,取成交量前 {SCAN_MAX_HIST_FETCH} 只")
             pre_filtered = pre_filtered[:SCAN_MAX_HIST_FETCH]
 

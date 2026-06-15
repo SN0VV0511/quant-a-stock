@@ -24,6 +24,11 @@ import pandas as pd
 import numpy as np
 
 from config.settings import (
+    BAOSTOCK_HISTORY_BATCH_SIZE,
+    BAOSTOCK_HISTORY_BATCH_WORKERS,
+    BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
+    BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
+    BAOSTOCK_HISTORY_TIMEOUT_PER_STOCK_SECONDS,
     is_a_share_stock,
     is_etf,
     normalize_a_share_code,
@@ -219,6 +224,30 @@ def _fetch_tencent_quote_batch(
         except (IndexError, ValueError):
             logger.debug("腾讯行情响应行解析失败: %r", line[:200])
     return quotes
+
+
+def _history_rows_to_dataframe(rows: list[list[str]]) -> pd.DataFrame | None:
+    """将 BaoStock 历史行情行转换为统一 DataFrame。"""
+    if not rows:
+        return None
+
+    columns = [
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "preclose",
+        "pctChg",
+    ]
+    frame = pd.DataFrame(rows, columns=columns)
+    for column in columns[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if frame.empty or frame["close"].iloc[-1] <= 0:
+        return None
+    return frame
 
 
 def _normalize_compact_date(value: object) -> str:
@@ -736,7 +765,10 @@ class AKDataLoader:
             return None
 
         cache_key = f"hist_{raw_code}_{days}"
-        cached = self._read_cache(cache_key)
+        cached = self._read_cache(
+            cache_key,
+            max_age=BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
+        )
         if cached is not None:
             return cached
 
@@ -764,15 +796,8 @@ class AKDataLoader:
                 logger.warning("get_stock_history(%s) BaoStock 错误: %s", code, result.get("error_code"))
                 return None
 
-            rows = result.get("rows", [])
-            if not rows:
-                return None
-
-            df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"])
-            for col in ["open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            if len(df) == 0 or df["close"].iloc[-1] <= 0:
+            df = _history_rows_to_dataframe(result.get("rows", []))
+            if df is None:
                 return None
 
             self._write_cache(cache_key, df)
@@ -780,35 +805,191 @@ class AKDataLoader:
 
         return None
 
-    def get_batch_history(self, codes, days=120, max_batch=5000, timeout_per_stock=30):
-        """批量获取历史数据（ThreadPoolExecutor 并发加载）"""
-        result = {}
-        total = min(len(codes), max_batch)
-        target_codes = codes[:max_batch]
+    def get_batch_history(
+        self,
+        codes: list[str],
+        days: int = 120,
+        max_batch: int = 5000,
+        timeout_per_stock: int = BAOSTOCK_HISTORY_TIMEOUT_PER_STOCK_SECONDS,
+    ) -> dict[str, pd.DataFrame]:
+        """批量加载历史数据，缓存命中后按组复用 BaoStock 登录会话。
 
-        # 先确保登录态，避免 4 个 worker 同时抢 _bs_lock 导致死锁
-        self._ensure_login()
+        每个子进程只登录一次并连续查询一组股票，避免旧实现为每只股票重复
+        启动 Python、登录 BaoStock。主进程只并发少量批次，并在每批完成后
+        输出进度，便于区分慢查询与真正卡死。
+        """
+        started_at = time.monotonic()
+        target_codes: list[str] = []
+        seen_codes: set[str] = set()
+        for code in codes[:max_batch]:
+            try:
+                normalized = normalize_a_share_code(str(code))
+            except ValueError:
+                continue
+            if normalized not in seen_codes:
+                seen_codes.add(normalized)
+                target_codes.append(normalized)
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            future_map = {
-                executor.submit(self.get_stock_history, code, days): code
-                for code in target_codes
-            }
-            done_count = 0
-            batch_timeout = max(60, len(target_codes) * timeout_per_stock // 4)
-            for future in as_completed(future_map, timeout=batch_timeout):
-                code = future_map[future]
-                done_count += 1
+        result: dict[str, pd.DataFrame] = {}
+        missing: list[tuple[str, str]] = []
+        stale_cache_count = 0
+        compatible_cache_count = 0
+        compatible_cache_keys: dict[str, list[tuple[int, str]]] = {}
+        try:
+            for entry in os.scandir(self.cache_dir):
+                if not entry.is_file() or not entry.name.startswith("hist_"):
+                    continue
+                if not entry.name.endswith(".pkl"):
+                    continue
+                cache_name = entry.name[len("hist_") : -len(".pkl")]
+                raw_code, separator, cached_days_text = cache_name.rpartition("_")
+                if not separator or not cached_days_text.isdigit():
+                    continue
                 try:
-                    df = future.result(timeout=5)
-                    if df is not None and not df.empty:
-                        result[code] = df
-                except Exception as e:
-                    logger.debug(f"get_batch_history({code}) 失败: {e}")
-                if done_count % 100 == 0:
-                    logger.info(f"历史数据进度: {done_count}/{total}")
+                    normalized = normalize_a_share_code(raw_code)
+                except ValueError:
+                    continue
+                cached_days = int(cached_days_text)
+                if cached_days >= days:
+                    compatible_cache_keys.setdefault(normalized, []).append(
+                        (cached_days, f"hist_{raw_code}_{cached_days}")
+                    )
+        except OSError as exc:
+            logger.warning("扫描历史缓存目录失败: %s", exc)
 
-        logger.info(f"批量历史数据完成: {len(result)}/{total} 只成功")
+        for index, code in enumerate(target_codes, start=1):
+            cache_key = f"hist_{code}_{days}"
+            cached = self._read_cache(
+                cache_key,
+                max_age=BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
+            )
+            if cached is None:
+                cached = self._read_cache(
+                    cache_key,
+                    max_age=BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
+                )
+                if cached is not None:
+                    stale_cache_count += 1
+            if cached is None:
+                candidates = sorted(
+                    compatible_cache_keys.get(code, []),
+                    reverse=True,
+                )
+                for _cached_days, candidate_key in candidates:
+                    if candidate_key == cache_key:
+                        continue
+                    candidate = self._read_cache(
+                        candidate_key,
+                        max_age=BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
+                    )
+                    if candidate is not None and not candidate.empty:
+                        cached = candidate
+                        compatible_cache_count += 1
+                        break
+            if cached is not None and not cached.empty:
+                result[code] = cached
+            else:
+                missing.append((code, to_baostock_code(code)))
+            if index % 500 == 0:
+                logger.info(
+                    "历史缓存检查进度: %d/%d，命中 %d 只",
+                    index,
+                    len(target_codes),
+                    len(result),
+                )
+
+        logger.info(
+            "历史缓存检查完成: 总计 %d 只，命中 %d 只（旧缓存 %d，兼容长周期缓存 %d），待下载 %d 只，耗时 %.2fs",
+            len(target_codes),
+            len(result),
+            stale_cache_count,
+            compatible_cache_count,
+            len(missing),
+            time.monotonic() - started_at,
+        )
+        if not missing or not self._bs_available:
+            return result
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
+        batch_size = max(1, BAOSTOCK_HISTORY_BATCH_SIZE)
+        batches = [
+            missing[index : index + batch_size]
+            for index in range(0, len(missing), batch_size)
+        ]
+        worker_count = min(max(1, BAOSTOCK_HISTORY_BATCH_WORKERS), len(batches))
+        logger.info(
+            "开始批量下载历史行情: %d 只，%d 批，每批 %d 只，%d 路并发",
+            len(missing),
+            len(batches),
+            batch_size,
+            worker_count,
+        )
+
+        failed_codes: list[str] = []
+        processed = 0
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="baostock-history",
+        ) as executor:
+            future_map = {}
+            for batch_index, batch in enumerate(batches, start=1):
+                bs_codes = [bs_code for _code, bs_code in batch]
+                batch_timeout = max(30, len(batch) * max(1, timeout_per_stock))
+                future = executor.submit(
+                    _run_bs_with_subprocess,
+                    "query_history_batch",
+                    start,
+                    end,
+                    *bs_codes,
+                    timeout=batch_timeout,
+                )
+                future_map[future] = (batch_index, batch)
+
+            for future in as_completed(future_map):
+                batch_index, batch = future_map[future]
+                processed += len(batch)
+                try:
+                    payload = future.result()
+                except Exception as exc:
+                    payload = None
+                    logger.warning(
+                        "历史行情第 %d/%d 批执行异常: %s",
+                        batch_index,
+                        len(batches),
+                        exc,
+                        exc_info=True,
+                    )
+
+                batch_results = payload.get("results", {}) if payload else {}
+                for code, bs_code in batch:
+                    item = batch_results.get(bs_code)
+                    if not item or item.get("error_code") != "0":
+                        failed_codes.append(code)
+                        continue
+                    frame = _history_rows_to_dataframe(item.get("rows", []))
+                    if frame is None:
+                        failed_codes.append(code)
+                        continue
+                    result[code] = frame
+                    self._write_cache(f"hist_{code}_{days}", frame)
+
+                logger.info(
+                    "历史数据进度: %d/%d 只，成功 %d 只，失败 %d 只，耗时 %.1fs",
+                    processed,
+                    len(missing),
+                    len(result),
+                    len(failed_codes),
+                    time.monotonic() - started_at,
+                )
+
+        logger.info(
+            "批量历史数据完成: %d/%d 只成功，远端失败 %d 只，总耗时 %.2fs",
+            len(result),
+            len(target_codes),
+            len(failed_codes),
+            time.monotonic() - started_at,
+        )
         return result
 
     def get_realtime_batch(self, codes):
@@ -1276,7 +1457,7 @@ class AKDataLoader:
     def _cache_path(self, key):
         return os.path.join(self.cache_dir, f"{key}.pkl")
 
-    def _read_cache(self, key):
+    def _read_cache(self, key, max_age=None):
         path = self._cache_path(key)
         if not os.path.exists(path):
             return None
@@ -1285,7 +1466,8 @@ class AKDataLoader:
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
                     meta = json.load(f)
-                if time.time() - meta.get("ts", 0) > self.cache_ttl:
+                effective_max_age = self.cache_ttl if max_age is None else max_age
+                if time.time() - meta.get("ts", 0) > effective_max_age:
                     return None
             return pd.read_pickle(path)
         except Exception:

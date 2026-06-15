@@ -119,7 +119,24 @@ SCAN_MIN_VOLUME = 1_000_000    # 实时成交量下限(股),排除僵尸股
 SCAN_MIN_AVG_VOLUME = 500_000  # 20 日均量下限(股)
 SCAN_MIN_AVG_AMOUNT = 30_000_000  # 20 日平均成交额下限(元),模拟盘默认 3000 万
 SCAN_LIMIT_PCT = 9.8           # 实时涨跌幅绝对值达此值视为涨跌停,剔除
-SCAN_MAX_HIST_FETCH = 2000     # 粗筛后最多拉取历史数据的标的数量
+# 0 表示扫描实时粗筛后的全部股票；可通过环境变量设置正整数临时限流。
+SCAN_MAX_HIST_FETCH = int(os.getenv("SCAN_MAX_HIST_FETCH", "0"))
+# 全盘历史加载不能按股票反复启动并登录 BaoStock。以下参数控制“单进程一次登录、
+# 连续查询一批股票”的并发模型，可通过环境变量按机器和网络情况调整。
+BAOSTOCK_HISTORY_BATCH_SIZE = int(os.getenv("BAOSTOCK_HISTORY_BATCH_SIZE", "25"))
+BAOSTOCK_HISTORY_BATCH_WORKERS = int(os.getenv("BAOSTOCK_HISTORY_BATCH_WORKERS", "8"))
+BAOSTOCK_HISTORY_TIMEOUT_PER_STOCK_SECONDS = int(
+    os.getenv("BAOSTOCK_HISTORY_TIMEOUT_PER_STOCK_SECONDS", "8")
+)
+# 日线在盘中无需每小时重复下载；6 小时覆盖一个交易时段，次日开盘前会自然过期。
+BAOSTOCK_HISTORY_CACHE_TTL_SECONDS = int(
+    os.getenv("BAOSTOCK_HISTORY_CACHE_TTL_SECONDS", "21600")
+)
+# 全盘扫描允许使用有限期旧缓存，避免 BaoStock 不稳定时阻塞数千只股票。
+# 实时价格仍由腾讯接口提供；默认 7 天可覆盖周末和短假期。
+BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS = int(
+    os.getenv("BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS", "604800")
+)
 MAX_PRICE_MA20_RATIO = 1.18
 MAX_PRICE_MA60_RATIO = 1.35
 MAX_5D_GAIN = 0.25

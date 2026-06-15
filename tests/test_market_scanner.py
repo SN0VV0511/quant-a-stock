@@ -3,7 +3,8 @@
 import numpy as np
 import pandas as pd
 
-from strategies.market_scanner import score_candidates, _zscore
+from strategies import market_scanner
+from strategies.market_scanner import MarketScanner, score_candidates, _zscore
 
 
 def _hist(trend_pct, n=70, volume=4_000_000, base=10.0):
@@ -70,3 +71,40 @@ def test_zscore_standardizes():
     out = _zscore(np.array([1.0, 2.0, 3.0]))
     assert abs(out.mean()) < 1e-9
     assert out[0] < out[1] < out[2]
+
+
+def test_full_market_scan_does_not_truncate_history_targets(monkeypatch):
+    """全盘模式下实时粗筛通过的股票必须全部进入历史加载。"""
+
+    class FakeLoader:
+        """记录扫描器传入历史加载阶段的完整代码列表。"""
+
+        def __init__(self):
+            self.history_codes = []
+
+        def get_realtime_quotes(self, codes):
+            return {
+                code: {
+                    "price": 10.0,
+                    "pct_change": 1.0,
+                    "volume": 2_000_000,
+                }
+                for code in codes
+            }
+
+        def get_batch_history(self, codes, days):
+            self.history_codes = list(codes)
+            return {}
+
+    loader = FakeLoader()
+    stocks = [
+        {"code": f"60{index:04d}", "name": f"股票{index}"}
+        for index in range(25)
+    ]
+    monkeypatch.setattr(market_scanner, "SCAN_MAX_HIST_FETCH", 0)
+    monkeypatch.setattr("config.settings.SCAN_ENABLE_FUNDAMENTAL_FILTER", False)
+
+    result = MarketScanner(loader=loader).scan(stocks, top_n=5)
+
+    assert result == []
+    assert loader.history_codes == [stock["code"] for stock in stocks]
