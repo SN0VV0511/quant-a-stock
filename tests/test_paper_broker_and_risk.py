@@ -2,8 +2,8 @@
 
 import pytest
 
-from config.settings import DRAWDOWN_RECOVERY_DAYS
-from live_runner import SharedState, _handle_position_exits
+from config.settings import DRAWDOWN_RECOVERY_DAYS, EXIT_LIMIT_DOWN_COOLDOWN_SECONDS
+from live_runner import SharedState, _handle_position_exits, _submit_exit_order
 from risk.control import RiskController
 
 from trading.brokers import PaperBrokerAdapter, QmtBrokerAdapter
@@ -504,3 +504,63 @@ def test_drawdown_deleverage_reduces_oversized_position(tmp_path) -> None:
 
     remaining = broker.query_positions().get("600000", {}).get("shares", 0)
     assert remaining < 300  # 已对存量减仓
+
+
+def test_limit_down_exit_cooldown_is_short_not_until_close(tmp_path) -> None:
+    """跌停拒单后冷却应是短周期(EXIT_LIMIT_DOWN_COOLDOWN_SECONDS),而非锁到收盘。
+
+    回归真实事故:第一天买入 T+1 锁定,第二天跌停无法卖出,但下午跌停打开。
+    旧实现 _submit_exit_order 对跌停拒单调 set_exit_cooldown_until_close(锁到 15:00),
+    导致上午检测到跌停后下午开口子时仍被冷却跳过、错过止损 → 亏损放大。
+
+    修复后:跌停冷却用 set_exit_cooldown(seconds=EXIT_LIMIT_DOWN_COOLDOWN_SECONDS),
+    冷却结束后下一轮盯盘会重新检测跌停是否已打开。
+    """
+    import time as _time
+    from datetime import timedelta
+    from config.time_utils import now_local
+
+    broker = _paper_broker(tmp_path)
+    risk = RiskController()
+    shared = SharedState()
+    recorder = EventRecorder(path=str(tmp_path / "events.jsonl"))
+    # 建立持仓(T+1 已解锁,可在次日卖出)。
+    broker.place_order(OrderIntent(
+        code="603773", action="buy", price=100.0, shares=100,
+        name="沃格光电", strategy="测试", date="20260527",
+    ))
+
+    # 构造跌停:现价 = 昨收 * 0.9,触发 check_price_limit 返回 limit_type="跌停"。
+    sell_order = OrderIntent(
+        code="603773", action="sell", price=90.0, shares=100,
+        name="沃格光电", strategy="止损", date="20260528",
+        reason="CATASTROPHIC_STOP_LOSS",
+    )
+    market_data = {"603773": {"current_price": 90.0, "prev_close": 100.0,
+                              "is_st": False, "is_suspended": False}}
+
+    report = _submit_exit_order(sell_order, broker, risk, market_data, recorder, shared)
+
+    # 跌停 → 卖单被风控拒绝,report 为 None,进入冷却。
+    assert report is None, "跌停时应被风控拒绝,不应成交"
+    assert shared.is_exit_cooling_down("603773") is True
+
+    # 关键断言:冷却截止时间应在 ~现在+EXIT_LIMIT_DOWN_COOLDOWN_SECONDS 附近,
+    # 而不是当天 15:00 收盘。读取 rejected_exits 的冷却截止时间戳校验。
+    cooldown_deadline = shared.rejected_exits.get("603773", 0)
+    now_ts = _time.time()
+    # 冷却时长应在 [EXIT_LIMIT_DOWN_COOLDOWN_SECONDS - 10, EXIT_LIMIT_DOWN_COOLDOWN_SECONDS + 10] 内
+    # (留 10s 容差应对测试执行耗时)。
+    cooldown_seconds = cooldown_deadline - now_ts
+    assert cooldown_seconds <= EXIT_LIMIT_DOWN_COOLDOWN_SECONDS + 10, (
+        f"跌停冷却时长 {cooldown_seconds:.0f}s 过长,应≈{EXIT_LIMIT_DOWN_COOLDOWN_SECONDS}s,不得锁到收盘"
+    )
+    # 反向验证:绝不能锁到当天收盘(15:00)。若锁到收盘,deadline ≈ 当天15:00时间戳,
+    # 远大于 now + EXIT_LIMIT_DOWN_COOLDOWN_SECONDS。
+    close_today = now_local().replace(hour=15, minute=0, second=0, microsecond=0)
+    if now_local() < close_today:
+        # 当天还没收盘:锁到收盘的 deadline 应 == close_today 时间戳,
+        # 我们的 deadline 必须明显小于它(否则就是锁到收盘的旧 bug)。
+        assert cooldown_deadline < close_today.timestamp() - 60, (
+            "跌停冷却被锁到当天收盘,下午开口子时仍会被跳过、错过止损"
+        )

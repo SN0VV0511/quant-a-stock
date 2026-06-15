@@ -43,6 +43,7 @@ from config.settings import (  # noqa: E402
     MIN_POSITION_RATIO,
     REBUY_COOLDOWN_SECONDS,
     ENTRY_INTERVAL_SECONDS,
+    EXIT_LIMIT_DOWN_COOLDOWN_SECONDS,
     REPORT_DIR,
     RPS_HISTORY_DAYS,
     RPS_STATE_FILE,
@@ -1168,11 +1169,18 @@ def _submit_exit_order(
     recorder: EventRecorder,
     shared: SharedState | None,
 ) -> ExecutionReport | None:
-    """提交卖出订单，并在风控拒绝时进入冷却期。跌停等极端情况冷却到收盘。"""
+    """提交卖出订单，并在风控拒绝时进入冷却期。
+
+    跌停冷却用较长但有限的时间(默认 EXIT_LIMIT_DOWN_COOLDOWN_SECONDS=300s),
+    而非锁到收盘。原因:A 股跌停盘中可能打开,旧实现 set_exit_cooldown_until_close
+    会把"早晨瞬时跌停"当成"全天跌停",下午跌停打开时仍被冷却跳过 → 错过止损。
+    改为短周期重试后,每 EXIT_LIMIT_DOWN_COOLDOWN_SECONDS 秒重新检测一次,
+    跌停一旦打开即可在下一轮盯盘止损成交。
+    """
     report, reject_reason = _submit_order(order, broker, risk_ctrl, market_data, recorder)
     if report is None and shared is not None:
         if "跌停" in reject_reason:
-            shared.set_exit_cooldown_until_close(order.code)
+            shared.set_exit_cooldown(order.code, seconds=EXIT_LIMIT_DOWN_COOLDOWN_SECONDS)
         else:
             shared.set_exit_cooldown(order.code)
     return report

@@ -65,6 +65,11 @@ DRAWDOWN_RECOVERY_DAYS = 2
 REBUY_COOLDOWN_SECONDS = 0      # 0=当天不再买回(收盘后自动重置)
 ENTRY_INTERVAL_SECONDS = int(os.getenv("ENTRY_INTERVAL_SECONDS", "300"))  # 买入间隔:每笔建仓至少间隔5分钟,避免一分钟打满仓位
 
+# 卖出被跌停拒绝后的冷却时间(秒)。A 股跌停盘中可能打开,冷却结束后下一轮
+# 盯盘会重新检测跌停状态;一旦打开即可止损成交。旧实现锁到收盘会把"早晨
+# 瞬时跌停"当成全天跌停,导致下午开口子时仍被冷却跳过、错过止损。
+EXIT_LIMIT_DOWN_COOLDOWN_SECONDS = int(os.getenv("EXIT_LIMIT_DOWN_COOLDOWN_SECONDS", "300"))
+
 # ==================== 策略参数(集中管理,便于回测调参) ====================
 # 择时:止损止盈(live_runner 持仓退出逻辑读取)
 STOP_LOSS_PCT = 0.07            # 固定止损线:亏损达 7% 离场
