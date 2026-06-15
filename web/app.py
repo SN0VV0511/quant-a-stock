@@ -281,6 +281,12 @@ class QuantHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
 
+        # 兼容反向代理的 /quantify 前缀:Vite base="/quantify/" 构建的产物引用
+        # 的是 /quantify/assets/...,本地直接访问时后端路由(/assets/、/api/)无该前缀,
+        # 这里统一剥离,使本地直连和反向代理部署都能命中路由。
+        if path.startswith("/quantify/"):
+            path = path[len("/quantify"):]
+
         # 登录页不需要认证（优先 React SPA）
         if path == "/login":
             return self._serve_spa("login.html")
@@ -323,6 +329,8 @@ class QuantHandler(SimpleHTTPRequestHandler):
         """支持静态资源与 SPA 的 HEAD 检查，避免默认文件服务绕过自定义路由。"""
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/quantify/"):
+            path = path[len("/quantify"):]
 
         if path.startswith("/assets/"):
             return self._serve_static_asset(path, write_body=False)
@@ -349,6 +357,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         global _DASHBOARD_PASSWORD_HASH
         parsed = urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/quantify/"):
+            path = path[len("/quantify"):]
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len) if content_len > 0 else b"{}"
         try:
@@ -356,7 +367,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         except json.JSONDecodeError:
             data = {}
 
-        if parsed.path == "/api/login":
+        if path == "/api/login":
             pwd = data.get("password", "")
             if hashlib.sha256(pwd.encode()).hexdigest() == _DASHBOARD_PASSWORD_HASH:
                 self.send_response(200)
@@ -369,7 +380,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 self._json_response({"success": False, "error": "密码错误"}, status=401)
             return
 
-        if parsed.path == "/api/logout":
+        if path == "/api/logout":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -381,13 +392,13 @@ class QuantHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True}).encode())
             return
 
-        if parsed.path == "/api/scan/trigger":
+        if path == "/api/scan/trigger":
             if not self._require_api_auth():
                 return
             self._json_response(self._api_scan_trigger())
             return
 
-        if parsed.path == "/api/change-password":
+        if path == "/api/change-password":
             # 不要求认证：未登录状态下也可用旧密码修改新密码
             old_pwd = data.get("old_password", "")
             new_pwd = data.get("new_password", "")
