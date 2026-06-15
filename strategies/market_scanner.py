@@ -7,6 +7,7 @@
 """
 
 import logging
+import time
 
 import pandas as pd
 import numpy as np
@@ -233,8 +234,20 @@ class MarketScanner:
         Returns:
             list of dict: 排名后的股票信息
         """
+        scan_started_at = time.monotonic()
         if stock_list is None:
-            stock_list = self.loader.get_all_stocks()
+            stage_started_at = time.monotonic()
+            logger.info("扫描阶段 1/3: 加载股票池")
+            try:
+                stock_list = self.loader.get_all_stocks()
+            except Exception:
+                logger.error("扫描阶段 1/3 加载股票池失败", exc_info=True)
+                raise
+            logger.info(
+                "扫描阶段 1/3 完成: %d 只，耗时 %.2fs",
+                len(stock_list),
+                time.monotonic() - stage_started_at,
+            )
 
         stock_list = [
             stock for stock in stock_list
@@ -245,8 +258,18 @@ class MarketScanner:
         # 批量获取实时行情(腾讯接口)。实时行情仅用于"粗筛"以减少历史数据拉取量,
         # 不参与最终动量打分——打分统一用历史复权口径,避免量纲/复权不一致。
         codes = [s["code"] for s in stock_list]
-        quotes = self.loader.get_realtime_quotes(codes)
-        logger.info(f"获取到 {len(quotes)} 只实时行情")
+        stage_started_at = time.monotonic()
+        logger.info("扫描阶段 2/3: 获取 %d 只实时行情", len(codes))
+        try:
+            quotes = self.loader.get_realtime_quotes(codes)
+        except Exception:
+            logger.error("扫描阶段 2/3 获取实时行情失败", exc_info=True)
+            raise
+        logger.info(
+            "扫描阶段 2/3 完成: 获取到 %d 只实时行情，耗时 %.2fs",
+            len(quotes),
+            time.monotonic() - stage_started_at,
+        )
 
         pre_filtered = []
         for stock in stock_list:
@@ -289,7 +312,21 @@ class MarketScanner:
         fetch_codes = [s["code"] for s in pre_filtered]
         name_map = {s["code"]: s["name"] for s in pre_filtered}
         logger.info(f"开始批量加载 {len(fetch_codes)} 只股票历史数据...")
-        history_map = self.loader.get_batch_history(fetch_codes, days=max(momentum_period + 30, 260))
+        stage_started_at = time.monotonic()
+        logger.info("扫描阶段 3/3: 加载 %d 只历史行情", len(fetch_codes))
+        try:
+            history_map = self.loader.get_batch_history(
+                fetch_codes,
+                days=max(momentum_period + 30, 260),
+            )
+        except Exception:
+            logger.error("扫描阶段 3/3 加载历史行情失败", exc_info=True)
+            raise
+        logger.info(
+            "扫描阶段 3/3 完成: 获取 %d 只历史行情，耗时 %.2fs",
+            len(history_map),
+            time.monotonic() - stage_started_at,
+        )
 
         final = score_candidates(
             history_map,
@@ -298,7 +335,12 @@ class MarketScanner:
             name_map=name_map,
         )
 
-        logger.info(f"扫描完成: 有效 {len(history_map)} 只,筛选出 {len(final)} 只")
+        logger.info(
+            "扫描完成: 有效 %d 只，筛选出 %d 只，总耗时 %.2fs",
+            len(history_map),
+            len(final),
+            time.monotonic() - scan_started_at,
+        )
         return final
 
 

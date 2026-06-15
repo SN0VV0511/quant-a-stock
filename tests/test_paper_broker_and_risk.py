@@ -1,9 +1,15 @@
 """虚拟 Broker 与风控集成测试。"""
 
+import pandas as pd
 import pytest
 
 from config.settings import DRAWDOWN_RECOVERY_DAYS, EXIT_LIMIT_DOWN_COOLDOWN_SECONDS
-from live_runner import SharedState, _handle_position_exits, _submit_exit_order
+from live_runner import (
+    SharedState,
+    _handle_position_exits,
+    _load_exit_history,
+    _submit_exit_order,
+)
 from risk.control import RiskController
 
 from trading.brokers import PaperBrokerAdapter, QmtBrokerAdapter
@@ -163,6 +169,22 @@ def test_same_day_exit_rejection_enters_cooldown(tmp_path) -> None:
     assert shared.is_exit_cooling_down("603773") is True
     assert first_event_count == 2
     assert second_event_count == first_event_count
+
+
+def test_exit_history_falls_back_to_stock_history() -> None:
+    """退出检查应兼容仅实现旧版 get_stock_history 的 loader。"""
+
+    class LegacyLoader:
+        """仅提供旧版个股历史接口。"""
+
+        def get_stock_history(self, code: str, days: int):
+            return pd.DataFrame({"code": [code], "days": [days]})
+
+    history = _load_exit_history(LegacyLoader(), "sh600519", 60)
+
+    assert history is not None
+    assert history.iloc[0].to_dict() == {"code": "600519", "days": 60}
+    assert _load_exit_history(object(), "600519", 60) is None
 
 
 def test_paper_broker_buy_and_next_day_sell(tmp_path) -> None:

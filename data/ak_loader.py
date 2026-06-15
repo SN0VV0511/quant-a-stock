@@ -55,6 +55,9 @@ socket.setdefaulttimeout(30)
 _BS_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bs_worker.py")
 _BS_SUBPROCESS_TIMEOUT_SECONDS = 15
 _BS_UNIVERSE_TIMEOUT_SECONDS = 5
+_TENCENT_BATCH_SIZE = 100
+_TENCENT_MAX_WORKERS = 6
+_TENCENT_REQUEST_TIMEOUT_SECONDS = 5
 
 
 def _reap_process(proc: subprocess.Popen[bytes], command: str) -> None:
@@ -149,6 +152,73 @@ def _require_akshare():
     """确保 AKShare 依赖已安装。"""
     if ak is None:
         raise ImportError("缺少 akshare 依赖，请先执行: pip install -r requirements.txt")
+
+
+def _fetch_tencent_quote_batch(
+    tencent_codes: list[str],
+    timeout: float = _TENCENT_REQUEST_TIMEOUT_SECONDS,
+) -> dict[str, dict[str, float | str]]:
+    """请求并解析一批腾讯实时行情。
+
+    Args:
+        tencent_codes: 腾讯格式证券代码列表，例如 ``sh600519``。
+        timeout: 单次 HTTP 请求超时秒数。
+
+    Returns:
+        以六位证券代码为键的实时行情字典。
+
+    Raises:
+        OSError: 网络连接或读取失败。
+        UnicodeError: 响应编码异常。
+    """
+    batch_str = ",".join(tencent_codes)
+    url = f"https://qt.gtimg.cn/q={batch_str}"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    response = urllib.request.urlopen(request, timeout=timeout)
+    try:
+        data = response.read().decode("gbk")
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+    quotes: dict[str, dict[str, float | str]] = {}
+    for line in data.strip().split(";"):
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+
+        try:
+            parts = line.split('"')[1].split("~")
+            if len(parts) < 40:
+                continue
+
+            code = parts[2]
+            name = parts[1] if len(parts) > 1 else ""
+            price = float(parts[3]) if parts[3] else 0
+            if price <= 0:
+                continue
+
+            prev_close = float(parts[4]) if parts[4] else price
+            open_price = float(parts[5]) if parts[5] else price
+            volume = float(parts[6]) if parts[6] else 0
+            high = float(parts[33]) if parts[33] else price
+            low = float(parts[34]) if parts[34] else price
+            change_pct = float(parts[32]) if parts[32] else 0
+
+            quotes[code] = {
+                "name": name,
+                "price": price,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "prev_close": prev_close,
+                "volume": volume * 100,
+                "pct_change": change_pct,
+            }
+        except (IndexError, ValueError):
+            logger.debug("腾讯行情响应行解析失败: %r", line[:200])
+    return quotes
 
 
 def _normalize_compact_date(value: object) -> str:
@@ -582,65 +652,78 @@ class AKDataLoader:
             logger.info("没有可请求的沪深 A 股实时行情代码")
             return {}
 
-        quotes = {}
+        batches = [
+            tencent_codes[index : index + _TENCENT_BATCH_SIZE]
+            for index in range(0, len(tencent_codes), _TENCENT_BATCH_SIZE)
+        ]
+        worker_count = min(_TENCENT_MAX_WORKERS, len(batches))
+        started_at = time.monotonic()
+        logger.info(
+            "开始获取腾讯实时行情: %d 只，%d 批，%d 路并发，单批超时 %ds",
+            len(tencent_codes),
+            len(batches),
+            worker_count,
+            _TENCENT_REQUEST_TIMEOUT_SECONDS,
+        )
 
-        # 批量查询（每批 100 个）
-        batch_size = 100
-        for i in range(0, len(tencent_codes), batch_size):
-            batch = tencent_codes[i:i + batch_size]
-            batch_str = ",".join(batch)
+        quotes: dict[str, dict[str, float | str]] = {}
+        failures: list[str] = []
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="tencent-quotes",
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    _fetch_tencent_quote_batch,
+                    batch,
+                    _TENCENT_REQUEST_TIMEOUT_SECONDS,
+                ): (batch_index, batch)
+                for batch_index, batch in enumerate(batches, start=1)
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                batch_index, batch = future_map[future]
+                completed += 1
+                try:
+                    quotes.update(future.result())
+                except Exception as exc:
+                    failures.append(f"第{batch_index}批({len(batch)}只): {exc}")
+                    logger.warning(
+                        "腾讯行情第 %d/%d 批失败: %s",
+                        batch_index,
+                        len(batches),
+                        exc,
+                        exc_info=len(failures) == 1,
+                    )
 
-            try:
-                url = f"https://qt.gtimg.cn/q={batch_str}"
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                resp = urllib.request.urlopen(req, timeout=15)
-                data = resp.read().decode("gbk")
+                if completed == len(batches) or completed % 5 == 0:
+                    logger.info(
+                        "腾讯行情进度: %d/%d 批，已解析 %d 只，失败 %d 批",
+                        completed,
+                        len(batches),
+                        len(quotes),
+                        len(failures),
+                    )
 
-                for line in data.strip().split(";"):
-                    line = line.strip()
-                    if not line or "=" not in line:
-                        continue
-
-                    try:
-                        parts = line.split('"')[1].split("~")
-                        if len(parts) < 40:
-                            continue
-
-                        code = parts[2]
-                        name = parts[1] if len(parts) > 1 else ""
-                        price = float(parts[3]) if parts[3] else 0
-                        if price <= 0:
-                            continue
-
-                        prev_close = float(parts[4]) if parts[4] else price
-                        open_price = float(parts[5]) if parts[5] else price
-                        volume = float(parts[6]) if parts[6] else 0  # 手
-                        high = float(parts[33]) if parts[33] else price
-                        low = float(parts[34]) if parts[34] else price
-                        change_pct = float(parts[32]) if parts[32] else 0
-
-                        quotes[code] = {
-                            "name": name,
-                            "price": price,
-                            "open": open_price,
-                            "high": high,
-                            "low": low,
-                            "prev_close": prev_close,
-                            "volume": volume * 100,  # 转为股
-                            "pct_change": change_pct,
-                        }
-                    except (IndexError, ValueError):
-                        continue
-
-            except Exception as e:
-                logger.warning(f"腾讯行情批次 {i//batch_size} 失败: {e}")
-                time.sleep(1)
-                continue
-
-            if i > 0 and i % 500 == 0:
-                logger.info(f"已获取 {i}/{len(tencent_codes)} 行情")
-
-        logger.info(f"获取实时行情: {len(quotes)} 只")
+        elapsed = time.monotonic() - started_at
+        if failures:
+            logger.warning(
+                "腾讯实时行情部分失败: %d/%d 批，耗时 %.2fs；首个错误: %s",
+                len(failures),
+                len(batches),
+                elapsed,
+                failures[0],
+            )
+        if len(failures) == len(batches):
+            raise ConnectionError(
+                f"腾讯实时行情全部 {len(batches)} 批请求失败；首个错误: {failures[0]}"
+            )
+        if not quotes:
+            raise RuntimeError(
+                f"腾讯实时行情响应未解析出有效数据: {len(tencent_codes)} 只，"
+                f"{len(batches)} 批，失败 {len(failures)} 批"
+            )
+        logger.info("获取实时行情: %d 只，耗时 %.2fs", len(quotes), elapsed)
         return quotes
 
     def get_stock_history(self, code, days=120):

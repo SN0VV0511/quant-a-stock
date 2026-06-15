@@ -75,6 +75,7 @@ def test_static_asset_head_omits_body(tmp_path, monkeypatch) -> None:
     assert handler.status == 200
     assert handler.response_headers["Content-Type"] == "text/css"
     assert handler.response_headers["Content-Length"] == len(b"body{color:white}")
+    assert handler.response_headers["Cache-Control"] == "public, max-age=31536000, immutable"
     assert handler.wfile.getvalue() == b""
 
 

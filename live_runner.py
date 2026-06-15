@@ -1028,10 +1028,7 @@ def _handle_position_exits(
         rsi = None
         hist = None
         try:
-            if is_etf(code):
-                hist = loader.get_etf_history(code, days=60)
-            else:
-                hist = loader.get_stock_data(normalize_code(code), days=60)
+            hist = _load_exit_history(loader, code, days=60)
             # 与买入路径共用实时价 K 线,避免买卖信号因输入不同而互相矛盾
             rt_hist = _build_realtime_hist(hist, float(current), market_data.get(code))
             if rt_hist is not None and len(rt_hist) > 25:
@@ -1159,6 +1156,34 @@ def _handle_position_exits(
         # 卖出成交后进入再买冷却,杜绝"卖出→立刻买回"的日内刷单
         if report is not None and report.is_success and shared is not None:
             shared.mark_rebuy_cooldown(code, REBUY_COOLDOWN_SECONDS)
+
+
+def _load_exit_history(loader: object, code: str, days: int) -> pd.DataFrame | None:
+    """兼容不同 loader 接口加载持仓退出所需历史行情。
+
+    Args:
+        loader: 行情加载器实例。
+        code: 股票或 ETF 代码。
+        days: 历史数据天数。
+
+    Returns:
+        历史行情；loader 不支持对应接口时返回 ``None``。
+    """
+    normalized_code = normalize_code(code)
+    method_names = (
+        ("get_etf_history",) if is_etf(code) else ("get_stock_data", "get_stock_history")
+    )
+    for method_name in method_names:
+        method = getattr(loader, method_name, None)
+        if callable(method):
+            return method(normalized_code, days=days)
+
+    logger.warning(
+        "持仓退出跳过历史指标: loader=%s 缺少接口 %s",
+        type(loader).__name__,
+        "/".join(method_names),
+    )
+    return None
 
 
 def _submit_exit_order(
