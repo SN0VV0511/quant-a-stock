@@ -613,7 +613,9 @@ def _should_skip_rps(today: str, force: bool) -> bool:
         return False
     try:
         state = _read_rps_state()
-    except Exception:
+    except (json.JSONDecodeError, OSError) as exc:
+        # 状态文件损坏/不可读时降级为重跑,但记录日志,避免静默掩盖数据异常。
+        logger.warning("读取 RPS 状态失败,将重跑轮动: %s", exc)
         return False
     return (
         state.get("date") == today

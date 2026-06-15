@@ -28,6 +28,10 @@ class RiskController:
         self._drawdown_latched = False
         self._drawdown_recovery_days = 0
         self._last_drawdown_review_date = None
+        # 触发熔断时的总市值快照。恢复判定改为"从熔断点起连续 N 个交易日
+        # 市值不再跌破该快照",而非"回撤回落到阈值下方"——否则空仓后峰值
+        # 只增不减,回撤永远 >= 阈值,熔断永远无法解除(策略永久空仓死锁)。
+        self._drawdown_latch_value = None
 
     # ==================== 第一层：资金管理 ====================
 
@@ -46,8 +50,11 @@ class RiskController:
 
         if order["action"] == "buy":
             order_amount = order["price"] * order["shares"]
-            strategy_tag = order.get("strategy_tag", "combo_trend")
-            is_etf_flag = is_etf(order["code"]) or strategy_tag in {"etf_rotation", "rps_rotation"}
+            # 单票上限只按标的属性判定,不参考 strategy_tag:旧实现曾把
+            # rps_rotation/etf_rotation 标签的股票也按 ETF 30% 放行,与
+            # PositionManager.check_position_limit 的现价口径不一致,存在
+            # 单票集中度失控风险。
+            is_etf_flag = is_etf(order["code"])
 
             # 检查现金
             if order_amount > cash * (1 - CASH_BUFFER):
@@ -223,9 +230,12 @@ class RiskController:
             (exceeded, drawdown)
         """
         drawdown = portfolio.get_drawdown()
-        if drawdown >= threshold:
+        # 仅在未锁存且回撤触及阈值时触发熔断,并记录触发点市值;已锁存时
+        # 不在此处清零恢复计数(恢复推进统一由 set_daily_start 负责)。
+        if not self._drawdown_latched and drawdown >= threshold:
             self._drawdown_latched = True
             self._drawdown_recovery_days = 0
+            self._drawdown_latch_value = portfolio.get_total_value()
         exceeded = drawdown >= threshold or self._drawdown_latched
 
         if exceeded:
@@ -327,22 +337,49 @@ class RiskController:
         return False, ""
 
     def set_daily_start(self, portfolio, date=None):
-        """记录日初市值，并推进最大回撤熔断的恢复交易日计数。"""
+        """记录日初市值，并推进最大回撤熔断的恢复交易日计数。
+
+        恢复判据:自触发熔断起,连续 ``DRAWDOWN_RECOVERY_DAYS`` 个交易日总市值
+        **不再创新低**(即下跌已止住、企稳),即解除熔断。
+
+        设计要点:
+        - 回撤口径用历史峰值(只增不减),空仓后净值走平、峰值不降,回撤长期
+          >= 阈值。旧实现用"回撤回落到阈值下方"作为恢复条件,导致熔断永远
+          无法解除 → 策略永久空仓死锁。
+        - 改用"不再创新低"而非"市值回到熔断点之上":熔断期间禁止开仓 → 空仓
+          → 净值走平在低位,若要求回到熔断点之上才能恢复,会再次形成"要恢复
+          得先开仓、要开仓得先恢复"的自我参照死锁。"不再创新低"只要求下跌
+          停止,空仓走平即满足,可在 N 日后恢复开仓能力。
+        - 恢复时把 ``peak_value`` 重置为当前总市值,使回撤归零、避免
+          ``check_max_drawdown`` 因 drawdown 仍 >= 阈值而立即重新触发 latch。
+        """
         self._daily_start_value = portfolio.get_total_value()
         review_date = str(date or datetime.now().strftime("%Y%m%d")).replace("-", "")[:8]
-        drawdown = portfolio.get_drawdown()
-        if drawdown >= MAX_DRAWDOWN_THRESHOLD:
-            self._drawdown_latched = True
-            self._drawdown_recovery_days = 0
-            self._last_drawdown_review_date = review_date
+        if not self._drawdown_latched:
+            # 未锁存:回撤触及阈值才触发熔断(实际 latch/记录在 check_max_drawdown 完成)。
             return
-        if self._drawdown_latched and review_date != self._last_drawdown_review_date:
+        # 已锁存:用 _drawdown_latch_value 跟踪熔断期间的"最近最低净值"。
+        # 当日再创新低 → 下跌未止住,重置计数并更新基准;否则计为"企稳一日"。
+        latch_low = self._drawdown_latch_value
+        if latch_low is None or self._daily_start_value < latch_low:
+            self._drawdown_latch_value = self._daily_start_value
+            self._drawdown_recovery_days = 0
+            return
+        if review_date != self._last_drawdown_review_date:
             self._drawdown_recovery_days += 1
             self._last_drawdown_review_date = review_date
             if self._drawdown_recovery_days >= DRAWDOWN_RECOVERY_DAYS:
                 self._drawdown_latched = False
                 self._drawdown_recovery_days = 0
-                logger.info("最大回撤熔断已连续恢复 %d 个交易日，恢复正常买入", DRAWDOWN_RECOVERY_DAYS)
+                self._drawdown_latch_value = None
+                # 恢复时把回撤峰值重置为当前总市值,使回撤从当前水位重新计算。
+                # 否则 drawdown 仍 >= 阈值,check_max_drawdown 会立即重新触发 latch。
+                if self._daily_start_value > 0 and hasattr(portfolio, "state"):
+                    portfolio.state["peak_value"] = self._daily_start_value
+                logger.info(
+                    "最大回撤熔断已连续 %d 个交易日企稳(不再创新低)，恢复正常买入",
+                    DRAWDOWN_RECOVERY_DAYS,
+                )
 
     def filter_orders(self, orders, portfolio, market_data=None):
         """批量过滤订单
