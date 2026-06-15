@@ -12,6 +12,7 @@ import sys
 import json
 import time
 import socket
+import signal
 import subprocess
 import threading
 import logging
@@ -52,18 +53,74 @@ socket.setdefaulttimeout(30)
 
 
 _BS_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bs_worker.py")
+_BS_SUBPROCESS_TIMEOUT_SECONDS = 15
+_BS_UNIVERSE_TIMEOUT_SECONDS = 5
 
 
-def _run_bs_with_subprocess(command, *args, timeout=30):
+def _reap_process(proc: subprocess.Popen[bytes], command: str) -> None:
+    """在守护线程中回收已终止的子进程，避免阻塞业务线程。"""
+    try:
+        proc.wait()
+    except Exception as exc:  # pragma: no cover - 仅用于尽力回收异常进程
+        logger.debug("回收 bs_worker %s 失败: %s", command, exc)
+
+
+def _terminate_bs_worker(proc: subprocess.Popen[bytes], command: str) -> None:
+    """终止 BaoStock worker，但绝不在调用线程中等待其退出。"""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # pragma: no cover - Windows 兼容分支
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        logger.debug("终止 bs_worker %s 失败: %s", command, exc)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_reap_process,
+        args=(proc, command),
+        name=f"bs-worker-reaper-{command}",
+        daemon=True,
+    ).start()
+
+
+def _run_bs_with_subprocess(
+    command: str,
+    *args: str,
+    timeout: float = _BS_SUBPROCESS_TIMEOUT_SECONDS,
+) -> dict[str, object] | None:
     """用 subprocess 执行 BaoStock 查询，绕过 GIL 导致的 threading 超时失效。
 
+    超时后只负责发送终止信号和关闭管道，进程回收交给守护线程。这样即使
+    worker 卡在不可中断的系统调用中，也不会再次阻塞扫描线程。
+
+    Args:
+        command: worker 命令名称。
+        *args: 传递给 worker 的字符串参数。
+        timeout: 最大等待秒数。
+
     Returns:
-        dict: 子进程返回的 JSON（含 error_code / rows），异常或超时返回 None。
+        子进程返回的 JSON；异常或超时返回 ``None``。
     """
     cmd = [sys.executable, _BS_WORKER, command, *args]
+    proc: subprocess.Popen[bytes] | None = None
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         stdout, _ = proc.communicate(timeout=timeout)
         if proc.returncode != 0:
@@ -71,17 +128,14 @@ def _run_bs_with_subprocess(command, *args, timeout=30):
             return None
         return json.loads(stdout.decode("utf-8"))
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        logger.warning("bs_worker %s 超时 (%ds)，已 kill", command, timeout)
+        if proc is not None:
+            _terminate_bs_worker(proc, command)
+        logger.warning("bs_worker %s 超时 (%.1fs)，已请求终止", command, timeout)
         return None
     except Exception as e:
         logger.warning("bs_worker %s 异常: %s", command, e)
-        try:
-            proc.kill()
-            proc.communicate()
-        except Exception:
-            pass
+        if proc is not None and proc.poll() is None:
+            _terminate_bs_worker(proc, command)
         return None
 
 
@@ -375,64 +429,81 @@ class AKDataLoader:
     def close(self):
         self._logout()
 
-    def _get_stocks_from_cache(self):
-        """从 data/cache/hist_*.pkl 文件中提取股票代码作为备用列表。"""
-        stocks = []
+    def _get_stocks_from_cache(self) -> list[dict[str, str]]:
+        """从历史行情缓存文件名中提取并去重股票代码。"""
+        stocks_by_code: dict[str, dict[str, str]] = {}
         try:
-            for fname in os.listdir(self.cache_dir):
-                if not fname.startswith("hist_") or not fname.endswith(".pkl"):
+            for entry in os.scandir(self.cache_dir):
+                if not entry.is_file() or not entry.name.endswith(".pkl"):
                     continue
-                # 文件名格式: hist_{code}_{days}.pkl
-                parts = fname[len("hist_"):-len(".pkl")].rsplit("_", 1)
-                if not parts:
+
+                prefix = next(
+                    (
+                        value
+                        for value in ("hist_", "histext_")
+                        if entry.name.startswith(value)
+                    ),
+                    None,
+                )
+                if prefix is None:
                     continue
-                raw_code = parts[0]
+
+                # 文件名格式: hist_{code}_{days}.pkl / histext_{code}_{days}.pkl
+                cache_name = entry.name[len(prefix) : -len(".pkl")]
+                raw_code, separator, _days = cache_name.rpartition("_")
+                if not separator:
+                    continue
                 if is_a_share_stock(raw_code):
-                    stocks.append({
-                        "code": normalize_a_share_code(raw_code),
+                    code = normalize_a_share_code(raw_code)
+                    stocks_by_code[code] = {
+                        "code": code,
                         "bs_code": to_baostock_code(raw_code),
                         "name": "",
-                    })
+                    }
         except Exception as e:
-            logger.warning(f"从缓存目录读取股票列表失败: {e}")
-        stocks.sort(key=lambda s: s["code"])
-        logger.info(f"从缓存文件中恢复股票列表: {len(stocks)} 只")
+            logger.warning("从缓存目录读取股票列表失败: %s", e)
+        stocks = sorted(stocks_by_code.values(), key=lambda stock: stock["code"])
+        logger.info("从缓存文件中恢复股票列表: %d 只", len(stocks))
         return stocks
 
-    def get_all_stocks(self):
-        """获取沪深 A 股股票列表（BaoStock）。
+    def get_all_stocks(self) -> list[dict[str, str]]:
+        """获取沪深 A 股股票列表，优先使用本地历史缓存。
 
-        BaoStock 不可用时自动回退到缓存文件中的股票列表。
+        扫描链路不能依赖 BaoStock 的可用性：只要磁盘上存在历史缓存，就直接
+        构建股票池。仅在本地完全无缓存时才尝试远端查询。
         """
         now = time.time()
         if self._stock_list_cache and (now - self._stock_list_cache_time) < 3600:
             return self._stock_list_cache
 
-        # BaoStock 已标记不可用，直接走缓存
-        if not self._bs_available:
-            stocks = self._get_stocks_from_cache()
-            self._stock_list_cache = stocks
+        cached_stocks = self._get_stocks_from_cache()
+        if cached_stocks:
+            self._stock_list_cache = cached_stocks
             self._stock_list_cache_time = now
-            return stocks
+            return cached_stocks
 
-        try:
-            self._ensure_login()
-        except ConnectionError:
-            stocks = self._get_stocks_from_cache()
-            self._stock_list_cache = stocks
-            self._stock_list_cache_time = now
-            return stocks
+        if not self._bs_available:
+            return []
 
         # 尝试今天及前 5 天，BaoStock 盘中可能没数据
         rows = []
         for offset in range(6):
             day = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
-            result = _run_bs_with_subprocess("query_all_stock", day)
+            result = _run_bs_with_subprocess(
+                "query_all_stock",
+                day,
+                timeout=_BS_UNIVERSE_TIMEOUT_SECONDS,
+            )
             if result is None:
-                logger.warning("BaoStock query_all_stock(%s) 失败或超时", day)
-                continue
+                logger.error("BaoStock query_all_stock(%s) 超时或异常，立即熔断", day)
+                self._bs_available = False
+                break
             if result.get("error_code") != "0":
-                logger.warning("BaoStock query_all_stock(%s) 错误: %s", day, result.get("error_code"))
+                logger.warning(
+                    "BaoStock query_all_stock(%s) 错误: %s",
+                    day,
+                    result.get("error_code"),
+                )
                 continue
             rows = result.get("rows", [])
             if rows:

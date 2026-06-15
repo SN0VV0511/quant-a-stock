@@ -868,6 +868,8 @@ class QuantHandler(SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", len(body))
+            # 入口文件引用带内容哈希的资源，必须每次校验以便及时发现新构建。
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             if write_body:
                 self.wfile.write(body)
@@ -888,7 +890,8 @@ class QuantHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime_type or "application/octet-stream")
         self.send_header("Content-Length", len(body))
-        self.send_header("Cache-Control", "public, max-age=3600")
+        # Vite 构建资源带内容哈希，可安全长期缓存且无需重复校验。
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         self.end_headers()
         if write_body:
             self.wfile.write(body)
