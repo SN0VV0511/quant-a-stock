@@ -12,6 +12,7 @@ import numpy as np
 from config.settings import (
     INITIAL_CAPITAL, is_etf, DEFAULT_ETF_POOL, DEFAULT_STOCK_POOL,
     MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
+    MIN_STOCK_ORDER_AMOUNT, MIN_ETF_ORDER_AMOUNT,
 )
 from rules.engine import TradingRules
 from rules.position import PositionManager
@@ -130,11 +131,14 @@ class BacktestEngine:
             # 为买入订单计算具体股数
             for order in orders:
                 if order["action"] == "buy" and order.get("shares", 0) <= 0:
-                    max_ratio = MAX_SINGLE_ETF if is_etf(order["code"]) else MAX_SINGLE_STOCK
+                    is_etf_flag = is_etf(order["code"])
+                    max_ratio = MAX_SINGLE_ETF if is_etf_flag else MAX_SINGLE_STOCK
+                    min_amount = MIN_ETF_ORDER_AMOUNT if is_etf_flag else MIN_STOCK_ORDER_AMOUNT
                     total_value = portfolio.get_total_value(current_prices)
                     order["shares"] = self.rules.calc_lot_size(
                         order["price"], portfolio.get_cash(),
-                        max_ratio=max_ratio, total_value=total_value
+                        max_ratio=max_ratio, total_value=total_value,
+                        min_amount=min_amount,
                     )
 
             # 风控过滤
@@ -267,7 +271,10 @@ class BacktestEngine:
                 continue
 
             if signal == 1 and shares == 0:
-                buy_shares = self.rules.calc_lot_size(price, cash, total_value=cash)
+                buy_shares = self.rules.calc_lot_size(
+                    price, cash, total_value=cash,
+                    min_amount=MIN_STOCK_ORDER_AMOUNT,
+                )
                 if buy_shares > 0:
                     amount = price * buy_shares
                     cost_detail = self.rules.calc_total_cost(amount, "buy", False)

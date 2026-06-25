@@ -29,6 +29,12 @@ AKShare 只是 Python 数据接口库，不是股票标的。本项目当前交�
 - 沪市股票：`600`、`601`、`603`、`605`、`688`、`689` 开头。
 - 深市股票：`000`、`001`、`002`、`003`、`300`、`301` 开头。
 - 沪市 ETF：`51`、`56`、`58` 开头；深市 ETF：`15` 开头。
+- 默认 5 万资金账户配置只直接买入沪深主板股票和场内 ETF，不直接买入创业板
+  `300/301`、科创板 `688/689`、可转债、港股通或融资融券标的。
+- 如账户已确认开通额外权限，可复制 `config/permissions.example.yaml` 为
+  `config/permissions.yaml`，或设置 `ALLOW_CHINEXT_STOCKS=true`、
+  `ALLOW_STAR_MARKET_STOCKS=true` 等环境变量。未开通时，创业板/科创板方向通过
+  ETF（如创业板 ETF、科创 50 ETF、半导体 ETF）参与。
 - 实时全市场扫描仍只扫描沪深 A 股股票；ETF 走日频 RPS/动量模块；行业指数只做强弱观察，不直接下单。
 - 实时虚拟盘会过滤指数、基金、港股、美股、B 股、北交所和市场前缀不一致的代码。
 
@@ -278,6 +284,9 @@ python scripts/paper_acceptance.py --days 30 --min-snapshot-days 20 --json
 - `INITIAL_CAPITAL`：回测和虚拟盘初始资金。
 - `MAX_TOTAL_POSITION`：总仓位上限。
 - `MAX_SINGLE_STOCK`：单只股票仓位上限。
+- `MIN_STOCK_ORDER_AMOUNT`：股票最低建议买入成交额，默认 8000 元。
+- `MIN_ETF_ORDER_AMOUNT`：ETF 最低建议买入成交额，默认 5000 元。
+- `PERMISSIONS_FILE`：可选账户权限配置文件，默认读取 `config/permissions.yaml`。
 - `CASH_BUFFER`：现金缓冲。
 - `DAILY_LOSS_THRESHOLD`：单日最大亏损阈值。
 - `MAX_DRAWDOWN_THRESHOLD`：最大回撤阈值。
@@ -290,6 +299,11 @@ BROKER_MODE=paper
 LIVE_TRADING_ENABLED=false
 LIVE_WATCH_INTERVAL_SECONDS=4
 LIVE_SCAN_INTERVAL_SECONDS=600
+PERMISSIONS_FILE=config/permissions.yaml
+ALLOW_CHINEXT_STOCKS=false
+ALLOW_STAR_MARKET_STOCKS=false
+MIN_STOCK_ORDER_AMOUNT=8000
+MIN_ETF_ORDER_AMOUNT=5000
 QMT_ACCOUNT_ID=
 QMT_CLIENT_PATH=
 ```
@@ -349,11 +363,11 @@ logs/paper_daemon_service.log   后台服务日志
 
 风控规则：
 
-- 只允许沪深 A 股股票代码。
+- 默认只允许当前账户权限覆盖的沪深 A 股股票和场内 ETF。
 - 普通策略买入受默认白名单限制。
 - 全市场扫描策略买入可绕过固定白名单。
 - 卖出不受买入白名单限制，但仍受 T+1、停牌、跌停和持仓数量限制。
-- 买入前检查现金、单票仓位、总仓位和现金缓冲。
+- 买入前检查现金、最低建议成交额、单票仓位、总仓位和现金缓冲。
 
 ## QMT / miniQMT 接入状态
 

@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 
 from config.settings import (
-    is_a_share_stock,
+    is_account_tradable_stock,
     SCAN_MIN_PRICE,
     SCAN_MIN_VOLUME,
     SCAN_MIN_AVG_VOLUME,
@@ -86,7 +86,11 @@ def score_candidates(
     raw = []
     liquidity_filtered = 0
     acceleration_filtered = 0
+    permission_filtered = 0
     for code, df in history_map.items():
+        if not is_account_tradable_stock(str(code)):
+            permission_filtered += 1
+            continue
         if df is None or len(df) < momentum_period + 1:
             continue
 
@@ -168,7 +172,8 @@ def score_candidates(
         })
 
     logger.info(
-        "候选过滤统计: 流动性不足 %d 只,短期极端加速 %d 只",
+        "候选过滤统计: 账户权限不符 %d 只,流动性不足 %d 只,短期极端加速 %d 只",
+        permission_filtered,
         liquidity_filtered,
         acceleration_filtered,
     )
@@ -249,10 +254,16 @@ class MarketScanner:
                 time.monotonic() - stage_started_at,
             )
 
+        before_permission_filter = len(stock_list)
         stock_list = [
             stock for stock in stock_list
-            if is_a_share_stock(str(stock.get("code", "")))
+            if is_account_tradable_stock(str(stock.get("code", "")))
         ]
+        logger.info(
+            "账户权限过滤: %d -> %d 只可交易沪深 A 股股票",
+            before_permission_filter,
+            len(stock_list),
+        )
         logger.info(f"开始扫描 {len(stock_list)} 只沪深 A 股股票...")
 
         # 批量获取实时行情(腾讯接口)。实时行情仅用于"粗筛"以减少历史数据拉取量,

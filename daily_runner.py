@@ -14,6 +14,7 @@ from config.settings import (
     DEFAULT_RPS_ETF_POOL,
     DEFAULT_UNIVERSE, get_rps_etf_codes, get_all_codes,
     is_etf, MAX_SINGLE_ETF, MAX_SINGLE_STOCK, RPS_HISTORY_DAYS,
+    MIN_STOCK_ORDER_AMOUNT, MIN_ETF_ORDER_AMOUNT,
 )
 from config.time_utils import today_yyyymmdd
 from data.loader import DataLoader
@@ -207,9 +208,11 @@ class DailyRunner:
                         price = current_prices[order["code"]]
                         order["price"] = price
                     if price > 0:
+                        min_amount = MIN_ETF_ORDER_AMOUNT if is_etf(order["code"]) else MIN_STOCK_ORDER_AMOUNT
                         order["shares"] = self.portfolio.rules.calc_lot_size(
                             price, self.portfolio.get_cash(),
-                            max_ratio=max_ratio, total_value=total_value
+                            max_ratio=max_ratio, total_value=total_value,
+                            min_amount=min_amount,
                         )
 
             # 9. 构建市场数据（用于风控）

@@ -12,7 +12,7 @@ import tempfile
 from config.settings import (
     STATE_FILE, INITIAL_CAPITAL, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION, LOT_SIZE, is_etf, TRADE_LOG_FILE, SNAPSHOT_LOG_FILE,
-    ENFORCE_T1,
+    ENFORCE_T1, MIN_STOCK_ORDER_AMOUNT, MIN_ETF_ORDER_AMOUNT,
 )
 from config.time_utils import format_local, today_yyyymmdd
 from rules.engine import TradingRules
@@ -85,7 +85,8 @@ class PositionManager:
             affordable_shares = self.rules.calc_lot_size(
                 price, self.state["cash"],
                 max_ratio=MAX_SINGLE_ETF if is_etf_flag else MAX_SINGLE_STOCK,
-                total_value=self.get_total_value({"cash": self.state["cash"]})
+                total_value=self.get_total_value({"cash": self.state["cash"]}),
+                min_amount=MIN_ETF_ORDER_AMOUNT if is_etf_flag else MIN_STOCK_ORDER_AMOUNT,
             )
             if affordable_shares <= 0:
                 return {"success": False, "reason": "现金不足", "shares": 0}

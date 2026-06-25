@@ -36,6 +36,7 @@ from config.settings import (  # noqa: E402
     INITIAL_CAPITAL,
     MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION,
+    MIN_STOCK_ORDER_AMOUNT,
     REPORT_DIR,
     SMALLCAP_TOP_N,
     SMALLCAP_REBALANCE_DAYS,
@@ -43,6 +44,7 @@ from config.settings import (  # noqa: E402
     SMALLCAP_MIN_PRICE,
     SCAN_MIN_VOLUME,
     SCAN_MAX_HIST_FETCH,
+    is_account_tradable_stock,
     normalize_a_share_code,
 )
 from data.ak_loader import AKDataLoader  # noqa: E402
@@ -97,9 +99,17 @@ def _build_universe(loader: AKDataLoader, max_universe: int) -> tuple[list[str],
         (codes, quotes): 候选代码列表(6 位)与其实时行情字典。
     """
     stocks = loader.get_all_stocks()
-    all_codes = [s["code"] for s in stocks]
+    all_codes = [
+        s["code"]
+        for s in stocks
+        if is_account_tradable_stock(str(s.get("code", "")))
+    ]
     name_map = {s["code"]: s.get("name", "") for s in stocks}
-    logger.info("全市场股票 %d 只,获取实时行情粗筛...", len(all_codes))
+    logger.info(
+        "全市场股票 %d 只,账户权限过滤后 %d 只,获取实时行情粗筛...",
+        len(stocks),
+        len(all_codes),
+    )
     quotes = loader.get_realtime_quotes(all_codes)
 
     pre = []
@@ -239,7 +249,12 @@ def rebalance(broker: PaperBrokerAdapter, loader: AKDataLoader, risk: RiskContro
             continue
         total_value = broker.portfolio.get_total_value()
         shares = broker.portfolio.rules.calc_lot_size(
-            price, broker.query_cash(), max_ratio=max_ratio, total_value=total_value)
+            price,
+            broker.query_cash(),
+            max_ratio=max_ratio,
+            total_value=total_value,
+            min_amount=MIN_STOCK_ORDER_AMOUNT,
+        )
         if shares <= 0:
             recorder.record("signal_skipped", {"code": code, "reason": "可买不足一手", "price": price})
             continue

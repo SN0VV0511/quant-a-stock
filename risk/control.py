@@ -10,7 +10,9 @@ from config.settings import (
     INITIAL_CAPITAL, MAX_TOTAL_POSITION, MAX_SINGLE_ETF, MAX_SINGLE_STOCK,
     CASH_BUFFER, DAILY_LOSS_THRESHOLD, MAX_DRAWDOWN_THRESHOLD, LOT_SIZE,
     DRAWDOWN_RECOVERY_DAYS, DRAWDOWN_REDUCED_POSITION_LIMIT,
+    MIN_STOCK_ORDER_AMOUNT, MIN_ETF_ORDER_AMOUNT,
     is_etf, is_supported_trading_target, DEFAULT_UNIVERSE,
+    get_trading_permission_rejection_reason,
 )
 from trading.models import OrderIntent, RiskDecision
 
@@ -59,6 +61,15 @@ class RiskController:
             # 检查现金
             if order_amount > cash * (1 - CASH_BUFFER):
                 return False, f"现金不足（需要 {order_amount:.0f}，可用 {cash * (1 - CASH_BUFFER):.0f}）"
+
+            min_order_amount = MIN_ETF_ORDER_AMOUNT if is_etf_flag else MIN_STOCK_ORDER_AMOUNT
+            if order_amount < min_order_amount:
+                target_type = "ETF" if is_etf_flag else "股票"
+                return False, (
+                    "MIN_ORDER_AMOUNT_NOT_MET: "
+                    f"{target_type}订单金额 {order_amount:.0f} 元低于最低建议成交额 "
+                    f"{min_order_amount:.0f} 元，避免最低佣金和滑点吞噬收益"
+                )
 
             # 检查单票上限
             max_ratio = MAX_SINGLE_ETF if is_etf_flag else MAX_SINGLE_STOCK
@@ -109,6 +120,9 @@ class RiskController:
 
         # 1. 标的范围检查：当前交易通道允许沪深 A 股股票和 ETF。
         if not is_supported_trading_target(code):
+            permission_reason = get_trading_permission_rejection_reason(code)
+            if permission_reason:
+                return False, permission_reason
             return False, f"标的 {code} 不是支持的沪深 A 股股票或 ETF"
 
         # 2. 标的白名单检查（扫描策略跳过白名单限制；卖出不限制）

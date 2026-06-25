@@ -29,6 +29,7 @@ from config.settings import (
     SMALLCAP_MIN_TURNOVER,
     SMALLCAP_MIN_VOLUME_RATIO,
     SMALLCAP_REVERSAL_DAYS,
+    is_account_tradable_stock,
 )
 from strategies.indicators import calculate_obv_trend
 
@@ -62,6 +63,8 @@ def passes_risk_filter(row: dict[str, Any]) -> bool:
     Returns:
         True 表示通过风控,可纳入候选。
     """
+    if not is_account_tradable_stock(str(row.get("code", ""))):
+        return False
     if row.get("is_st"):
         return False
     if row.get("is_suspended"):

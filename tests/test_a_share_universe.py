@@ -8,8 +8,10 @@ from config.settings import (
     get_a_share_market,
     is_etf,
     is_a_share_stock,
+    is_account_tradable_stock,
     is_supported_trading_target,
     is_chinext,
+    is_star_market,
     normalize_a_share_code,
     to_baostock_code,
     to_tencent_security_code,
@@ -30,6 +32,10 @@ def test_a_share_code_helpers_accept_hu_shen_stocks() -> None:
     assert is_a_share_stock("sh601988") is True
     assert is_a_share_stock("sz300750") is True
     assert is_chinext("sz301308") is True
+    assert is_star_market("sh688981") is True
+    assert is_account_tradable_stock("600519") is True
+    assert is_account_tradable_stock("300750") is False
+    assert is_account_tradable_stock("688981") is False
     assert to_tencent_code("600519") == "sh600519"
     assert to_tencent_code("000001") == "sz000001"
     assert to_tencent_security_code("510300") == "sh510300"
@@ -39,6 +45,8 @@ def test_a_share_code_helpers_accept_hu_shen_stocks() -> None:
     assert is_etf("sz159915") is True
     assert is_supported_trading_target("510300") is True
     assert is_supported_trading_target("600519") is True
+    assert is_supported_trading_target("300750") is False
+    assert is_supported_trading_target("688981") is False
 
 
 @pytest.mark.parametrize(
@@ -88,6 +96,8 @@ def test_market_scanner_filters_input_to_hu_shen_a_shares() -> None:
             return [
                 {"code": "600519", "name": "贵州茅台"},
                 {"code": "000001", "name": "平安银行"},
+                {"code": "300750", "name": "宁德时代"},
+                {"code": "688981", "name": "中芯国际"},
                 {"code": "sh000001", "name": "上证指数"},
                 {"code": "159915", "name": "创业板 ETF"},
             ]
@@ -135,7 +145,40 @@ def test_risk_and_paper_broker_reject_non_a_share_order(tmp_path) -> None:
     assert len(rejected) == 1
     assert "不是支持的沪深 A 股股票或 ETF" in rejected[0].reason
     assert report.status == "rejected"
-    assert "仅支持沪深 A 股股票或 ETF 代码" in report.message
+    assert "仅支持当前账户可交易的沪深 A 股股票或 ETF 代码" in report.message
+
+
+def test_risk_and_paper_broker_reject_restricted_board_stock(tmp_path) -> None:
+    """默认 5 万账户配置应拒绝创业板/科创板个股，但保留 ETF 替代路径。"""
+    broker = PaperBrokerAdapter(
+        state_file=str(tmp_path / "state.json"),
+        trade_log_file=str(tmp_path / "trade_log.json"),
+        snapshot_log_file=str(tmp_path / "snapshots.jsonl"),
+    )
+    broker.connect()
+    risk = RiskController()
+    order = OrderIntent(
+        code="688981",
+        action="buy",
+        price=80.0,
+        shares=100,
+        name="中芯国际",
+        strategy="全市场扫描+组合策略",
+        date="20260528",
+    )
+
+    approved, rejected = risk.filter_order_intents(
+        [order],
+        broker.portfolio,
+        {"688981": {"current_price": 80.0, "prev_close": 79.0, "is_st": False, "is_suspended": False}},
+    )
+    report = broker.place_order(order)
+
+    assert approved == []
+    assert len(rejected) == 1
+    assert "未开通科创板权限" in rejected[0].reason
+    assert report.status == "rejected"
+    assert "未开通科创板权限" in report.message
 
 
 def test_risk_and_paper_broker_allow_etf_order(tmp_path) -> None:
@@ -151,7 +194,7 @@ def test_risk_and_paper_broker_allow_etf_order(tmp_path) -> None:
         code="510300",
         action="buy",
         price=4.0,
-        shares=100,
+        shares=1300,
         name="沪深300ETF",
         strategy="ETF/行业RPS轮动",
         date="20260528",

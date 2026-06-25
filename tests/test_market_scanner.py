@@ -35,6 +35,17 @@ def test_low_volume_filtered_out():
     assert "600001" not in codes
 
 
+def test_restricted_board_filtered_out():
+    history = {
+        "600000": _hist(0.1),
+        "688981": _hist(0.8),
+        "300750": _hist(0.9),
+    }
+    ranked = score_candidates(history, top_n=5, momentum_period=60)
+    codes = {r["code"] for r in ranked}
+    assert codes == {"600000"}
+
+
 def test_insufficient_history_skipped():
     history = {"600000": _hist(0.5, n=30)}  # 不足 momentum_period+1
     ranked = score_candidates(history, top_n=5, momentum_period=60)

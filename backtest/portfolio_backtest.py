@@ -30,6 +30,7 @@ import pandas as pd
 from config.settings import (
     INITIAL_CAPITAL,
     MAX_SINGLE_STOCK,
+    MIN_STOCK_ORDER_AMOUNT,
 )
 from backtest.metrics import compute_performance_metrics, format_summary
 from risk.control import RiskController
@@ -401,6 +402,7 @@ class PortfolioBacktester:
                 order["shares"] = portfolio.rules.calc_lot_size(
                     exec_price, portfolio.get_cash(),
                     max_ratio=self.max_single_stock, total_value=total_value,
+                    min_amount=MIN_STOCK_ORDER_AMOUNT,
                 )
                 if order["shares"] <= 0:
                     continue

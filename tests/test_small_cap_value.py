@@ -25,7 +25,7 @@ class TestRiskFilter:
         assert not passes_risk_filter(_row("600000", 30e8, 1.0, price=1.5))
 
     def test_high_price_excluded_for_small_capital(self):
-        assert not passes_risk_filter(_row("600000", 30e8, 1.0, price=35.0))
+        assert not passes_risk_filter(_row("600000", 30e8, 1.0, price=65.0))
 
     def test_negative_pb_excluded(self):
         assert not passes_risk_filter(_row("600000", 30e8, -1.0))
@@ -36,6 +36,10 @@ class TestRiskFilter:
 
     def test_valid_passes(self):
         assert passes_risk_filter(_row("600000", 50e8, 1.2))
+
+    def test_restricted_board_stock_excluded_by_account_permission(self):
+        assert not passes_risk_filter(_row("688981", 80e8, 2.0))
+        assert not passes_risk_filter(_row("300750", 80e8, 2.0))
 
 
 class TestScoring:
@@ -99,7 +103,7 @@ def _bdays(n):
 
 
 class TestFactorBacktester:
-    """注意:当前小资金风控会按单票 15%、总仓 60% 控制调仓目标。"""
+    """注意:当前小资金风控会按单票 20%、总仓 90% 控制调仓目标。"""
 
     @staticmethod
     def _universe(days):

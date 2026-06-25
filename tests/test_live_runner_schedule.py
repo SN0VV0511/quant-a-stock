@@ -12,7 +12,7 @@ from trading.brokers import PaperBrokerAdapter
 from trading.observability import EventRecorder
 
 
-def _hist(trend: float, n: int = 45) -> pd.DataFrame:
+def _hist(trend: float, n: int = 75) -> pd.DataFrame:
     """构造 ETF/行业 RPS 测试行情。"""
     dates = [d.strftime("%Y%m%d") for d in pd.date_range("2026-01-01", periods=n, freq="B")]
     closes = np.linspace(4.0, 4.0 * (1 + trend), n)

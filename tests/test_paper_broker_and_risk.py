@@ -60,7 +60,7 @@ def test_full_market_order_can_pass_risk_and_fill(tmp_path) -> None:
         code="600000",
         action="buy",
         price=10.0,
-        shares=100,
+        shares=800,
         name="浦发银行",
         strategy="全市场扫描+组合策略",
         reason="固定样本信号",
@@ -76,7 +76,7 @@ def test_full_market_order_can_pass_risk_and_fill(tmp_path) -> None:
     assert rejected == []
     assert len(approved) == 1
     assert report.is_success is True
-    assert broker.query_positions()["600000"]["shares"] == 100
+    assert broker.query_positions()["600000"]["shares"] == 800
 
 
 def test_risk_allows_non_whitelist_position_sell(tmp_path) -> None:
@@ -281,7 +281,7 @@ def test_min_lot_exceeding_single_position_limit_is_rejected(tmp_path) -> None:
     order = OrderIntent(
         code="600000",
         action="buy",
-        price=100.0,
+        price=110.0,
         shares=100,
         name="高价样本",
         strategy="全市场扫描+组合策略",
@@ -291,14 +291,14 @@ def test_min_lot_exceeding_single_position_limit_is_rejected(tmp_path) -> None:
     approved, rejected = risk.filter_order_intents(
         [order],
         broker.portfolio,
-        {"600000": {"current_price": 100, "prev_close": 99, "is_st": False, "is_suspended": False}},
+        {"600000": {"current_price": 110, "prev_close": 109, "is_st": False, "is_suspended": False}},
     )
     assert approved == []
     assert "MIN_LOT_EXCEEDS_POSITION_LIMIT" in rejected[0].reason
 
 
 def test_stock_with_etf_strategy_tag_keeps_stock_position_limit(tmp_path) -> None:
-    """股票即使被标 ETF 轮动标签,单票上限仍按股票 15% 判定,不得放宽到 30%。
+    """股票即使被标 ETF 轮动标签,单票上限仍按股票 20% 判定,不得放宽到 30%。
 
     回归:旧 check_capital_allocation 用 `is_etf(code) or strategy_tag in
     {etf_rotation, rps_rotation}` 判定上限,若股票误带 rps_rotation 标签会
@@ -306,12 +306,12 @@ def test_stock_with_etf_strategy_tag_keeps_stock_position_limit(tmp_path) -> Non
     """
     broker = _paper_broker(tmp_path)
     risk = RiskController()
-    # 高价股一手 10000,总资产 50000;股票上限 15%=7500,一手即超限应被拒。
+    # 高价股一手 13000,总资产 50000;股票上限 20%=10000,一手即超限应被拒。
     # 若误按 ETF 30%=15000 放行,则一手可通过——正是要拦截的情形。
     order = OrderIntent(
         code="600000",
         action="buy",
-        price=100.0,
+        price=130.0,
         shares=100,
         name="误带标签的股票",
         strategy="全市场扫描+组合策略",
@@ -321,10 +321,33 @@ def test_stock_with_etf_strategy_tag_keeps_stock_position_limit(tmp_path) -> Non
     approved, rejected = risk.filter_order_intents(
         [order],
         broker.portfolio,
-        {"600000": {"current_price": 100, "prev_close": 99, "is_st": False, "is_suspended": False}},
+        {"600000": {"current_price": 130, "prev_close": 129, "is_st": False, "is_suspended": False}},
     )
     assert approved == []
     assert "MIN_LOT_EXCEEDS_POSITION_LIMIT" in rejected[0].reason
+
+
+def test_small_stock_order_amount_is_rejected(tmp_path) -> None:
+    """低于最低建议成交额的股票买入应被风控拒绝。"""
+    broker = _paper_broker(tmp_path)
+    risk = RiskController()
+    order = OrderIntent(
+        code="600000",
+        action="buy",
+        price=10.0,
+        shares=700,
+        name="小额样本",
+        strategy="全市场扫描+组合策略",
+        strategy_tag="combo_trend",
+        date="20260528",
+    )
+    approved, rejected = risk.filter_order_intents(
+        [order],
+        broker.portfolio,
+        {"600000": {"current_price": 10, "prev_close": 9.9, "is_st": False, "is_suspended": False}},
+    )
+    assert approved == []
+    assert "MIN_ORDER_AMOUNT_NOT_MET" in rejected[0].reason
 
 
 def test_drawdown_circuit_requires_two_recovery_days() -> None:
@@ -466,15 +489,15 @@ def test_position_limit_uses_current_price_not_cost(tmp_path) -> None:
         trade_log_file=str(tmp_path / "trade_log.json"),
         snapshot_log_file=str(tmp_path / "snapshots.jsonl"),
     )
-    # 成本价 5、现价 13、持有 600 股:现价市值 7800,成本市值仅 3000。
+    # 成本价 5、现价 13、持有 800 股:现价市值 10400,成本市值仅 4000。
     pm.state["positions"]["600000"] = {
-        "name": "测试", "shares": 600, "total_qty": 600, "sellable_qty": 600,
+        "name": "测试", "shares": 800, "total_qty": 800, "sellable_qty": 800,
         "avg_cost": 5.0, "current_price": 13.0,
         "buy_date": "20260101", "strategy_tag": "combo_trend",
     }
     total_value = 54795.0  # cash + 现价市值
-    # 再加一手约 1300 元:按现价 (7800+1300)/54795=16.6% 超 15% 上限,应拒绝;
-    # 旧成本口径 (3000+1300)/54795=7.8% 会错误放行。
+    # 再加一手约 1300 元:按现价 (10400+1300)/54795=21.4% 超 20% 上限,应拒绝;
+    # 旧成本口径 (4000+1300)/54795=9.7% 会错误放行。
     within, _ = pm.check_position_limit("600000", 1300, total_value=total_value)
     assert within is False
 

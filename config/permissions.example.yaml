@@ -1,0 +1,9 @@
+# 账户权限示例。复制为 config/permissions.yaml 后会被回测、模拟盘和实时执行共同读取。
+# 环境变量仍然优先于本文件，便于临时联调。
+permissions:
+  main_board: true
+  chinext: false
+  star: false
+  convertible: false
+  hk_connect: false
+  margin: false

@@ -4,13 +4,101 @@ A 股量化交易系统 - 全局配置
 
 from __future__ import annotations
 
+import json
 import os
 
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    """读取布尔环境变量，便于在不同账户权限下切换交易范围。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_bool(value: object, name: str) -> bool:
+    """把配置文件中的布尔值转换为 bool，非法值直接失败以避免权限误配。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(f"权限配置 {name} 必须是布尔值")
+
+
+def _load_permission_flags(path: str) -> dict[str, bool]:
+    """读取可选账户权限配置文件，供回测、模拟盘和实时执行共享。"""
+    if not path or not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            text = fp.read()
+        if path.endswith(".json"):
+            raw = json.loads(text)
+            if isinstance(raw, dict) and isinstance(raw.get("permissions"), dict):
+                raw = raw["permissions"]
+            if not isinstance(raw, dict):
+                raise ValueError("JSON 权限配置必须是对象")
+            return {str(k): _parse_bool(v, str(k)) for k, v in raw.items()}
+
+        flags: dict[str, bool] = {}
+        in_permissions_section = False
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            clean = line.split("#", 1)[0].rstrip()
+            if not clean.strip():
+                continue
+            if clean.strip() == "permissions:":
+                in_permissions_section = True
+                continue
+            if ":" not in clean:
+                raise ValueError(f"第 {line_no} 行不是 key: value 格式")
+            key, raw_value = clean.split(":", 1)
+            key = key.strip()
+            raw_value = raw_value.strip().strip('"').strip("'")
+            if in_permissions_section and not line.startswith((" ", "\t")):
+                in_permissions_section = False
+            if in_permissions_section:
+                key = key.strip()
+            flags[key] = _parse_bool(raw_value, key)
+        return flags
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"读取账户权限配置失败: {path}") from exc
+
+
+PERMISSIONS_FILE = os.getenv(
+    "PERMISSIONS_FILE",
+    os.path.join(BASE_DIR, "config", "permissions.yaml"),
+)
+_PERMISSION_FLAGS = _load_permission_flags(PERMISSIONS_FILE)
+
+
+def _permission_bool(key: str, env_name: str, default: bool) -> bool:
+    """按 环境变量 > 权限配置文件 > 默认值 的优先级读取权限开关。"""
+    if os.getenv(env_name) is not None:
+        return _env_bool(env_name, default)
+    if key in _PERMISSION_FLAGS:
+        return _PERMISSION_FLAGS[key]
+    return default
+
 # ==================== 资金配置 ====================
-INITIAL_CAPITAL = 50000.0  # 初始资金（元）
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "50000.0"))  # 初始资金（元）
+
+# ==================== 账户权限配置 ====================
+# 5 万资金账户通常不满足创业板(10 万/24 个月)和科创板(50 万/24 个月)
+# 股票权限门槛。默认只交易主板股票和 ETF；科技/创业方向通过 ETF 暴露。
+ALLOW_MAIN_BOARD_STOCKS = _permission_bool("main_board", "ALLOW_MAIN_BOARD_STOCKS", True)
+ALLOW_CHINEXT_STOCKS = _permission_bool("chinext", "ALLOW_CHINEXT_STOCKS", False)
+ALLOW_STAR_MARKET_STOCKS = _permission_bool("star", "ALLOW_STAR_MARKET_STOCKS", False)
+ALLOW_CONVERTIBLE_BONDS = _permission_bool("convertible", "ALLOW_CONVERTIBLE_BONDS", False)
+ALLOW_HK_CONNECT = _permission_bool("hk_connect", "ALLOW_HK_CONNECT", False)
+ALLOW_MARGIN_TRADING = _permission_bool("margin", "ALLOW_MARGIN_TRADING", False)
 
 # ==================== 默认回测配置 ====================
 DEFAULT_STOCK = "000001"
@@ -34,6 +122,8 @@ SLIPPAGE_ETF = 0.0003     # ETF 滑点 3bp
 
 # ==================== 交易单位 ====================
 LOT_SIZE = 100  # 每手 100 股/份
+MIN_STOCK_ORDER_AMOUNT = float(os.getenv("MIN_STOCK_ORDER_AMOUNT", "8000.0"))
+MIN_ETF_ORDER_AMOUNT = float(os.getenv("MIN_ETF_ORDER_AMOUNT", "5000.0"))
 
 # ==================== T+1 交易限制 ====================
 # A 股买入次日才可卖出。默认强制(贴近真实成交、防止虚拟盘出现现实中不可能的
@@ -46,9 +136,9 @@ LIMIT_ST = 0.05           # ST 板块 ±5%
 LIMIT_CHINEXT = 0.20      # 创业板 ±20%
 
 # ==================== 持仓限制 ====================
-MAX_TOTAL_POSITION = 1.0    # 总仓位上限 100%
+MAX_TOTAL_POSITION = 0.90   # 总仓位上限 90%,为 5 万小资金保留现金缓冲
 MAX_SINGLE_ETF = 0.30       # 单只 ETF 上限 30%,为个股留空间
-MAX_SINGLE_STOCK = 0.15     # 单只股票上限 15%,避免单票波动吞噬账户
+MAX_SINGLE_STOCK = 0.20     # 单只股票上限 20%,兼顾 8000 元最低成交额与集中度
 MAX_SINGLE_STOCK_PCT = MAX_SINGLE_STOCK  # 统一策略配置命名
 CASH_BUFFER = 0.10          # 现金缓冲 10%
 
@@ -97,10 +187,10 @@ LIMITUP_VWAP_BREAK_MINUTES = 3
 ETF_EXTREME_STOP_PCT = 0.12
 
 # 择时:大盘择时(系统性风险过滤)
-# 回测结论(scripts/ab_backtest.py,2023~2025 与 2024H2 两段):简单的"价格≥MA20"择时
-# 在弱市与 V 型反弹窗口均跑输基线——A 股反弹多为急拉,该过滤入场滞后、错过主升段且
-# 把交易数砍半。因此默认关闭,功能保留待改进(如改用 MA20<MA60 且下行的更严判据)。
-ENABLE_MARKET_REGIME = False    # 指数处于弱势(收盘价跌破其 MA)时暂停开新仓,只允许卖出/止损
+# 2026-01~2026-06 小样本 A/B 回测:单独开启 MA20 大盘择时使收益
+# +2.07% -> +2.29%,最大回撤 10.33% -> 8.34%。5 万小资金优先控制回撤,
+# 默认开启;如需复现旧基线,运行前设 ENABLE_MARKET_REGIME=false。
+ENABLE_MARKET_REGIME = _env_bool("ENABLE_MARKET_REGIME", True)  # 指数弱势时暂停开新仓,只允许卖出/止损
 MARKET_INDEX_CODE = "sh000300"  # 基准指数:沪深300
 MARKET_REGIME_MA = 20           # 大盘择时均线周期
 
@@ -137,11 +227,11 @@ BAOSTOCK_HISTORY_CACHE_TTL_SECONDS = int(
 BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS = int(
     os.getenv("BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS", "604800")
 )
-MAX_PRICE_MA20_RATIO = 1.18
-MAX_PRICE_MA60_RATIO = 1.35
-MAX_5D_GAIN = 0.25
-MAX_60D_GAIN = 1.20
-MAX_YTD_GAIN = 2.00
+MAX_PRICE_MA20_RATIO = 1.12
+MAX_PRICE_MA60_RATIO = 1.28
+MAX_5D_GAIN = 0.18
+MAX_60D_GAIN = 0.80
+MAX_YTD_GAIN = 1.20
 
 # 选股:基本面过滤
 SCAN_ENABLE_FUNDAMENTAL_FILTER = True   # 是否启用基本面过滤
@@ -175,9 +265,9 @@ SCORE_WEIGHT_VOLATILITY = 0.2   # 波动率惩罚权重(从得分中减去)
 # ==================== 小市值价值策略参数 ====================
 # 依据:A股价格动量长期负 IC(短期反转主导),真正有效的是小市值 + 低估值 + 短期反转。
 # 2024「国九条」退市新规后,必须叠加严格风控过滤,规避退市/ST/面值/财务风险。
-# 调仓:周度(每 5 个交易日)。仓位:等权,持有 SMALLCAP_TOP_N 只。
-SMALLCAP_TOP_N = 12              # 持仓数量(等权)
-SMALLCAP_REBALANCE_DAYS = 5     # 调仓周期(交易日),5≈周度
+# 调仓:双周(每 10 个交易日)。仓位:等权,持有 SMALLCAP_TOP_N 只。
+SMALLCAP_TOP_N = 4               # 持仓数量(等权),5 万账户避免过度分散和最低佣金拖累
+SMALLCAP_REBALANCE_DAYS = 10     # 调仓周期(交易日),10≈双周,降低换手和交易成本
 # "折中:小市值为主"——设市值下限规避最小微盘(国九条退市/流动性高风险区),设上限保持小盘暴露
 SMALLCAP_MIN_MKTCAP = 20e8      # 流通市值下限(元),约 20 亿,排除最小微盘
 SMALLCAP_MAX_MKTCAP = 200e8     # 流通市值上限(元),约 200 亿,保持小盘风格
@@ -189,17 +279,17 @@ SMALLCAP_W_OBV = 0.10           # OBV 资金累积加分,只增强排序,不作�
 SMALLCAP_REVERSAL_DAYS = 20     # 短期反转回看天数
 # 国九条风控过滤阈值
 SMALLCAP_MIN_PRICE = 2.0        # 最低股价(元),缓冲 1 元面值退市风险
-SMALLCAP_MAX_PRICE = 30.0       # 最高股价(元),小资金避免单手金额过大
+SMALLCAP_MAX_PRICE = 60.0       # 最高股价(元),避免一手金额过度挤占 5 万账户
 SMALLCAP_MIN_PB = 0.5           # PB 下限,过滤净资产为负/极低的高退市风险标的
 SMALLCAP_MIN_TURNOVER = 1.0     # 换手率下限(%),过滤流动性枯竭标的
 SMALLCAP_MIN_VOLUME_RATIO = 0.5  # 量比下限,过滤缩量僵尸股
 MIN_POSITION_RATIO = 0.3        # 最低仓位比例,低于此值视为空仓
 
 # ==================== ETF / 行业 RPS 轮动参数 ====================
-RPS_LOOKBACK_DAYS = 20          # RPS 回看周期(日频)
+RPS_LOOKBACK_DAYS = 60          # RPS 回看周期(日频),更偏中期趋势
 RPS_MIN_SCORE = 0.0             # 入选分位下限:小池子(ETF/行业)横截面分位会被高阈值卡死,
                                 # 改由"趋势确认+绝对正动量"过滤(见 rps_rotation),此处设 0 不额外卡分位
-RPS_TOP_N = 3                   # 每日最多持有/买入数量
+RPS_TOP_N = 2                   # 每日最多持有/买入数量,小资金优先集中 ETF 暴露
 RPS_MIN_AVG_VOLUME = 500_000    # 20 日均量下限
 RPS_HISTORY_DAYS = 120          # RPS 拉取历史行情天数
 ETF_REBALANCE_WEEKDAY = 0       # ETF/RPS 默认周一调仓
@@ -264,7 +354,7 @@ DEFAULT_STOCK_POOL = {
     "sz000651": {"name": "格力电器", "code": "sz000651", "raw_code": "000651"},
     "sz000725": {"name": "京东方A",  "code": "sz000725", "raw_code": "000725"},
     "sz002415": {"name": "海康威视", "code": "sz002415", "raw_code": "002415"},
-    "sz300750": {"name": "宁德时代", "code": "sz300750", "raw_code": "300750"},
+    "sz002594": {"name": "比亚迪", "code": "sz002594", "raw_code": "002594"},
 }
 
 # 合并标的池
@@ -408,9 +498,71 @@ def is_a_share_stock(code: str) -> bool:
     return get_a_share_market(code) is not None
 
 
+def is_star_market(code: str) -> bool:
+    """判断是否为科创板股票（688/689 开头）。"""
+    try:
+        raw = normalize_a_share_code(code)
+    except ValueError:
+        return False
+    return get_a_share_market(code) == "sh" and raw.startswith(("688", "689"))
+
+
+def is_chinext(code: str) -> bool:
+    """判断是否为创业板股票（300/301 开头）。"""
+    try:
+        raw = normalize_a_share_code(code)
+    except ValueError:
+        return False
+    return get_a_share_market(code) == "sz" and raw.startswith(("300", "301"))
+
+
+def get_stock_board(code: str) -> str | None:
+    """返回股票板块标识，用于权限过滤与日志解释。"""
+    if is_star_market(code):
+        return "star"
+    if is_chinext(code):
+        return "chinext"
+    if is_a_share_stock(code):
+        return "mainboard"
+    return None
+
+
+def is_account_tradable_stock(code: str) -> bool:
+    """判断股票是否符合当前账户权限配置。
+
+    ETF 不在此函数处理；科创/创业方向可通过 ETF 池暴露，而不是直接买入
+    需要额外权限的个股。
+    """
+    board = get_stock_board(code)
+    if board is None:
+        return False
+    if board == "star":
+        return ALLOW_STAR_MARKET_STOCKS
+    if board == "chinext":
+        return ALLOW_CHINEXT_STOCKS
+    return ALLOW_MAIN_BOARD_STOCKS
+
+
+def get_trading_permission_rejection_reason(code: str) -> str | None:
+    """返回当前账户权限导致不可买卖的原因。"""
+    if get_stock_board(code) == "mainboard" and not ALLOW_MAIN_BOARD_STOCKS:
+        return f"标的 {code} 属于沪深主板股票，当前账户配置未开通主板股票交易权限"
+    if is_star_market(code) and not ALLOW_STAR_MARKET_STOCKS:
+        return (
+            f"标的 {code} 属于科创板股票，当前账户配置未开通科创板权限；"
+            "5 万资金账户建议通过科创 50/科创 100 等 ETF 替代"
+        )
+    if is_chinext(code) and not ALLOW_CHINEXT_STOCKS:
+        return (
+            f"标的 {code} 属于创业板股票，当前账户配置未开通创业板权限；"
+            "5 万资金账户建议通过创业板 ETF 或主板科技股替代"
+        )
+    return None
+
+
 def is_supported_trading_target(code: str) -> bool:
-    """判断是否为当前交易通道支持的沪深 A 股股票或 ETF。"""
-    return is_a_share_stock(code) or is_etf(code)
+    """判断是否为当前账户和交易通道支持的沪深 A 股股票或 ETF。"""
+    return is_account_tradable_stock(code) or is_etf(code)
 
 
 def get_etf_market(code: str) -> str | None:
@@ -453,15 +605,6 @@ def to_baostock_code(code: str) -> str:
     if market is None:
         raise ValueError(f"非沪深 A 股股票代码，无法请求 BaoStock 行情: {code}")
     return f"{market}.{normalize_a_share_code(code)}"
-
-
-def is_chinext(code):
-    """判断是否为创业板股票（300/301 开头）。"""
-    try:
-        raw = normalize_a_share_code(code)
-    except ValueError:
-        return False
-    return get_a_share_market(code) == "sz" and raw.startswith(("300", "301"))
 
 
 def is_shenzhen(code):

@@ -41,6 +41,8 @@ from config.settings import (  # noqa: E402
     MAX_SINGLE_ETF,
     MAX_SINGLE_STOCK,
     MAX_TOTAL_POSITION,
+    MIN_ETF_ORDER_AMOUNT,
+    MIN_STOCK_ORDER_AMOUNT,
     MIN_POSITION_RATIO,
     REBUY_COOLDOWN_SECONDS,
     ENTRY_INTERVAL_SECONDS,
@@ -677,6 +679,7 @@ def _calculate_buy_shares(
         broker.query_cash(),
         max_ratio=target_ratio,
         total_value=broker.portfolio.get_total_value(prices),
+        min_amount=MIN_ETF_ORDER_AMOUNT,
     )
 
 
@@ -1322,6 +1325,7 @@ def _handle_candidate_entries(
             broker.query_cash(),
             max_ratio=MAX_SINGLE_STOCK,
             total_value=total_value,
+            min_amount=MIN_STOCK_ORDER_AMOUNT,
         )
         if shares < LOT_SIZE:
             recorder.record("signal_skipped", {
@@ -1401,6 +1405,7 @@ def _handle_candidate_entries(
                 broker.query_cash(),
                 max_ratio=MAX_SINGLE_STOCK,
                 total_value=broker.portfolio.get_total_value(prices),
+                min_amount=MIN_STOCK_ORDER_AMOUNT,
             )
             if shares < LOT_SIZE:
                 recorder.record("signal_skipped", {

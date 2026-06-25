@@ -10,7 +10,7 @@ from config.settings import (
     COMMISSION_RATE, COMMISSION_MIN, STAMP_TAX_RATE, TRANSFER_FEE_RATE,
     SLIPPAGE_STOCK, SLIPPAGE_ETF, LOT_SIZE,
     LIMIT_MAINBOARD, LIMIT_ST, LIMIT_CHINEXT,
-    is_etf, is_chinext, CASH_BUFFER,
+    is_etf, is_chinext, is_star_market, CASH_BUFFER,
 )
 
 
@@ -29,8 +29,8 @@ class TradingRules:
         """
         if is_etf(code):
             return LIMIT_MAINBOARD  # ETF 跟随主板 10%
-        if is_chinext(code):
-            return LIMIT_CHINEXT    # 创业板 20%
+        if is_chinext(code) or is_star_market(code):
+            return LIMIT_CHINEXT    # 创业板/科创板 20%
         # ST 判断通过股票名称中包含 ST 来判断，这里返回默认值
         # 调用方可通过传入额外信息覆盖
         return LIMIT_MAINBOARD
@@ -159,7 +159,13 @@ class TradingRules:
         }
 
     @staticmethod
-    def calc_lot_size(price, cash, max_ratio=0.25, total_value=None):
+    def calc_lot_size(
+        price: float,
+        cash: float,
+        max_ratio: float = 0.25,
+        total_value: float | None = None,
+        min_amount: float = 0.0,
+    ) -> int:
         """计算可买股数（100 股整数倍）
 
         Args:
@@ -167,6 +173,7 @@ class TradingRules:
             cash: 可用现金
             max_ratio: 单票最大仓位比例
             total_value: 组合总市值（用于计算仓位限制）
+            min_amount: 最低建议成交额，低于该金额则不生成买入单
 
         Returns:
             可买股数（整手）
@@ -191,6 +198,8 @@ class TradingRules:
         # 计算可买股数，向下取整到 100 的整数倍
         max_shares = int(net_cash / price)
         lot_shares = (max_shares // LOT_SIZE) * LOT_SIZE
+        if min_amount > 0 and lot_shares * price < min_amount:
+            return 0
 
         return lot_shares
 

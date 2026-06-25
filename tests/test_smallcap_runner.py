@@ -38,6 +38,10 @@ class FakeLoader:
         days = [d.strftime("%Y%m%d") for d in pd.date_range("2024-01-01", periods=30, freq="B")]
         self._days = days
         self.stocks = [{"code": f"60000{i}", "name": f"票{i}"} for i in range(8)]
+        self.stocks.extend([
+            {"code": "688981", "name": "中芯国际"},
+            {"code": "300750", "name": "宁德时代"},
+        ])
         self._hist = {}
         for i, s in enumerate(self.stocks):
             close = 10 + np.linspace(0, 1, 30) + i * 0.1
@@ -93,7 +97,7 @@ def test_rebalance_builds_equal_weight_smallcap_portfolio():
 
     pos = broker.query_positions()
     assert pos, "调仓应建立持仓"
-    # top_n=5 时按 min(单票15%,总仓60%/5)≈12% 建仓,应能建多只
+    # top_n=5 时按 min(单票20%,总仓90%/5)≈18% 建仓,应能建多只
     assert len(pos) >= 4
     # 选中的应是市值最小/最便宜的(600000~600004),不含最大最贵的 600007
     assert "600007" not in pos
@@ -125,3 +129,14 @@ def test_rebalance_sells_dropped_holdings():
 
     # 600007 市值最大最贵,应被调出
     assert "600007" not in broker.query_positions()
+
+
+def test_universe_filters_restricted_board_stocks():
+    """构建小市值候选池时应先剔除当前账户不能买的创业板/科创板个股。"""
+    loader = FakeLoader()
+
+    codes, _quotes = sr._build_universe(loader, max_universe=100)
+
+    assert "688981" not in codes
+    assert "300750" not in codes
+    assert "600000" in codes
