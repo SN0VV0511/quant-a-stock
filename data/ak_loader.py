@@ -528,6 +528,26 @@ class AKDataLoader:
     def close(self):
         self._logout()
 
+    _stock_name_map_cache: dict[str, str] | None = None
+    _stock_name_map_cache_time: float = 0
+
+    def get_stock_name_map(self) -> dict[str, str]:
+        """获取 A 股代码→名称映射，缓存 1 小时。"""
+        now = time.time()
+        if self._stock_name_map_cache and (now - self._stock_name_map_cache_time) < 3600:
+            return self._stock_name_map_cache
+        try:
+            import akshare as ak
+            df = ak.stock_info_a_code_name()
+            name_map = dict(zip(df["code"].astype(str), df["name"].astype(str)))
+            self._stock_name_map_cache = name_map
+            self._stock_name_map_cache_time = now
+            logger.info("加载 A 股名称映射: %d 只", len(name_map))
+            return name_map
+        except Exception as e:
+            logger.warning("加载 A 股名称映射失败: %s", e)
+            return {}
+
     def _get_stocks_from_cache(self) -> list[dict[str, str]]:
         """从历史行情缓存文件名中提取并去重股票代码。"""
         stocks_by_code: dict[str, dict[str, str]] = {}
@@ -561,6 +581,12 @@ class AKDataLoader:
                     }
         except Exception as e:
             logger.warning("从缓存目录读取股票列表失败: %s", e)
+        # 用 AKShare 名称映射补全空名称
+        name_map = self.get_stock_name_map()
+        if name_map:
+            for stock in stocks_by_code.values():
+                if not stock["name"]:
+                    stock["name"] = name_map.get(stock["code"], stock["code"])
         stocks = sorted(stocks_by_code.values(), key=lambda stock: stock["code"])
         logger.info("从缓存文件中恢复股票列表: %d 只", len(stocks))
         return stocks

@@ -152,7 +152,7 @@ def score_candidates(
 
         raw.append({
             "code": code,
-            "name": name_map.get(code, code),
+            "name": name_map.get(code, code) or code,
             "price": round(close_now, 2),
             "momentum": round(momentum, 4),
             "momentum_20": round(momentum_20, 4),

@@ -27,6 +27,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config.settings import (  # noqa: E402
     BROKER_MODE,
     CASH_BUFFER,
+    DATA_DIR,
     DEFAULT_INDUSTRY_INDEX_POOL,
     DEFAULT_RPS_ETF_POOL,
     ENABLE_RPS_ROTATION,
@@ -1336,7 +1337,7 @@ def _handle_candidate_entries(
         if shared.last_entry_time > 0 and (now_entry - shared.last_entry_time) < ENTRY_INTERVAL_SECONDS:
             continue
 
-        name = next((s["name"] for s in stocks if s["code"] == code), code)
+        name = next((s["name"] for s in stocks if s["code"] == code and s.get("name")), code) or code
         order = OrderIntent(
             code=code,
             name=name,
