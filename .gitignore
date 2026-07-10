@@ -28,6 +28,16 @@ data/daily_backtest_state.json
 data/.password_hash
 reports/daily_*.txt
 
+# ============ 运行时数据与敏感交易记录（不入库） ============
+data/*.db
+data/_brief.txt
+data/_preview.txt
+data/live_runner.pid
+reports/*.json
+reports/*_combined.txt
+reports/all_daily_reports.txt
+reports/monthly_review_*.md
+
 # 前端构建产物与依赖
 web/frontend/node_modules/
 web/dist/

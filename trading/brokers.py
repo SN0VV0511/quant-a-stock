@@ -103,10 +103,10 @@ class PaperBrokerAdapter(BrokerAdapter):
             return self._reject(order, "委托数量必须大于 0")
         if order.price <= 0:
             return self._reject(order, "委托价格必须大于 0")
-        if not is_supported_trading_target(order.code):
+        # 卖出不受板块权限限制，只限制买入方向
+        if order.action != "sell" and not is_supported_trading_target(order.code):
             reason = get_trading_permission_rejection_reason(order.code)
             return self._reject(order, reason or f"仅支持当前账户可交易的沪深 A 股股票或 ETF 代码: {order.code}")
-
         trade_date = order.date or today_yyyymmdd()
         with self._lock:
             if order.action == "buy":
@@ -231,7 +231,8 @@ class QmtBrokerAdapter(BrokerAdapter):
     def place_order(self, order: OrderIntent) -> ExecutionReport:
         """记录 dry-run 委托，不发送真实订单。"""
         self._ensure_connected()
-        if not is_supported_trading_target(order.code):
+        # 卖出不受板块权限限制，只限制买入方向
+        if order.action != "sell" and not is_supported_trading_target(order.code):
             reason = get_trading_permission_rejection_reason(order.code)
             report = ExecutionReport(
                 order_id=f"QMT-DRYRUN-{uuid.uuid4().hex[:12]}",

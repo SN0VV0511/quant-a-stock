@@ -82,6 +82,8 @@ def load_trade_log():
             )
             if key not in known:
                 trades.append(trade)
+    # 按 (date, time) 升序排序，确保前端 reverse() 后最新在前
+    trades.sort(key=lambda t: (str(t.get("date", "")), str(t.get("time", ""))))
     return trades
 
 
@@ -543,6 +545,8 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 t["name"] = name_map.get(raw, "")
         # 提取所有日期列表
         all_dates = sorted(set(t.get("date", "") for t in trades if t.get("date")), reverse=True)
+        # 按 (date, time) 升序排序，确保前端 reverse() 后最新在前
+        trades.sort(key=lambda t: (str(t.get("date", "")), str(t.get("time", ""))))
         # 按日期过滤
         if query_date:
             trades = [t for t in trades if t.get("date") == query_date]

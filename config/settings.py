@@ -144,7 +144,7 @@ CASH_BUFFER = 0.10          # 现金缓冲 10%
 
 # ==================== 风控参数 ====================
 DAILY_LOSS_THRESHOLD = 0.025    # 单日最大亏损 2.5% 触发降仓
-MAX_DRAWDOWN_THRESHOLD = 0.06   # 最大回撤 6% 暂停开仓
+MAX_DRAWDOWN_THRESHOLD = 0.06   # 回撤暂停开仓阈值(正常模式)
 DAILY_LOSS_CIRCUIT_BREAKER = -DAILY_LOSS_THRESHOLD
 MAX_DRAWDOWN_CIRCUIT_BREAKER = -MAX_DRAWDOWN_THRESHOLD
 DRAWDOWN_REDUCED_POSITION_LIMIT = 0.30
@@ -190,7 +190,7 @@ ETF_EXTREME_STOP_PCT = 0.12
 # 2026-01~2026-06 小样本 A/B 回测:单独开启 MA20 大盘择时使收益
 # +2.07% -> +2.29%,最大回撤 10.33% -> 8.34%。5 万小资金优先控制回撤,
 # 默认开启;如需复现旧基线,运行前设 ENABLE_MARKET_REGIME=false。
-ENABLE_MARKET_REGIME = _env_bool("ENABLE_MARKET_REGIME", True)  # 指数弱势时暂停开新仓,只允许卖出/止损
+ENABLE_MARKET_REGIME = _env_bool("ENABLE_MARKET_REGIME", True)  # 大盘择时(正常模式)
 MARKET_INDEX_CODE = "sh000300"  # 基准指数:沪深300
 MARKET_REGIME_MA = 20           # 大盘择时均线周期
 

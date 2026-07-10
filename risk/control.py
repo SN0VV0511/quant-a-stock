@@ -119,7 +119,8 @@ class RiskController:
         action = order["action"]
 
         # 1. 标的范围检查：当前交易通道允许沪深 A 股股票和 ETF。
-        if not is_supported_trading_target(code):
+        #    卖出（减仓/止损）不受板块权限限制，只限制买入方向。
+        if action != "sell" and not is_supported_trading_target(code):
             permission_reason = get_trading_permission_rejection_reason(code)
             if permission_reason:
                 return False, permission_reason
