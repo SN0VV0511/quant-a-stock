@@ -319,6 +319,15 @@ def run(date_str: str | None = None, *, dry_run: bool = False, force_rebalance: 
         ignore_calendar: bool = False, top_n: int = SMALLCAP_TOP_N,
         max_universe: int = SCAN_MAX_HIST_FETCH) -> dict:
     """每日执行入口。"""
+    if (
+        not dry_run
+        and os.getenv("ENABLE_LEGACY_ACCOUNT_WRITERS", "false").strip().lower()
+        not in {"1", "true", "yes", "on"}
+    ):
+        raise RuntimeError(
+            "旧小市值账户写入已停用；仅研究 dry-run 可直接运行，"
+            "确需复现时显式设置 ENABLE_LEGACY_ACCOUNT_WRITERS=true"
+        )
     date_str = (date_str or datetime.now().strftime("%Y%m%d")).replace("-", "")
 
     if not ignore_calendar and not is_trading_day(date_str):

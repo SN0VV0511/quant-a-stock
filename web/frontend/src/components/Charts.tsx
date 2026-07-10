@@ -240,6 +240,168 @@ export function AllocationChart({ cash, positions, reducedMotion }: AllocationCh
   );
 }
 
+interface EquitySparklineProps {
+  points: EquityPoint[];
+  reducedMotion: boolean;
+}
+
+/**
+ * 策略剧场中的紧凑净值曲线，只展示真实账户快照，不补造行情点。
+ */
+export function EquitySparkline({ points, reducedMotion }: EquitySparklineProps) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const chartRef = useRef<Chart | null>(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || !points.length) {
+      return undefined;
+    }
+
+    const labels = points.map((point) => shortTimeLabel(point.t));
+    const values = points.map((point) => point.value);
+    if (!chartRef.current) {
+      chartRef.current = new Chart(canvasRef.current, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            {
+              data: values,
+              borderColor: "#ff4b3e",
+              backgroundColor: "rgba(255, 75, 62, 0.08)",
+              borderWidth: 1.8,
+              pointRadius: points.length === 1 ? 2.5 : 0,
+              pointBackgroundColor: "#ff6a5f",
+              fill: true,
+              tension: 0.34
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: chartAnimation(reducedMotion),
+          interaction: { intersect: false, mode: "index" },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: "rgba(5, 5, 6, 0.96)",
+              borderColor: "rgba(255, 75, 62, 0.45)",
+              borderWidth: 1,
+              titleColor: "#f5f5f4",
+              bodyColor: "#b8b6b2",
+              callbacks: {
+                label: (context) => `净值：¥${formatNumber(Number(context.raw), 0)}`
+              }
+            }
+          },
+          scales: {
+            x: { display: false },
+            y: { display: false }
+          }
+        }
+      });
+    } else {
+      chartRef.current.data.labels = labels;
+      chartRef.current.data.datasets[0].data = values;
+      const dataset = chartRef.current.data.datasets[0] as unknown as { pointRadius: number };
+      dataset.pointRadius = points.length === 1 ? 2.5 : 0;
+      chartRef.current.update();
+    }
+
+    return undefined;
+  }, [points, reducedMotion]);
+
+  useEffect(() => {
+    return () => {
+      chartRef.current?.destroy();
+      chartRef.current = null;
+    };
+  }, []);
+
+  if (!points.length) {
+    return <div className="equity-sparkline is-empty">等待净值快照</div>;
+  }
+  return (
+    <div className="equity-sparkline">
+      <canvas ref={canvasRef} aria-label="账户净值迷你曲线" />
+    </div>
+  );
+}
+
+interface RiskGaugeProps {
+  score: number;
+  reducedMotion: boolean;
+}
+
+/**
+ * 半圆风险仪表：分数越高代表风险预算越充足。
+ */
+export function RiskGauge({ score, reducedMotion }: RiskGaugeProps) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const chartRef = useRef<Chart | null>(null);
+  const safeScore = Math.max(0, Math.min(10, score));
+  const color = safeScore >= 7 ? "#37c978" : safeScore >= 4 ? "#f2a93b" : "#ff4b3e";
+
+  useEffect(() => {
+    if (!canvasRef.current) {
+      return undefined;
+    }
+    const values = [safeScore, 10 - safeScore];
+    if (!chartRef.current) {
+      chartRef.current = new Chart(canvasRef.current, {
+        type: "doughnut",
+        data: {
+          datasets: [
+            {
+              data: values,
+              backgroundColor: [color, "rgba(255, 255, 255, 0.1)"],
+              borderWidth: 0,
+              borderRadius: 8
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: chartAnimation(reducedMotion),
+          rotation: -90,
+          circumference: 180,
+          cutout: "76%",
+          plugins: {
+            legend: { display: false },
+            tooltip: { enabled: false }
+          }
+        }
+      });
+    } else {
+      chartRef.current.data.datasets[0].data = values;
+      chartRef.current.data.datasets[0].backgroundColor = [color, "rgba(255, 255, 255, 0.1)"];
+      chartRef.current.update();
+    }
+
+    return undefined;
+  }, [color, reducedMotion, safeScore]);
+
+  useEffect(() => {
+    return () => {
+      chartRef.current?.destroy();
+      chartRef.current = null;
+    };
+  }, []);
+
+  return (
+    <div className="risk-gauge">
+      <canvas ref={canvasRef} aria-label={`风险评分 ${safeScore.toFixed(1)} 分`} />
+      <div className="risk-gauge__value" aria-hidden="true">
+        <strong>{safeScore.toFixed(1)}</strong>
+        <span>/ 10</span>
+        <small>风险评分</small>
+      </div>
+    </div>
+  );
+}
+
 interface BacktestChartProps {
   series: BacktestSeries[];
   reducedMotion: boolean;

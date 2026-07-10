@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trus
 
 COPY . .
 
-CMD ["python3", "live_runner.py", "--top-n", "30"]
+CMD ["python3", "robust_runner.py", "daemon"]

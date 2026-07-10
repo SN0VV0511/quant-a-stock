@@ -26,7 +26,7 @@ except ImportError:
     BACKTEST_START = "20250101"
     BACKTEST_END = "20260523"
 
-    def normalize_a_share_code(code):
+    def normalize_a_share_code(code: str) -> str:
         """配置模块不可用时的最小代码归一化兜底。"""
         normalized = str(code).strip().lower().replace(".", "")
         if normalized.startswith(("sh", "sz")):
@@ -35,7 +35,7 @@ except ImportError:
             raise ValueError(f"无效证券代码: {code}")
         return normalized
 
-    def to_baostock_code(code):
+    def to_baostock_code(code: str) -> str:
         """配置模块不可用时的最小 BaoStock 代码兜底。"""
         raw = normalize_a_share_code(code)
         market = "sh" if raw.startswith(("600", "601", "603", "605", "688", "689")) else "sz"

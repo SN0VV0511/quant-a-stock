@@ -5,7 +5,9 @@ import { App } from "./App";
 vi.mock("./components/Charts", () => ({
   AllocationChart: () => <div data-testid="allocation-chart" />,
   BacktestChart: () => <div data-testid="backtest-chart" />,
-  EquityCharts: () => <div data-testid="equity-chart" />
+  EquityCharts: () => <div data-testid="equity-chart" />,
+  EquitySparkline: () => <div data-testid="equity-sparkline" />,
+  RiskGauge: () => <div data-testid="risk-gauge" />
 }));
 
 describe("App login", () => {
@@ -32,7 +34,8 @@ describe("App login", () => {
     fireEvent.change(screen.getByLabelText("访问密码"), { target: { value: "secret" } });
     fireEvent.click(screen.getByRole("button", { name: "进入终端" }));
 
-    await waitFor(() => expect(screen.getByText("总市值")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "策略运行剧场" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /组合持仓/ }));
     await waitFor(() => expect(screen.getByText("持仓战绩榜")).toBeInTheDocument());
   });
 
@@ -45,9 +48,11 @@ describe("App login", () => {
 
     render(<App />);
 
-    await waitFor(() => expect(screen.getByText("候选股")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "策略运行剧场" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "阶段 1：行情快照" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /组合持仓/ }));
     expect(screen.getByText("持仓战绩榜")).toBeInTheDocument();
-    expect(screen.getByText("暂无持仓，成交后显示实时盈亏排名。")).toBeInTheDocument();
+    expect(screen.getByText("暂无已平仓记录，完成交易后显示战绩排名。")).toBeInTheDocument();
   });
 
   it("新密码不足时给出内联错误", async () => {

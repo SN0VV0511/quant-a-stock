@@ -1,32 +1,26 @@
 import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  Activity,
-  BarChart3,
-  Briefcase,
-  Eye,
-  EyeOff,
-  FlaskConical,
-  LogOut,
-  Radar,
-  RefreshCcw,
-  Search,
-  ShieldCheck,
-  Terminal,
-  Trophy,
-  TrendingUp,
-  UserLock,
-  Zap
-} from "lucide-react";
+  IconActivity as Activity,
+  IconBriefcase2 as Briefcase,
+  IconEye as Eye,
+  IconEyeOff as EyeOff,
+  IconFlask as FlaskConical,
+  IconLockAccess as UserLock,
+  IconRadar2 as Radar,
+  IconSearch as Search,
+  IconTerminal2 as Terminal,
+  IconTrophy as Trophy,
+  IconTrendingUp as TrendingUp
+} from "@tabler/icons-react";
 import { api } from "./lib/api";
 import { formatCurrency, formatNumber, formatPercent, toneByValue } from "./lib/format";
 import { usePolling } from "./hooks/usePolling";
 import { useReducedMotion } from "./hooks/useReducedMotion";
 import { AllocationChart, BacktestChart, EquityCharts } from "./components/Charts";
 import { HudCard } from "./components/HudCard";
+import { StrategyTheater, type WorkspaceSection } from "./components/StrategyTheater";
 import type { BacktestSeries, Candidate, ObservationResponse, Position, ProfitRankItem, RpsOrder, RpsSignal, Trade } from "./types";
-
-const todayKey = () => new Date().toISOString().slice(0, 10).replace(/-/g, "");
 
 function toneClass(value: number | null | undefined) {
   return `tone-${toneByValue(value)}`;
@@ -230,18 +224,10 @@ function KpiCard({
   );
 }
 
-function StatusDot({ active, label }: { active?: boolean; label: string }) {
-  return (
-    <span className="status-pill">
-      <span className={`status-dot ${active ? "is-live" : "is-off"}`} aria-hidden="true" />
-      {label}
-    </span>
-  );
-}
-
 function DashboardView({ onLogout }: { onLogout: () => void }) {
   const reducedMotion = useReducedMotion();
   const clock = useClock();
+  const [activeSection, setActiveSection] = useState<WorkspaceSection>("theater");
   const [logLines, setLogLines] = useState(100);
   const [autoScroll, setAutoScroll] = useState(true);
   const [showRejected, setShowRejected] = useState(false);
@@ -264,182 +250,174 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
     window.history.replaceState({}, "", "/quantify/login");
   };
 
-  const lastRefresh = Math.max(
-    status.updatedAt ?? 0,
-    portfolio.updatedAt ?? 0,
-    trades.updatedAt ?? 0,
-    candidates.updatedAt ?? 0,
-    rps.updatedAt ?? 0,
-    equity.updatedAt ?? 0
-  );
-
   const portfolioData = portfolio.data;
   const positionRatio = portfolioData?.position_ratio ?? 0;
   const currentDrawdown = (equity.data?.points ?? []).at(-1)?.drawdown ?? 0;
   const allTrades = (trades.data?.trades ?? []).slice().reverse();
   const visibleTrades = showRejected ? allTrades : allTrades.filter((trade) => trade.status !== "rejected");
-  const todayTrades = visibleTrades.filter((trade) => trade.date === todayKey());
-  const latestTrade = visibleTrades[0];
   const rpsOrders = rps.data?.orders ?? [];
   const activeOrders = rpsOrders.filter((order) => order.status !== "risk_rejected");
   const backtestSeries = backtest.data?.series ?? [];
 
+  const workspaceContent = (() => {
+    switch (activeSection) {
+      case "market":
+        return (
+          <section className="workspace-grid">
+            <div className="workspace-kpis span-12">
+              <KpiCard
+                label="总市值"
+                value={formatCurrency(portfolioData?.total_value, 0)}
+                sub={`${formatPercent(portfolioData?.pnl_pct)} (${formatNumber(portfolioData?.pnl, 0)} 元)`}
+                tone={toneByValue(portfolioData?.pnl)}
+              />
+              <KpiCard label="可用现金" value={formatCurrency(portfolioData?.cash, 0)} sub={`现金占比 ${((1 - positionRatio) * 100).toFixed(1)}%`} />
+              <KpiCard
+                label="持仓仓位"
+                value={`${(positionRatio * 100).toFixed(1)}%`}
+                sub={`${portfolioData?.position_count ?? 0} 只持仓`}
+                tone={positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent"}
+                meter={{ value: positionRatio * 100, tone: positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent" }}
+              />
+              <KpiCard
+                label="当前回撤"
+                value={`${(currentDrawdown * 100).toFixed(2)}%`}
+                sub="目标上限 10%"
+                tone={currentDrawdown > 0.06 ? "negative" : currentDrawdown > 0.03 ? "warn" : "neutral"}
+                meter={{
+                  value: (currentDrawdown / 0.1) * 100,
+                  tone: currentDrawdown > 0.06 ? "negative" : currentDrawdown > 0.03 ? "warn" : "accent"
+                }}
+              />
+            </div>
+            <HudCard
+              className="span-12"
+              title="净值曲线 / 回撤"
+              icon={<TrendingUp size={18} />}
+              meta={equity.data?.points?.length ? `${equity.data.points.length} 个快照` : equity.error ?? "--"}
+            >
+              {equity.data?.points?.length ? <EquityCharts points={equity.data.points} reducedMotion={reducedMotion} /> : <EmptyState text="暂无净值数据，运行虚拟盘后生成快照。" />}
+            </HudCard>
+            <HudCard title="候选股雷达" icon={<Search size={18} />} meta={candidates.data?.updated_at || "--"}>
+              <CandidateList items={candidates.data?.candidates ?? []} />
+            </HudCard>
+            <HudCard title="运行观察" icon={<Radar size={18} />} meta={healthMeta(observation.data)}>
+              <ObservationPanel data={observation.data} error={observation.error} />
+            </HudCard>
+          </section>
+        );
+      case "factors":
+        return (
+          <section className="workspace-grid">
+            <HudCard title="主板候选池" icon={<Search size={18} />} meta={candidates.data?.updated_at || "--"}>
+              <CandidateList items={candidates.data?.candidates ?? []} />
+            </HudCard>
+            <HudCard title="ETF / RPS 研究基线" icon={<Radar size={18} />} meta={rpsStatus(rps.data)}>
+              <RpsPanel signals={rps.data?.etf_signals ?? []} industries={rps.data?.industry_signals ?? []} orders={activeOrders} hiddenCount={rpsOrders.length - activeOrders.length} errors={rps.data?.errors ?? []} />
+            </HudCard>
+            <HudCard className="span-12" title="策略验收状态" icon={<FlaskConical size={18} />} meta={healthMeta(observation.data)}>
+              <ObservationPanel data={observation.data} error={observation.error} />
+            </HudCard>
+          </section>
+        );
+      case "portfolio":
+        return (
+          <section className="workspace-grid">
+            <HudCard title="持仓分布" icon={<Briefcase size={18} />} meta={`${portfolioData?.position_count ?? 0} 只`}>
+              <AllocationChart cash={portfolioData?.cash ?? 0} positions={portfolioData?.positions ?? []} reducedMotion={reducedMotion} />
+              <PositionList items={portfolioData?.positions ?? []} cash={portfolioData?.cash ?? 0} totalValue={portfolioData?.total_value ?? 0} />
+            </HudCard>
+            <HudCard className="profit-ranking-card" title="持仓战绩榜" icon={<Trophy size={18} />} meta="历史累计收益率">
+              <ProfitRanking ranking={profitRanking.data?.ranking ?? []} />
+            </HudCard>
+          </section>
+        );
+      case "execution":
+        return (
+          <section className="workspace-grid">
+            <HudCard
+              title="操作记录"
+              icon={<Activity size={18} />}
+              meta={
+                <label className="checkline">
+                  <input type="checkbox" checked={showRejected} onChange={(event) => setShowRejected(event.target.checked)} />
+                  显示异常
+                </label>
+              }
+            >
+              <DateFilter dates={trades.data?.dates ?? []} selected={selectedDate} onSelect={setSelectedDate} />
+              <TradeList trades={visibleTrades} />
+            </HudCard>
+            <HudCard
+              title="实时日志"
+              icon={<Terminal size={18} />}
+              meta={
+                <div className="inline-actions">
+                  <button className={logLines === 100 ? "chip active" : "chip"} onClick={() => setLogLines(100)} type="button">100</button>
+                  <button className={logLines === 300 ? "chip active" : "chip"} onClick={() => setLogLines(300)} type="button">300</button>
+                  <button className={autoScroll ? "chip active" : "chip"} onClick={() => setAutoScroll((next) => !next)} type="button">自动</button>
+                </div>
+              }
+            >
+              <LogPanel lines={logs.data?.logs ?? []} autoScroll={autoScroll} />
+            </HudCard>
+          </section>
+        );
+      case "backtest":
+        return (
+          <section className="workspace-grid">
+            <HudCard className="span-12" title="策略回测对比" icon={<FlaskConical size={18} />} meta={backtestMeta(backtest.data)}>
+              {backtestSeries.length ? (
+                <div className="backtest-layout">
+                  <BacktestChart series={backtestSeries} reducedMotion={reducedMotion} />
+                  <BacktestTable series={backtestSeries} />
+                </div>
+              ) : (
+                <EmptyState text={backtest.data?.generating ? "策略回测生成中，完成后自动显示。" : backtest.data?.error ? `策略回测生成失败：${backtest.data.error}` : "暂无回测结果，系统会在后台自动生成。"} />
+              )}
+            </HudCard>
+          </section>
+        );
+      case "system":
+        return (
+          <section className="workspace-grid">
+            <HudCard title="运行状态" icon={<Activity size={18} />} meta={status.error ?? "实时"}>
+              <div className="metric-stack">
+                <div className="kv-row"><span>策略进程</span><strong className={status.data?.live_runner ? "tone-positive" : "tone-negative"}>{status.data?.live_runner ? "运行中" : "已停止"}</strong></div>
+                <div className="kv-row"><span>Web 服务</span><strong className={status.data?.web_server === false ? "tone-negative" : "tone-positive"}>{status.data?.web_server === false ? "异常" : "正常"}</strong></div>
+                <div className="kv-row"><span>盯盘线程</span><strong>{status.data?.watch_thread ? "运行中" : "未运行"}</strong></div>
+                <div className="kv-row"><span>扫描线程</span><strong>{status.data?.scan_thread ? "运行中" : "未运行"}</strong></div>
+                <div className="kv-row"><span>最后日志</span><strong>{status.data?.last_log_time || "--"}</strong></div>
+              </div>
+            </HudCard>
+            <HudCard title="验收检查" icon={<FlaskConical size={18} />} meta={healthMeta(observation.data)}>
+              <ObservationPanel data={observation.data} error={observation.error} />
+            </HudCard>
+          </section>
+        );
+      case "theater":
+      default:
+        return null;
+    }
+  })();
+
   return (
-    <main className="terminal-shell">
-      <div className="hud-bg" aria-hidden="true" />
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">
-            <Zap size={20} />
-          </span>
-          <div>
-            <span className="eyebrow">A-SHARE OPS</span>
-            <h1>量化盯盘系统</h1>
-          </div>
-        </div>
-        <div className="topbar__right">
-          <span className={`refresh-signal ${lastRefresh ? "active" : ""}`} aria-label="刷新状态" />
-          <StatusDot active={status.data?.live_runner} label={status.data?.live_runner ? "实盘观察运行中" : "观察已停止"} />
-          <StatusDot active={status.data?.watch_thread} label="盯盘线" />
-          <StatusDot active={status.data?.scan_thread} label="扫描线" />
-          <span className="clock">{clock}</span>
-          <button className="ghost-action" onClick={logout} type="button">
-            <LogOut size={16} />
-            退出
-          </button>
-        </div>
-      </header>
-
-      <div className="risk-banner">
-        <ShieldCheck size={16} />
-        本页面为个人量化研究工具，数据来源于公开渠道，存在延迟与误差，不构成任何投资建议。
-      </div>
-
-      <motion.section
-        className="kpi-grid"
-        initial={reducedMotion ? false : "hidden"}
-        animate="show"
-        variants={{
-          hidden: {},
-          show: { transition: { staggerChildren: 0.045 } }
-        }}
-      >
-        <KpiCard
-          label="总市值"
-          value={formatCurrency(portfolioData?.total_value, 0)}
-          sub={`${formatPercent(portfolioData?.pnl_pct)} (${formatNumber(portfolioData?.pnl, 0)} 元)`}
-          tone={toneByValue(portfolioData?.pnl)}
-        />
-        <KpiCard label="可用现金" value={formatCurrency(portfolioData?.cash, 0)} sub={`现金占比 ${((1 - positionRatio) * 100).toFixed(1)}%`} />
-        <KpiCard
-          label="持仓仓位"
-          value={`${(positionRatio * 100).toFixed(1)}%`}
-          sub={`${portfolioData?.position_count ?? 0} 只持仓`}
-          tone={positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent"}
-          meter={{ value: positionRatio * 100, tone: positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent" }}
-        />
-        <KpiCard
-          label="当前回撤"
-          value={`${(currentDrawdown * 100).toFixed(2)}%`}
-          sub="峰值回撤"
-          tone={currentDrawdown > 0.06 ? "negative" : currentDrawdown > 0.03 ? "warn" : "neutral"}
-          meter={{
-            value: (currentDrawdown / 0.1) * 100,
-            tone: currentDrawdown > 0.06 ? "negative" : currentDrawdown > 0.03 ? "warn" : "accent"
-          }}
-        />
-        <KpiCard
-          label="今日交易"
-          value={`${todayTrades.length}`}
-          sub={latestTrade ? `${latestTrade.time ?? ""} ${(latestTrade.action ?? latestTrade.direction) === "buy" ? "买" : "卖"} ${latestTrade.name || latestTrade.code}` : "--"}
-          tone="neutral"
-        />
-        <KpiCard
-          label="候选股"
-          value={`${candidates.data?.candidates?.length ?? 0}`}
-          sub={candidates.data?.updated_at ? `更新 ${String(candidates.data.updated_at).slice(11)}` : "--"}
-          tone="accent"
-        />
-      </motion.section>
-
-      <section className="dashboard-grid">
-        <HudCard
-          className="span-12"
-          title="净值曲线 / 回撤"
-          icon={<TrendingUp size={18} />}
-          meta={equity.data?.points?.length ? `${equity.data.points.length} 个快照` : equity.error ?? "--"}
-        >
-          {equity.data?.points?.length ? <EquityCharts points={equity.data.points} reducedMotion={reducedMotion} /> : <EmptyState text="暂无净值数据，运行虚拟盘后生成快照。" />}
-        </HudCard>
-
-        <HudCard title="候选股雷达" icon={<Search size={18} />} meta={candidates.data?.updated_at || "--"}>
-          <CandidateList items={candidates.data?.candidates ?? []} />
-        </HudCard>
-
-        <HudCard title="ETF / RPS 日频" icon={<Radar size={18} />} meta={rpsStatus(rps.data)}>
-          <RpsPanel signals={rps.data?.etf_signals ?? []} industries={rps.data?.industry_signals ?? []} orders={activeOrders} hiddenCount={rpsOrders.length - activeOrders.length} errors={rps.data?.errors ?? []} />
-        </HudCard>
-
-        <HudCard
-          title="实时日志"
-          icon={<Terminal size={18} />}
-          meta={
-            <div className="inline-actions">
-              <button className={logLines === 100 ? "chip active" : "chip"} onClick={() => setLogLines(100)} type="button">
-                100
-              </button>
-              <button className={logLines === 300 ? "chip active" : "chip"} onClick={() => setLogLines(300)} type="button">
-                300
-              </button>
-              <button className={autoScroll ? "chip active" : "chip"} onClick={() => setAutoScroll((next) => !next)} type="button">
-                自动
-              </button>
-            </div>
-          }
-        >
-          <LogPanel lines={logs.data?.logs ?? []} autoScroll={autoScroll} />
-        </HudCard>
-
-        <HudCard title="持仓分布" icon={<Briefcase size={18} />} meta={`${portfolioData?.position_count ?? 0} 只`}>
-          <AllocationChart cash={portfolioData?.cash ?? 0} positions={portfolioData?.positions ?? []} reducedMotion={reducedMotion} />
-          <PositionList items={portfolioData?.positions ?? []} cash={portfolioData?.cash ?? 0} totalValue={portfolioData?.total_value ?? 0} />
-        </HudCard>
-
-        <HudCard
-          title="操作记录"
-          icon={<Activity size={18} />}
-          meta={
-            <label className="checkline">
-              <input type="checkbox" checked={showRejected} onChange={(event) => setShowRejected(event.target.checked)} />
-              显示异常
-            </label>
-          }
-        >
-          <DateFilter dates={trades.data?.dates ?? []} selected={selectedDate} onSelect={setSelectedDate} />
-          <TradeList trades={visibleTrades} />
-        </HudCard>
-
-        <HudCard
-          className="profit-ranking-card"
-          title="持仓战绩榜"
-          icon={<Trophy size={18} />}
-          meta="历史累计收益率"
-        >
-          <ProfitRanking ranking={profitRanking.data?.ranking ?? []} />
-        </HudCard>
-
-        <HudCard className="span-12" title="策略回测对比" icon={<FlaskConical size={18} />} meta={backtestMeta(backtest.data)}>
-          {backtestSeries.length ? (
-            <div className="backtest-layout">
-              <BacktestChart series={backtestSeries} reducedMotion={reducedMotion} />
-              <BacktestTable series={backtestSeries} />
-            </div>
-          ) : (
-            <EmptyState text={backtest.data?.generating ? "策略回测生成中，完成后自动显示。" : backtest.data?.error ? `策略回测生成失败：${backtest.data.error}` : "暂无回测结果，系统会在后台自动生成。"} />
-          )}
-        </HudCard>
-      </section>
-    </main>
+    <StrategyTheater
+      activeSection={activeSection}
+      onSectionChange={setActiveSection}
+      onLogout={logout}
+      clock={clock}
+      status={status.data}
+      portfolio={portfolioData}
+      candidates={candidates.data?.candidates ?? []}
+      rps={rps.data}
+      trades={allTrades}
+      equity={equity.data?.points ?? []}
+      observation={observation.data}
+      reducedMotion={reducedMotion}
+    >
+      {workspaceContent}
+    </StrategyTheater>
   );
 }
 

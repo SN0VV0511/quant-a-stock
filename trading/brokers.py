@@ -13,9 +13,13 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from config.settings import (
+    ENFORCE_T1,
+    INITIAL_CAPITAL,
     LIVE_TRADING_ENABLED,
     QMT_ACCOUNT_ID,
     QMT_CLIENT_PATH,
+    ROBUST_V2_ACCOUNT_ID,
+    ROBUST_V2_LEDGER_PATH,
     STATE_FILE,
     get_trading_permission_rejection_reason,
     is_supported_trading_target,
@@ -23,6 +27,7 @@ from config.settings import (
 from config.time_utils import today_yyyymmdd
 from rules.position import PositionManager
 from trading.models import ExecutionReport, OrderIntent, PortfolioSnapshot
+from trading.ledger import PaperLedger
 
 
 class BrokerAdapter(ABC):
@@ -90,10 +95,14 @@ class PaperBrokerAdapter(BrokerAdapter):
         with self._lock:
             return copy.deepcopy(self.portfolio.get_all_positions())
 
-    def query_snapshot(self, current_prices: dict[str, float] | None = None) -> PortfolioSnapshot:
+    def query_snapshot(
+        self, current_prices: dict[str, float] | None = None
+    ) -> PortfolioSnapshot:
         """查询账户快照。"""
         with self._lock:
-            return PortfolioSnapshot.from_portfolio(self.portfolio, current_prices, source="paper")
+            return PortfolioSnapshot.from_portfolio(
+                self.portfolio, current_prices, source="paper"
+            )
 
     def place_order(self, order: OrderIntent) -> ExecutionReport:
         """提交虚拟盘订单并立即按规则成交。"""
@@ -106,7 +115,11 @@ class PaperBrokerAdapter(BrokerAdapter):
         # 卖出不受板块权限限制，只限制买入方向
         if order.action != "sell" and not is_supported_trading_target(order.code):
             reason = get_trading_permission_rejection_reason(order.code)
-            return self._reject(order, reason or f"仅支持当前账户可交易的沪深 A 股股票或 ETF 代码: {order.code}")
+            return self._reject(
+                order,
+                reason
+                or f"仅支持当前账户可交易的沪深 A 股股票或 ETF 代码: {order.code}",
+            )
         trade_date = order.date or today_yyyymmdd()
         with self._lock:
             if order.action == "buy":
@@ -193,6 +206,74 @@ class PaperBrokerAdapter(BrokerAdapter):
         return f"PAPER-{uuid.uuid4().hex[:12]}"
 
 
+class SQLitePaperBrokerAdapter(BrokerAdapter):
+    """以 SQLite 单账本为唯一状态源的 ``paper_v2`` Broker。"""
+
+    def __init__(
+        self,
+        ledger_path: str | None = None,
+        account_id: str = ROBUST_V2_ACCOUNT_ID,
+        initial_cash: float = INITIAL_CAPITAL,
+        ledger: PaperLedger | None = None,
+    ) -> None:
+        self.ledger = ledger or PaperLedger(
+            ledger_path or ROBUST_V2_LEDGER_PATH,
+            account_id=account_id,
+            initial_cash=initial_cash,
+            enforce_t1=True,
+        )
+        self._connected = False
+
+    def connect(self) -> None:
+        """连接账本；运行配置关闭 T+1 时拒绝启动。"""
+        if not ENFORCE_T1:
+            raise RuntimeError("paper_v2 强制 T+1：检测到 ENFORCE_T1=false，拒绝启动")
+        self.ledger.connect()
+        self._connected = True
+
+    def _ensure_connected(self) -> None:
+        """确保 Broker 已连接。"""
+        if not self._connected:
+            raise RuntimeError("paper_v2 Broker 尚未连接")
+
+    def query_cash(self) -> float:
+        """查询账本可用现金。"""
+        self._ensure_connected()
+        return self.ledger.query_cash()
+
+    def query_positions(self) -> dict[str, dict[str, Any]]:
+        """查询账本持仓及 T+1 可卖数量。"""
+        self._ensure_connected()
+        return self.ledger.query_positions()
+
+    def query_snapshot(
+        self, current_prices: dict[str, float] | None = None
+    ) -> PortfolioSnapshot:
+        """查询账户净值快照。"""
+        self._ensure_connected()
+        return self.ledger.query_snapshot(current_prices)
+
+    def place_order(self, order: OrderIntent) -> ExecutionReport:
+        """提交幂等虚拟盘订单。"""
+        self._ensure_connected()
+        return self.ledger.place_order(order)
+
+    def cancel_order(self, order_id: str) -> bool:
+        """同步虚拟盘不支持撤单。"""
+        self._ensure_connected()
+        return self.ledger.cancel_order(order_id)
+
+    def query_orders(self) -> list[ExecutionReport]:
+        """查询持久化订单回报。"""
+        self._ensure_connected()
+        return self.ledger.query_orders()
+
+    def close(self) -> None:
+        """关闭账本连接。"""
+        self.ledger.close()
+        self._connected = False
+
+
 class QmtBrokerAdapter(BrokerAdapter):
     """QMT 预留适配器。
 
@@ -208,14 +289,20 @@ class QmtBrokerAdapter(BrokerAdapter):
     ) -> None:
         self.account_id = account_id or QMT_ACCOUNT_ID
         self.client_path = client_path or QMT_CLIENT_PATH
-        self.live_enabled = LIVE_TRADING_ENABLED if live_enabled is None else live_enabled
+        self.live_enabled = (
+            LIVE_TRADING_ENABLED if live_enabled is None else live_enabled
+        )
         self._connected = False
         self._orders: list[ExecutionReport] = []
 
     def connect(self) -> None:
         """连接 QMT dry-run 通道。"""
+        if not ENFORCE_T1:
+            raise RuntimeError("paper/live 模式检测到 ENFORCE_T1=false，拒绝启动")
         if self.live_enabled:
-            raise NotImplementedError("真实 QMT 下单尚未完成联调，当前版本拒绝连接实盘通道")
+            raise NotImplementedError(
+                "真实 QMT 下单尚未完成联调，当前版本拒绝连接实盘通道"
+            )
         self._connected = True
 
     def query_cash(self) -> float:
@@ -244,7 +331,8 @@ class QmtBrokerAdapter(BrokerAdapter):
                 shares=order.shares,
                 amount=0.0,
                 strategy=order.strategy,
-                message=reason or f"仅支持当前账户可交易的沪深 A 股股票或 ETF 代码: {order.code}",
+                message=reason
+                or f"仅支持当前账户可交易的沪深 A 股股票或 ETF 代码: {order.code}",
                 date=order.date,
             )
             self._orders.append(report)
@@ -291,9 +379,11 @@ class QmtBrokerAdapter(BrokerAdapter):
 
 def create_broker(mode: str | None = None) -> BrokerAdapter:
     """根据环境配置创建 Broker。"""
-    broker_mode = (mode or os.getenv("BROKER_MODE", "paper")).lower()
+    broker_mode = (mode or os.getenv("BROKER_MODE") or "paper").lower()
     if broker_mode == "paper":
         return PaperBrokerAdapter()
+    if broker_mode == "paper_v2":
+        return SQLitePaperBrokerAdapter()
     if broker_mode == "qmt":
         return QmtBrokerAdapter()
     raise ValueError(f"不支持的 Broker 模式: {broker_mode}")

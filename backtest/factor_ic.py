@@ -106,7 +106,9 @@ def compute_factor_ic(
         frames[code] = d.sort_values("date").reset_index(drop=True)
 
     days = sorted({str(x).replace("-", "")[:8] for x in trading_days})
-    acc = {name: {"ic": [], "layers": [[] for _ in range(n_layers)]} for name in factors}
+    acc: dict[str, dict[str, Any]] = {
+        name: {"ic": [], "layers": [[] for _ in range(n_layers)]} for name in factors
+    }
 
     for i in range(0, len(days) - period, period):
         t, t_fwd = days[i], days[i + period]

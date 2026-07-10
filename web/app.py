@@ -11,6 +11,7 @@ import time
 import logging
 import threading
 import mimetypes
+import sqlite3
 from datetime import datetime
 from dataclasses import asdict
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
     INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR, DATA_DIR,
     SNAPSHOT_LOG_FILE, TRADE_EVENTS_FILE, RPS_STATE_FILE, normalize_a_share_code,
+    ROBUST_V2_ACCOUNT_ID, ROBUST_V2_LEDGER_PATH,
 )
 from config.time_utils import format_local
 from data.ak_loader import AKDataLoader
@@ -33,12 +35,142 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templat
 DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
 
 # 日志文件路径
-LIVE_LOG = os.path.join(LOG_DIR, "live.log")
-LIVE_TODAY_LOG = os.path.join(LOG_DIR, "live_today.log")
+LIVE_LOG = os.path.join(LOG_DIR, "robust_v2.log")
+LIVE_TODAY_LOG = LIVE_LOG
 ROOT_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _v2_connection():
+    """以只读模式打开 paper_v2 账本，缺失或损坏时返回 None。"""
+    path = Path(ROBUST_V2_LEDGER_PATH).expanduser().resolve()
+    if not path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=2)
+        connection.row_factory = sqlite3.Row
+        return connection
+    except sqlite3.Error as exc:
+        logger.warning("只读打开 paper_v2 账本失败: %s", exc)
+        return None
+
+
+def _load_v2_state():
+    """从 SQLite 读取与旧 Web API 兼容的账户状态。"""
+    connection = _v2_connection()
+    if connection is None:
+        return None
+    try:
+        account = connection.execute(
+            "SELECT cash, updated_at FROM accounts WHERE account_id = ?",
+            (ROBUST_V2_ACCOUNT_ID,),
+        ).fetchone()
+        if account is None:
+            return None
+        rows = connection.execute(
+            "SELECT * FROM positions WHERE account_id = ? ORDER BY code",
+            (ROBUST_V2_ACCOUNT_ID,),
+        ).fetchall()
+        positions = {
+            str(row["code"]): {
+                "name": str(row["name"]),
+                "shares": int(row["shares"]),
+                "avg_cost": float(row["avg_cost"]),
+                "current_price": float(row["last_price"]),
+                "strategy_tag": "robust_v2",
+                "strategy_version": str(row["strategy_version"]),
+            }
+            for row in rows
+        }
+        return {
+            "cash": float(account["cash"]),
+            "positions": positions,
+            "trades": [],
+            "updated_at": str(account["updated_at"]),
+            "account_id": ROBUST_V2_ACCOUNT_ID,
+            "source": "paper_v2",
+        }
+    except sqlite3.Error as exc:
+        logger.warning("读取 paper_v2 账户状态失败: %s", exc)
+        return None
+    finally:
+        connection.close()
+
+
+def _load_v2_orders():
+    """从幂等订单表读取成交和拒单，供交易页展示。"""
+    connection = _v2_connection()
+    if connection is None:
+        return None
+    try:
+        rows = connection.execute(
+            "SELECT * FROM orders WHERE account_id = ? ORDER BY trade_date, created_at, rowid",
+            (ROBUST_V2_ACCOUNT_ID,),
+        ).fetchall()
+        return [
+            {
+                "date": str(row["trade_date"]),
+                "time": str(row["filled_at"] or row["created_at"])[-8:],
+                "code": str(row["code"]),
+                "name": str(row["name"]),
+                "action": str(row["action"]),
+                "direction": str(row["action"]),
+                "price": float(row["requested_price"]),
+                "actual_price": float(row["actual_price"]),
+                "shares": int(row["filled_shares"] or row["requested_shares"]),
+                "amount": float(row["amount"]),
+                "cost": float(row["total_cost"]),
+                "profit": float(row["profit"]) if row["profit"] is not None else None,
+                "strategy": str(row["strategy"]),
+                "strategy_tag": str(row["strategy_tag"]),
+                "reason": str(row["reason"]),
+                "sell_reason": str(row["reason"]) if row["action"] == "sell" else "",
+                "status": str(row["status"]),
+                "reject_reason": str(row["message"]) if row["status"] == "rejected" else "",
+            }
+            for row in rows
+        ]
+    except sqlite3.Error as exc:
+        logger.warning("读取 paper_v2 订单失败: %s", exc)
+        return None
+    finally:
+        connection.close()
+
+
+def _load_v2_equity():
+    """读取单账本净值和回撤序列。"""
+    connection = _v2_connection()
+    if connection is None:
+        return None
+    try:
+        rows = connection.execute(
+            """
+            SELECT snapshot_date, captured_at, total_value FROM nav_snapshots
+            WHERE account_id = ? ORDER BY snapshot_date, captured_at
+            """,
+            (ROBUST_V2_ACCOUNT_ID,),
+        ).fetchall()
+        points = []
+        peak = INITIAL_CAPITAL
+        for row in rows:
+            value = float(row["total_value"])
+            peak = max(peak, value)
+            points.append({
+                "t": str(row["captured_at"] or row["snapshot_date"]),
+                "value": value,
+                "drawdown": round((peak - value) / peak, 6) if peak > 0 else 0.0,
+            })
+        return points
+    except sqlite3.Error as exc:
+        logger.warning("读取 paper_v2 净值失败: %s", exc)
+        return None
+    finally:
+        connection.close()
+
+
 def load_state():
+    v2_state = _load_v2_state()
+    if v2_state is not None:
+        return v2_state
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8", errors="replace") as f:
@@ -49,6 +181,9 @@ def load_state():
 
 
 def load_trade_log():
+    v2_orders = _load_v2_orders()
+    if v2_orders is not None:
+        return v2_orders
     trades = []
     if os.path.exists(TRADE_LOG_FILE):
         try:
@@ -89,6 +224,15 @@ def load_trade_log():
 
 def load_rps_state():
     """读取 ETF/RPS 日频轮动状态。"""
+    if _load_v2_state() is not None:
+        return {
+            "available": False,
+            "status": "research_only",
+            "message": "paper_v2 不运行旧 ETF/RPS 日内账户策略",
+            "etf_signals": [],
+            "industry_signals": [],
+            "orders": [],
+        }
     if not os.path.exists(RPS_STATE_FILE):
         return {
             "available": False,
@@ -487,7 +631,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         # 合并 trade_events.jsonl 中被风控拒绝的订单
         today = datetime.now().strftime("%Y%m%d")
         events_file = os.path.join(DATA_DIR, "trade_events.jsonl")
-        if os.path.exists(events_file):
+        if _load_v2_state() is None and os.path.exists(events_file):
             try:
                 with open(events_file, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
@@ -685,7 +829,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
     def _api_status(self):
         """系统状态"""
-        live_running = is_process_running("live_runner.py")
+        live_running = is_process_running("robust_runner.py")
         web_running = True  # 自己在跑
 
         # 读取最新日志时间
@@ -739,6 +883,10 @@ class QuantHandler(SimpleHTTPRequestHandler):
         2. trade_events.jsonl — 盘中快照(portfolio_snapshot 事件)
         3. state daily_snapshots — 兜底(仅日期与总市值)
         """
+        v2_points = _load_v2_equity()
+        if v2_points is not None:
+            return {"points": v2_points, "initial": INITIAL_CAPITAL, "source": "paper_v2"}
+
         points: list[dict] = []
         seen_timestamps: set[str] = set()
 
@@ -871,7 +1019,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 body = f.read().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", len(body))
+            self.send_header("Content-Length", len(body))  # type: ignore[arg-type]
             # 入口文件引用带内容哈希的资源，必须每次校验以便及时发现新构建。
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
@@ -893,7 +1041,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             body = f.read()
         self.send_response(200)
         self.send_header("Content-Type", mime_type or "application/octet-stream")
-        self.send_header("Content-Length", len(body))
+        self.send_header("Content-Length", len(body))  # type: ignore[arg-type]
         # Vite 构建资源带内容哈希，可安全长期缓存且无需重复校验。
         self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         self.end_headers()

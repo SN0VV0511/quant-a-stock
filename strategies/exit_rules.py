@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 from config.settings import (
     ATR_STOP_MAX_PCT,
@@ -57,7 +57,7 @@ def get_exit_policy(strategy_tag: str) -> str:
     return "combo_trend"
 
 
-def _valid_positive(value: float | None) -> bool:
+def _valid_positive(value: float | None) -> TypeGuard[float]:
     """判断数值是否可用于风控计算。"""
     return value is not None and value > 0
 
@@ -104,7 +104,7 @@ def evaluate_position_exit(
     优先级为 T+1、灾难止损、ATR 硬止损、移动止盈、趋势破坏、
     Combo 防守、时间止损、策略调仓。
     """
-    indicators = {
+    indicators: dict[str, Any] = {
         "price": price,
         "avg_cost": avg_cost,
         "highest_price": highest_price,

@@ -22,7 +22,7 @@ export default defineConfig({
           react: ["react", "react-dom"],
           charts: ["chart.js"],
           motion: ["framer-motion"],
-          icons: ["lucide-react"]
+          icons: ["@tabler/icons-react"]
         }
       }
     }

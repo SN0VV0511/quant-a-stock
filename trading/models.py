@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
@@ -19,15 +20,22 @@ StrategyTag = Literal[
     "smallcap_value",
     "etf_rotation",
     "rps_rotation",
+    "robust_v2",
 ]
-VALID_STRATEGY_TAGS: frozenset[str] = frozenset({
-    "combo_trend",
-    "momentum_breakout",
-    "limitup_follow",
-    "smallcap_value",
-    "etf_rotation",
-    "rps_rotation",
-})
+VALID_STRATEGY_TAGS: frozenset[str] = frozenset(
+    {
+        "combo_trend",
+        "momentum_breakout",
+        "limitup_follow",
+        "smallcap_value",
+        "etf_rotation",
+        "rps_rotation",
+        "robust_v2",
+    }
+)
+
+Adjustment = Literal["qfq", "hfq", "none"]
+AssetType = Literal["stock", "etf"]
 
 
 def _now_str() -> str:
@@ -49,6 +57,10 @@ class OrderIntent:
         reason: 触发订单的原因。
         date: 交易日期，格式 YYYYMMDD。
         source: 订单来源，用于观测和审计。
+        account_id: 账户标识，新账本固定使用 ``paper_v2``。
+        strategy_version: 产生订单的策略版本。
+        signal_date: 产生目标仓位的信号日期。
+        idempotency_key: 幂等键；未传入时按订单关键字段稳定生成。
         metadata: 扩展字段。
     """
 
@@ -64,6 +76,10 @@ class OrderIntent:
     created_at: str = field(default_factory=_now_str)
     metadata: dict[str, Any] = field(default_factory=dict)
     strategy_tag: StrategyTag = "combo_trend"
+    account_id: str = "legacy"
+    strategy_version: str = "legacy"
+    signal_date: str | None = None
+    idempotency_key: str = ""
 
     def __post_init__(self) -> None:
         """校验订单意图的基础合法性。"""
@@ -77,6 +93,25 @@ class OrderIntent:
             raise ValueError(f"股数不能为负数: {self.shares}")
         if self.strategy_tag not in VALID_STRATEGY_TAGS:
             raise ValueError(f"不支持的策略标签: {self.strategy_tag}")
+        if not self.account_id.strip():
+            raise ValueError("账户标识不能为空")
+        if not self.strategy_version.strip():
+            raise ValueError("策略版本不能为空")
+        if not self.idempotency_key:
+            signal_date = self.signal_date or self.date or "undated"
+            raw = "|".join(
+                (
+                    self.account_id,
+                    self.strategy_version,
+                    signal_date,
+                    self.code,
+                    self.action,
+                    str(self.shares),
+                )
+            )
+            object.__setattr__(
+                self, "idempotency_key", hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            )
 
     @classmethod
     def from_order_dict(cls, order: dict[str, Any]) -> "OrderIntent":
@@ -92,10 +127,31 @@ class OrderIntent:
             date=order.get("date"),
             source=str(order.get("source", "legacy")),
             strategy_tag=order.get("strategy_tag", "combo_trend"),
-            metadata={k: v for k, v in order.items() if k not in {
-                "code", "action", "price", "shares", "name", "strategy", "reason", "date", "source",
-                "strategy_tag",
-            }},
+            account_id=str(order.get("account_id", "legacy")),
+            strategy_version=str(order.get("strategy_version", "legacy")),
+            signal_date=order.get("signal_date") or order.get("date"),
+            idempotency_key=str(order.get("idempotency_key", "")),
+            metadata={
+                k: v
+                for k, v in order.items()
+                if k
+                not in {
+                    "code",
+                    "action",
+                    "price",
+                    "shares",
+                    "name",
+                    "strategy",
+                    "reason",
+                    "date",
+                    "source",
+                    "strategy_tag",
+                    "account_id",
+                    "strategy_version",
+                    "signal_date",
+                    "idempotency_key",
+                }
+            },
         )
 
     def to_order_dict(self) -> dict[str, Any]:
@@ -111,8 +167,127 @@ class OrderIntent:
             "date": self.date,
             "source": self.source,
             "strategy_tag": self.strategy_tag,
+            "account_id": self.account_id,
+            "strategy_version": self.strategy_version,
+            "signal_date": self.signal_date,
+            "idempotency_key": self.idempotency_key,
             **self.metadata,
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可序列化字典。"""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MarketSnapshot:
+    """策略输入使用的可审计市场快照。
+
+    ``freshness_seconds`` 由数据装载层在生成快照时计算。策略只接受未超过
+    ``max_freshness_seconds`` 的快照，避免缓存陈旧时继续下单。
+    """
+
+    trade_date: str
+    source: str
+    adjustment: Adjustment
+    data_hash: str
+    freshness_seconds: int
+    max_freshness_seconds: int = 86_400
+    previous_trade_date: str | None = None
+    captured_at: str = field(default_factory=_now_str)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if len(self.trade_date) != 8 or not self.trade_date.isdigit():
+            raise ValueError(f"交易日必须为 YYYYMMDD: {self.trade_date}")
+        if not self.source.strip():
+            raise ValueError("行情数据源不能为空")
+        if not self.data_hash.strip():
+            raise ValueError("行情数据哈希不能为空")
+        if self.freshness_seconds < 0:
+            raise ValueError("行情新鲜度不能为负数")
+        if self.max_freshness_seconds <= 0:
+            raise ValueError("行情最大允许陈旧时间必须大于 0")
+
+    @property
+    def is_fresh(self) -> bool:
+        """返回快照是否仍在允许的新鲜度范围内。"""
+        return self.freshness_seconds <= self.max_freshness_seconds
+
+    def require_fresh(self) -> None:
+        """陈旧快照直接失败，禁止策略静默降级下单。"""
+        if not self.is_fresh:
+            raise ValueError(
+                f"行情快照已陈旧: freshness={self.freshness_seconds}s, "
+                f"limit={self.max_freshness_seconds}s"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可序列化字典。"""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TargetPosition:
+    """目标组合中的单个证券权重。"""
+
+    code: str
+    target_weight: float
+    reason: str
+    asset_type: AssetType
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.code:
+            raise ValueError("目标标的代码不能为空")
+        if not 0 < self.target_weight <= 1:
+            raise ValueError(f"目标权重必须位于 (0, 1]: {self.target_weight}")
+        if not self.reason.strip():
+            raise ValueError("目标仓位原因不能为空")
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可序列化字典。"""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TargetPortfolio:
+    """策略输出的目标组合，不包含任何券商下单行为。"""
+
+    account_id: str
+    strategy_version: str
+    signal_date: str
+    positions: tuple[TargetPosition, ...]
+    source_snapshot_hash: str
+    cash_weight: float
+    generated_at: str = field(default_factory=_now_str)
+    fallback_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.account_id.strip():
+            raise ValueError("目标组合账户标识不能为空")
+        if not self.strategy_version.strip():
+            raise ValueError("目标组合策略版本不能为空")
+        if len(self.signal_date) != 8 or not self.signal_date.isdigit():
+            raise ValueError(f"信号日期必须为 YYYYMMDD: {self.signal_date}")
+        codes = [position.code for position in self.positions]
+        if len(codes) != len(set(codes)):
+            raise ValueError("目标组合不能包含重复标的")
+        exposure = sum(position.target_weight for position in self.positions)
+        if exposure > 1 + 1e-9:
+            raise ValueError(f"目标组合总权重不能超过 100%: {exposure:.4f}")
+        if not 0 <= self.cash_weight <= 1:
+            raise ValueError(f"现金权重必须位于 [0, 1]: {self.cash_weight}")
+        if abs(exposure + self.cash_weight - 1) > 1e-6:
+            raise ValueError(
+                f"目标持仓与现金权重之和必须为 100%: exposure={exposure:.4f}, "
+                f"cash={self.cash_weight:.4f}"
+            )
+
+    @property
+    def exposure(self) -> float:
+        """返回目标总仓位。"""
+        return sum(position.target_weight for position in self.positions)
 
     def to_dict(self) -> dict[str, Any]:
         """转换为可序列化字典。"""

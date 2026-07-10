@@ -30,6 +30,10 @@ reports/daily_*.txt
 
 # ============ 运行时数据与敏感交易记录（不入库） ============
 data/*.db
+data/*.db-*
+data/universe/
+data/robust_research/
+data/robust_v2_selected.json
 data/_brief.txt
 data/_preview.txt
 data/live_runner.pid

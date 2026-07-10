@@ -15,7 +15,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from config.time_utils import now_local, today_yyyymmdd
+from config.settings import ROBUST_V2_ACCOUNT_ID
+from config.time_utils import today_yyyymmdd
+from trading.ledger import PaperLedger
 
 LOGGER = logging.getLogger("monthly_review")
 
@@ -36,6 +38,18 @@ class ReviewSummary:
     sell_count: int
     win_rate: float
     realized_profit: float
+    gross_profit: float = 0.0
+    net_profit: float = 0.0
+    commission: float = 0.0
+    stamp_tax: float = 0.0
+    slippage: float = 0.0
+    total_cost: float = 0.0
+    turnover_rate: float = 0.0
+    benchmark_return: float | None = None
+    data_version: str = "legacy-json"
+    strategy_version: str = "legacy"
+    account_id: str = "legacy"
+    run_id: str | None = None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -85,7 +99,9 @@ def _snapshot_points(root_dir: Path) -> list[tuple[str, float]]:
     daily_snapshots = state.get("daily_snapshots", {})
     if isinstance(daily_snapshots, dict):
         for date, summary in daily_snapshots.items():
-            if isinstance(summary, dict) and isinstance(summary.get("total_value"), (int, float)):
+            if isinstance(summary, dict) and isinstance(
+                summary.get("total_value"), (int, float)
+            ):
                 points.append((str(date), float(summary["total_value"])))
     return points
 
@@ -128,34 +144,73 @@ def _filter_by_days(
     trades: list[dict[str, Any]],
     days: int,
 ) -> tuple[list[tuple[str, float]], list[dict[str, Any]]]:
-    """按最近 N 天过滤快照和交易。"""
-    cutoff = now_local() - timedelta(days=days)
+    """按数据中最新日期回看 N 天，避免测试和补报受系统当前日期漂移影响。"""
+    parsed_dates = [
+        parsed
+        for parsed in (
+            [_parse_date(point[0]) for point in points]
+            + [_parse_date(str(trade.get("date", ""))) for trade in trades]
+        )
+        if parsed is not None
+    ]
+    anchor = max(parsed_dates) if parsed_dates else datetime.now()
+    cutoff = anchor - timedelta(days=days)
     filtered_points = [
-        point for point in points
-        if (_parse_date(point[0]) is None or _parse_date(point[0]) >= cutoff)
+        point
+        for point in points
+        if (parsed := _parse_date(point[0])) is None or parsed >= cutoff
     ]
     filtered_trades = [
-        trade for trade in trades
-        if (_parse_date(str(trade.get("date", ""))) is None or _parse_date(str(trade.get("date", ""))) >= cutoff)
+        trade
+        for trade in trades
+        if (
+            (parsed := _parse_date(str(trade.get("date", "")))) is None
+            or parsed >= cutoff
+        )
     ]
     return filtered_points, filtered_trades
 
 
-def build_review(root_dir: Path, days: int = 30) -> ReviewSummary:
-    """生成观察期复盘摘要。"""
-    points, trades = _filter_by_days(_snapshot_points(root_dir), _trade_rows(root_dir), days)
+def _filter_by_range(
+    points: list[tuple[str, float]],
+    trades: list[dict[str, Any]],
+    start_date: str,
+    end_date: str,
+) -> tuple[list[tuple[str, float]], list[dict[str, Any]]]:
+    """按显式起止日期做确定性过滤。"""
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    if start is None or end is None:
+        raise ValueError("开始和结束日期必须为 YYYYMMDD 或 YYYY-MM-DD")
+    if start > end:
+        raise ValueError("开始日期不能晚于结束日期")
+    filtered_points = [
+        point
+        for point in points
+        if (parsed := _parse_date(point[0])) is not None and start <= parsed <= end
+    ]
+    filtered_trades = [
+        trade
+        for trade in trades
+        if (parsed := _parse_date(str(trade.get("date", "")))) is not None
+        and start <= parsed <= end
+    ]
+    return filtered_points, filtered_trades
+
+
+def _summarize(
+    points: list[tuple[str, float]],
+    trades: list[dict[str, Any]],
+    *,
+    days: int,
+    fallback_date: str,
+    fallback_value: float,
+    metadata: dict[str, Any] | None = None,
+) -> ReviewSummary:
+    """按统一口径计算 JSON 和 SQLite 复盘摘要。"""
+    metadata = metadata or {}
     if not points:
-        state = _load_json(root_dir / "data" / "portfolio_state.json")
-        cash = float(state.get("cash", 0.0))
-        positions = state.get("positions", {})
-        position_value = 0.0
-        if isinstance(positions, dict):
-            for pos in positions.values():
-                if isinstance(pos, dict):
-                    position_value += float(pos.get("current_price", pos.get("avg_cost", 0)) or 0) * int(pos.get("shares", 0) or 0)
-        total_value = round(cash + position_value, 2)
-        today = today_yyyymmdd()
-        points = [(today, total_value)]
+        points = [(fallback_date, fallback_value)]
 
     points.sort(key=lambda item: item[0])
     values = [value for _, value in points]
@@ -168,11 +223,38 @@ def build_review(root_dir: Path, days: int = 30) -> ReviewSummary:
         if running_peak > 0:
             max_drawdown = max(max_drawdown, (running_peak - value) / running_peak)
 
-    buy_count = sum(1 for trade in trades if (trade.get("action") or trade.get("direction")) == "buy")
-    sell_trades = [trade for trade in trades if (trade.get("action") or trade.get("direction")) == "sell"]
-    realized = sum(float(trade.get("profit", 0) or 0) for trade in sell_trades)
-    wins = sum(1 for trade in sell_trades if float(trade.get("profit", 0) or 0) > 0)
+    buy_count = sum(
+        1
+        for trade in trades
+        if (trade.get("action") or trade.get("direction")) == "buy"
+    )
+    sell_trades = [
+        trade
+        for trade in trades
+        if (trade.get("action") or trade.get("direction")) == "sell"
+    ]
+    realized = sum(
+        float(trade.get("profit", trade.get("net_pnl", 0)) or 0)
+        for trade in sell_trades
+    )
+    wins = sum(
+        1
+        for trade in sell_trades
+        if float(trade.get("profit", trade.get("net_pnl", 0)) or 0) > 0
+    )
     win_rate = wins / len(sell_trades) if sell_trades else 0.0
+
+    commission = sum(float(trade.get("commission", 0) or 0) for trade in trades)
+    stamp_tax = sum(float(trade.get("stamp_tax", 0) or 0) for trade in trades)
+    slippage = sum(float(trade.get("slippage", 0) or 0) for trade in trades)
+    total_cost = sum(
+        float(trade.get("total_cost", trade.get("cost", 0)) or 0) for trade in trades
+    )
+    average_value = sum(values) / len(values) if values else 0.0
+    traded_amount = sum(float(trade.get("amount", 0) or 0) for trade in trades)
+    gross_profit = sum(float(trade.get("gross_pnl", 0) or 0) for trade in sell_trades)
+    if not gross_profit and realized:
+        gross_profit = realized + total_cost
 
     return ReviewSummary(
         start_date=points[0][0],
@@ -180,21 +262,178 @@ def build_review(root_dir: Path, days: int = 30) -> ReviewSummary:
         days=days,
         initial_value=round(initial_value, 2),
         final_value=round(final_value, 2),
-        total_return=round((final_value - initial_value) / initial_value, 4) if initial_value > 0 else 0.0,
+        total_return=(
+            round((final_value - initial_value) / initial_value, 4)
+            if initial_value > 0
+            else 0.0
+        ),
         max_drawdown=round(max_drawdown, 4),
         trade_count=len(trades),
         buy_count=buy_count,
         sell_count=len(sell_trades),
         win_rate=round(win_rate, 4),
         realized_profit=round(realized, 2),
+        gross_profit=round(gross_profit, 2),
+        net_profit=round(final_value - initial_value, 2),
+        commission=round(commission, 2),
+        stamp_tax=round(stamp_tax, 2),
+        slippage=round(slippage, 2),
+        total_cost=round(total_cost, 2),
+        turnover_rate=(
+            round(traded_amount / average_value, 4) if average_value > 0 else 0.0
+        ),
+        benchmark_return=metadata.get("benchmark_return"),
+        data_version=str(metadata.get("data_version", "legacy-json")),
+        strategy_version=str(metadata.get("strategy_version", "legacy")),
+        account_id=str(metadata.get("account_id", "legacy")),
+        run_id=metadata.get("run_id"),
+    )
+
+
+def _legacy_fallback_value(root_dir: Path) -> float:
+    """从旧 JSON 状态估算无快照时的账户值。"""
+    state = _load_json(root_dir / "data" / "portfolio_state.json")
+    cash = float(state.get("cash", 0.0))
+    positions = state.get("positions", {})
+    position_value = 0.0
+    if isinstance(positions, dict):
+        for position in positions.values():
+            if isinstance(position, dict):
+                position_value += float(
+                    position.get("current_price", position.get("avg_cost", 0)) or 0
+                ) * int(position.get("shares", 0) or 0)
+    return round(cash + position_value, 2)
+
+
+def _build_ledger_review(
+    ledger_path: Path,
+    *,
+    account_id: str,
+    start_date: str,
+    end_date: str,
+    run_id: str | None,
+) -> ReviewSummary:
+    """从同一 SQLite 账户和运行批次生成显式日期复盘。"""
+    ledger = PaperLedger(ledger_path, account_id=account_id)
+    try:
+        ledger.connect()
+        review = ledger.build_review(start_date, end_date, run_id=run_id)
+        rows = list(review.snapshots)
+        run_ids = {str(row.get("run_id") or "") for row in rows}
+        if run_id is None and len(run_ids) > 1:
+            raise ValueError("月报区间包含多个 run_id，请显式传入 --run-id")
+        effective_run_id = run_id or (next(iter(run_ids)) if run_ids else None)
+        points = [
+            (str(row["snapshot_date"]), float(row["total_value"])) for row in rows
+        ]
+        trades = [
+            {
+                **trade,
+                "date": trade["trade_date"],
+                "profit": trade.get("net_pnl"),
+                "cost": trade.get("total_cost"),
+            }
+            for trade in review.trades
+        ]
+        latest = rows[-1] if rows else {}
+        benchmark_return: float | None = None
+        benchmark_values = [
+            float(row["benchmark_return"])
+            for row in rows
+            if row.get("benchmark_return") is not None
+        ]
+        if benchmark_values:
+            compounded = 1.0
+            for value in benchmark_values:
+                compounded *= 1 + value
+            benchmark_return = compounded - 1
+        return _summarize(
+            points,
+            trades,
+            days=(
+                datetime.strptime(end_date, "%Y%m%d")
+                - datetime.strptime(start_date, "%Y%m%d")
+            ).days
+            + 1,
+            fallback_date=end_date,
+            fallback_value=ledger.query_snapshot().total_value,
+            metadata={
+                "benchmark_return": benchmark_return,
+                "data_version": latest.get("data_version", "unknown"),
+                "strategy_version": latest.get("strategy_version", "robust_v2"),
+                "account_id": account_id,
+                "run_id": effective_run_id,
+            },
+        )
+    finally:
+        ledger.close()
+
+
+def build_review(
+    root_dir: Path,
+    days: int = 30,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    ledger_path: Path | None = None,
+    account_id: str = ROBUST_V2_ACCOUNT_ID,
+    run_id: str | None = None,
+) -> ReviewSummary:
+    """生成观察期复盘；V2 推荐显式传入开始、结束日期。"""
+    if (start_date is None) != (end_date is None):
+        raise ValueError("开始和结束日期必须同时传入")
+    normalized_start = start_date.replace("-", "") if start_date else None
+    normalized_end = end_date.replace("-", "") if end_date else None
+    candidate_ledger = ledger_path or (root_dir / "data" / "paper_v2.db")
+    if ledger_path is not None and not candidate_ledger.exists():
+        raise FileNotFoundError(f"指定的 paper_v2 账本不存在: {candidate_ledger}")
+    if candidate_ledger.exists():
+        if not normalized_start or not normalized_end:
+            raise ValueError("paper_v2 月报必须显式传入开始和结束日期")
+        return _build_ledger_review(
+            candidate_ledger,
+            account_id=account_id,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            run_id=run_id,
+        )
+
+    points = _snapshot_points(root_dir)
+    trades = _trade_rows(root_dir)
+    if normalized_start and normalized_end:
+        points, trades = _filter_by_range(
+            points, trades, normalized_start, normalized_end
+        )
+        effective_days = (
+            datetime.strptime(normalized_end, "%Y%m%d")
+            - datetime.strptime(normalized_start, "%Y%m%d")
+        ).days + 1
+        fallback_date = normalized_end
+    else:
+        points, trades = _filter_by_days(points, trades, days)
+        effective_days = days
+        fallback_date = today_yyyymmdd()
+    return _summarize(
+        points,
+        trades,
+        days=effective_days,
+        fallback_date=fallback_date,
+        fallback_value=_legacy_fallback_value(root_dir),
     )
 
 
 def _parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="生成虚拟盘观察期复盘摘要")
-    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]), help="项目根目录")
+    parser.add_argument(
+        "--root", default=str(Path(__file__).resolve().parents[1]), help="项目根目录"
+    )
     parser.add_argument("--days", type=int, default=30, help="复盘最近 N 天")
+    parser.add_argument("--start", help="明确开始日期 YYYYMMDD")
+    parser.add_argument("--end", help="明确结束日期 YYYYMMDD")
+    parser.add_argument("--ledger", help="paper_v2 SQLite 账本路径")
+    parser.add_argument("--account-id", default=ROBUST_V2_ACCOUNT_ID, help="账户标识")
+    parser.add_argument("--run-id", help="运行批次；区间含多个批次时必填")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     return parser.parse_args()
 
@@ -203,7 +442,15 @@ def main() -> int:
     """命令行入口。"""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parse_args()
-    summary = build_review(Path(args.root), args.days)
+    summary = build_review(
+        Path(args.root),
+        args.days,
+        start_date=args.start,
+        end_date=args.end,
+        ledger_path=Path(args.ledger) if args.ledger else None,
+        account_id=args.account_id,
+        run_id=args.run_id,
+    )
     payload = asdict(summary)
     if args.json:
         sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")

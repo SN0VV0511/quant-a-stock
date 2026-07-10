@@ -611,7 +611,7 @@ class AKDataLoader:
             return []
 
         # 尝试今天及前 5 天，BaoStock 盘中可能没数据
-        rows = []
+        rows: list[list[str]] = []
         for offset in range(6):
             day = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
             result = _run_bs_with_subprocess(
@@ -630,7 +630,8 @@ class AKDataLoader:
                     result.get("error_code"),
                 )
                 continue
-            rows = result.get("rows", [])
+            raw_rows = result.get("rows", [])
+            rows = [row for row in raw_rows if isinstance(row, list)] if isinstance(raw_rows, list) else []
             if rows:
                 logger.info("股票列表使用日期: %s (%d 条)", day, len(rows))
                 break
@@ -987,13 +988,16 @@ class AKDataLoader:
                         exc_info=True,
                     )
 
-                batch_results = payload.get("results", {}) if payload else {}
+                raw_batch_results = payload.get("results", {}) if payload else {}
+                batch_results = raw_batch_results if isinstance(raw_batch_results, dict) else {}
                 for code, bs_code in batch:
                     item = batch_results.get(bs_code)
-                    if not item or item.get("error_code") != "0":
+                    if not isinstance(item, dict) or item.get("error_code") != "0":
                         failed_codes.append(code)
                         continue
-                    frame = _history_rows_to_dataframe(item.get("rows", []))
+                    raw_item_rows = item.get("rows", [])
+                    item_rows = raw_item_rows if isinstance(raw_item_rows, list) else []
+                    frame = _history_rows_to_dataframe(item_rows)
                     if frame is None:
                         failed_codes.append(code)
                         continue
@@ -1101,8 +1105,8 @@ class AKDataLoader:
                     df = future.result(timeout=timeout_per_stock)
                     if df is not None and not df.empty:
                         result[code] = df
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("扩展历史加载失败 %s: %s", code, exc)
                 if done % 200 == 0:
                     logger.info("扩展历史进度: %d/%d", done, len(target))
         logger.info("扩展历史完成: %d/%d 只", len(result), len(target))

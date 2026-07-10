@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -79,7 +79,7 @@ from strategies.market_scanner import MarketScanner  # noqa: E402
 from strategies.rps_rotation import RPSRotationStrategy, calculate_rps_scores  # noqa: E402
 from strategies.small_cap_value import build_factor_rows, score_small_cap_value  # noqa: E402
 from trading.brokers import PaperBrokerAdapter, create_broker  # noqa: E402
-from trading.models import ExecutionReport, OrderIntent, RiskDecision  # noqa: E402
+from trading.models import ExecutionReport, OrderIntent, RiskDecision, StrategyTag  # noqa: E402
 from trading.observability import EventRecorder  # noqa: E402
 
 
@@ -164,7 +164,9 @@ def _run_weekly_small_cap(
     try:
         for code in codes:
             try:
-                df = dl.get_daily_data(code, adjust_flag="2")
+                end_date = today
+                start_date = (datetime.strptime(today, "%Y%m%d") - timedelta(days=500)).strftime("%Y%m%d")
+                df = dl.get_daily_data(code, start_date, end_date, adjust_flag="2")
                 if df is None or df.empty:
                     continue
                 df = df.copy()
@@ -231,8 +233,8 @@ def _run_weekly_small_cap(
             code=order["code"],
             name=order.get("name", order["code"]),
             action=order["action"],
-            shares=order.get("shares"),
-            price=order.get("price"),
+            shares=int(order.get("shares", 0) or 0),
+            price=float(order.get("price", 0) or 0),
             strategy=order["strategy"],
             strategy_tag="smallcap_value",
             reason=order["reason"],
@@ -487,7 +489,7 @@ def _previous_day_limit_up(hist: pd.DataFrame | None) -> bool:
     return float(close.iloc[-1]) / float(close.iloc[-2]) - 1 >= 0.095
 
 
-def _combo_entry_strategy_tag(result: dict[str, Any], hist: pd.DataFrame | None) -> str:
+def _combo_entry_strategy_tag(result: dict[str, Any], hist: pd.DataFrame | None) -> StrategyTag:
     """根据入场形态标记 Combo、动量突破或涨停延续。"""
     if _previous_day_limit_up(hist):
         return "limitup_follow"
@@ -706,7 +708,7 @@ def _run_daily_rps_rotation(
         return {"date": today, "status": "after_hours", "completed": True}
 
     if not ENABLE_RPS_ROTATION:
-        state = {
+        disabled_state = {
             "date": today,
             "status": "disabled",
             "completed": True,
@@ -717,19 +719,19 @@ def _run_daily_rps_rotation(
             "industry_signals": [],
             "orders": [],
         }
-        _write_rps_state(state)
-        recorder.record("rps_rotation_skipped", state)
+        _write_rps_state(disabled_state)
+        recorder.record("rps_rotation_skipped", disabled_state)
         logger.info("ETF/RPS 轮动已关闭")
-        return state
+        return disabled_state
 
     if _should_skip_rps(today, force):
-        state = _read_rps_state()
+        existing_state = _read_rps_state()
         recorder.record("rps_rotation_skipped", {
             "date": today,
             "reason": "今日已完成，跳过重复调仓",
         })
         logger.info("ETF/RPS 今日已完成，跳过重复调仓")
-        return state
+        return existing_state
 
     state: dict[str, Any] = {
         "date": today,
@@ -869,7 +871,7 @@ def _run_daily_rps_rotation(
                 shares=shares,
                 date=today,
                 strategy=str(raw_order.get("strategy", "ETF/行业RPS轮动")),
-                strategy_tag=str(raw_order.get("strategy_tag", "rps_rotation")),
+                strategy_tag=cast(StrategyTag, str(raw_order.get("strategy_tag", "rps_rotation"))),
                 reason=str(raw_order.get("reason", "")),
                 source="daily_rps_rotation",
                 metadata={
@@ -1039,8 +1041,8 @@ def _handle_position_exits(
                 if combo is not None:
                     sig = combo.check_realtime(rt_hist)
                     combo_sell = sig.get("signal") == "sell"
-                    combo_reason = sig.get("reason", "策略信号")
-                    rsi = float(sig["rsi"]) if sig.get("rsi") is not None else None
+                    combo_reason = str(sig.get("reason", "策略信号"))
+                    rsi = float(str(sig["rsi"])) if sig.get("rsi") is not None else None
             if rt_hist is not None and len(rt_hist) >= 20:
                 ma20 = float(pd.to_numeric(rt_hist["close"], errors="coerce").tail(20).mean())
             if rt_hist is not None and len(rt_hist) >= 60:
@@ -1060,7 +1062,7 @@ def _handle_position_exits(
         )
         holding_days = _holding_days(pos.get("buy_date"), today)
         md = market_data.get(code, {})
-        vwap = float(md.get("vwap")) if md.get("vwap") else None
+        vwap = float(str(md.get("vwap"))) if md.get("vwap") else None
         below_vwap_minutes = 0
         if shared is not None and vwap is not None:
             below_vwap_minutes = shared.update_below_vwap(code, float(current) < vwap)
@@ -1068,7 +1070,7 @@ def _handle_position_exits(
         decision = evaluate_position_exit(
             avg_cost=avg_cost,
             price=float(current),
-            strategy_tag=strategy_tag,
+            strategy_tag=cast(StrategyTag, strategy_tag),
             sellable_qty=shares if t1_locked else sellable_qty,
             highest_price=peak_price,
             intraday_high_price=intraday_high,
@@ -1151,7 +1153,7 @@ def _handle_position_exits(
             shares=sellable_qty,
             date=today,
             strategy="分层退出策略",
-            strategy_tag=strategy_tag,
+            strategy_tag=cast(StrategyTag, strategy_tag),
             reason=decision.sell_reason,
             source="watch_thread",
             metadata={"detail": decision.detail, **decision.indicators},
@@ -1255,7 +1257,7 @@ def _handle_drawdown_deleverage(
             shares=reduce_qty,
             date=today,
             strategy="回撤降仓",
-            strategy_tag=str(pos.get("strategy_tag", "combo_trend")),
+            strategy_tag=cast(StrategyTag, str(pos.get("strategy_tag", "combo_trend"))),
             reason="DRAWDOWN_DELEVERAGE",
             source="watch_thread",
             metadata={"deleverage_ratio": ratio},
@@ -1640,6 +1642,14 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     """命令行入口。"""
+    if os.getenv("ENABLE_LEGACY_ACCOUNT_WRITERS", "false").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        logger.error(
+            "旧 Combo/RPS 实时账户写入已停用；请运行 robust_runner.py daemon。"
+            "仅研究复现时可显式设置 ENABLE_LEGACY_ACCOUNT_WRITERS=true"
+        )
+        raise SystemExit(2)
     args = _parse_args()
 
     # PID 锁：防止重复启动

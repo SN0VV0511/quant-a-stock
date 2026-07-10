@@ -166,7 +166,7 @@ def _run_rps_backtest(etf_hist: dict, industry_hist: dict,
     max_dd = 0.0
 
     # 收集所有 ETF 日期并建立索引
-    all_dates = set()
+    all_dates: set[str] = set()
     for df in etf_hist.values():
         all_dates.update(str(d).replace("-", "")[:8] for d in df["date"])
     sorted_dates = sorted(d for d in all_dates if days[0] <= d <= days[-1])

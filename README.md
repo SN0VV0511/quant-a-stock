@@ -1,6 +1,8 @@
 # A 股量化回测与虚拟盘观察系统
 
-这是一个面向学习、验证和观察期演练的 A 股量化项目。当前能力覆盖历史回测、全市场候选扫描、虚拟盘实时盯盘、五层风控、结构化交易事件、Web 仪表盘，以及 QMT / miniQMT 接入前的 dry-run 适配器。
+这是一个面向学习、验证和观察期演练的 A 股量化项目。默认账户策略为低频
+`robust_v2`：ETF 为主、沪深主板因子增强、现金不低于 20%，使用 SQLite 单账本。
+旧 Combo、RPS 和小市值策略只保留为研究基线，不再默认写虚拟盘账户。
 
 本项目默认只运行虚拟盘，不会发送真实委托。任何实盘接入都必须先经过一个月以上观察期、健康检查和人工确认。
 
@@ -16,7 +18,7 @@
 - 免费数据源：BaoStock 股票历史行情、腾讯股票实时行情、AKShare 交易日历/ETF/行业指数。
 - 回测能力：双均线策略、手续费、印花税、滑点、夏普比率、最大回撤。
 - 策略能力：组合信号、RSI、ETF 动量代理、ETF / 行业 RPS 轮动、全市场扫描候选池。
-- 虚拟盘：本地 JSON 持仓、交易流水、T+1、整手、涨跌停和仓位限制。
+- 虚拟盘：SQLite 单账本、分批 T+1、幂等订单、单实例写租约、整手和分证券费用。
 - 风控：标的范围、白名单买入、ST / 停牌过滤、资金检查、回撤和单日亏损控制。
 - 观测：`trade_events.jsonl` 记录信号、风控、成交和账户快照。
 - Web：本地仪表盘查看账户、交易、日志、健康检查和观察期状态。
@@ -73,7 +75,7 @@ OpenClaw 里常用的 Agent 指令可以直接写成：
 
 注意事项：
 
-- 观察期默认使用 `BROKER_MODE=paper`，不要在 OpenClaw 中直接开启真实交易。
+- 观察期默认使用 `BROKER_MODE=paper_v2`，不要在 OpenClaw 中直接开启真实交易。
 - `.env`、`logs/`、缓存和事件流水属于本地运行环境，不应提交。
 - `data/portfolio_state.json` 和 `data/trade_log.json` 当前是虚拟盘状态文件，拉取代码或切换分支前先执行 `git status`，避免覆盖正在观察的持仓状态。
 
@@ -105,78 +107,63 @@ python -m scripts.strategy_ab 120
 - `BACKTEST_AUTO_UNIVERSE_SIZE=120`：自动回测抽样股票数。
 - `BACKTEST_AUTO_MAX_AGE_HOURS=168`：回测结果最大缓存时间。
 
-## 虚拟盘实时运行
+## robust_v2 虚拟盘运行
 
-开始新观察期前，先预览会备份哪些旧状态文件：
-
-```bash
-python scripts/paper_reset.py --json
-```
-
-确认开始新的虚拟盘观察期时再执行：
+首次启用前先预览旧 JSON/日志归档；确认后只复制到只读目录，原文件不会删除或清空：
 
 ```bash
-python scripts/paper_reset.py --confirm --json
+python scripts/paper_v2_init.py --json
+python scripts/paper_v2_init.py --confirm --json
 ```
 
-盘中手动运行：
+前台运行唯一守护实例：
 
 ```bash
-python live_runner.py --broker paper
+./start_live.sh
+# 或
+python robust_runner.py daemon
 ```
 
-常用参数：
+部署应由 Docker、systemd、supervisor 或 tmux 托管。进程必须先获得 SQLite 写租约；
+第二个实例会直接拒绝启动，不再使用跨目录 `pkill`。Docker 入口已经切换为
+`robust_runner.py daemon`。
 
-- `--watch-interval 4`：盯盘刷新秒数。
-- `--scan-interval 600`：候选池扫描间隔。
-- `--top-n 30`：候选股数量。
-- `--ignore-calendar`：忽略交易日历，便于非交易时段联调。
+运行时序固定如下：
 
-虚拟盘运行流程：
+1. 每周最后一个交易日收盘后，用 T 日复权数据生成 `TargetPortfolio`，不下单。
+2. T+1 日 09:35 后，统一分配器把目标权重转换为整手订单并保留目标现金。
+3. 盘中每 60 秒只检查行情健康和 7% 股票/10% ETF 灾难止损。
+4. 普通退出必须由收盘目标确认；旧 `COMBO_DEFENSIVE_EXIT`、追涨和盘中补仓不接入账户。
+5. 前收盘偏差超过 2%、缺少上一交易日或数据陈旧时，该标的停止交易。
 
-1. 开盘后先执行一次 ETF/RPS 日频轮动，使用 AKShare 拉取 ETF 与行业指数历史数据。
-2. ETF/RPS 生成的买卖订单先经过风控，再进入 `PaperBrokerAdapter` 虚拟成交。
-3. 开盘后延迟确认全市场扫描，形成股票候选池。
-4. 盯盘线程持续更新持仓价格和候选股价格。
-5. 持仓触发止损、止盈或策略卖出时生成卖出订单。
-6. 候选股触发组合策略买入信号时生成买入订单。
-7. 所有信号、风控、成交、RPS 状态和账户快照写入结构化文件，供 1-2 个月观察期验收。
-
-ETF/RPS 观察文件：
-
-- `data/rps_state.json`：每日 ETF/RPS 数据源状态、ETF 入选、行业强弱和订单结果。
-- `data/trade_events.jsonl`：包含 `rps_rotation_completed`、`signal`、`risk_approved`、`execution` 等事件。
-- `reports/daily_YYYYMMDD.txt`：收盘日报会包含 ETF/RPS 摘要。
-
-观察期核心流水文件：
-
-- `data/trade_events.jsonl`：启动 `live_runner.py` 创建；每次扫描、RPS 轮动、信号、风控、成交、账户快照事件都会追加。
-- `data/portfolio_snapshots.jsonl`：初始化虚拟盘或创建 `PositionManager` 时先创建空文件；盘中每 5 分钟快照、收盘快照和手动 `save_snapshot()` 时追加。
-- 空文件表示“系统已初始化但还没产生对应事件/快照”；文件缺失通常表示数据目录未挂载或初始化没有跑。
-
-## 后台守护运行
-
-无人值守观察期建议使用后台服务管理脚本，避免重复启动多个守护进程：
+常用的单步诊断命令：
 
 ```bash
-python scripts/paper_service.py status --json
-python scripts/paper_service.py start --json
-python scripts/paper_service.py stop --json
-python scripts/paper_service.py restart --json
+python robust_runner.py status
+python robust_runner.py signal --date 20260710 --force
+python robust_runner.py execute --date 20260713
+python robust_runner.py report --date 20260713
 ```
 
-守护脚本会在交易日运行窗口内启动 `live_runner.py --broker paper`，收盘后执行健康检查和复盘摘要：
+旧入口默认拒绝写账户。只有复现研究基线时，才可临时设置
+`ENABLE_LEGACY_ACCOUNT_WRITERS=true`；不要与 `paper_v2` 守护实例同时部署。
+
+## robust_v2 样本外参数选择
+
+研究数据目录必须包含按代码保存的 `etf/`、`stock/` 行情，按交易日保存的
+`universe/robust_v2_YYYYMMDD.json`，以及必须提供的 `benchmark/000300.csv`；
+`benchmark/000905.csv` 可选。股票池版本不足约 3 年时脚本会拒绝运行：
 
 ```bash
-python scripts/paper_daemon.py --once --dry-run --json
-python scripts/paper_daemon.py
+python scripts/robust_walk_forward.py \
+  --data-root data/robust_research \
+  --legacy-baseline reports/backtest_latest.json
 ```
 
-如果只想在 OpenClaw 中联调流程，可以加 `--ignore-calendar`：
-
-```bash
-python scripts/paper_service.py start --ignore-calendar --json
-```
+脚本固定评估 32 组参数，使用 24 个月训练后接 6 个月滚动验证，最后 12 个月
+完全锁定；门槛不通过或双倍滑点下落后于基准时，自动降级为最多 60% ETF + 现金。
+通过后会写入 `data/robust_v2_selected.json`，下次启动时由 `robust_runner` 自动加载；
+文件缺失时使用本计划的推荐默认参数。
 
 ## Web 仪表盘
 
@@ -237,53 +224,48 @@ npm run test
 开盘前建议执行：
 
 ```bash
-python scripts/paper_healthcheck.py --json
-python scripts/paper_service.py status --json
+python robust_runner.py status
 ```
 
 盘中出现异常时查看：
 
 ```bash
-python scripts/paper_status.py --json
-tail -n 120 logs/live_today.log
-tail -n 120 logs/paper_daemon_service.log
+tail -n 120 logs/robust_v2.log
 ```
 
 收盘后执行严格检查：
 
 ```bash
-python scripts/paper_healthcheck.py --strict-snapshot --strict-events --strict-report --max-snapshot-age-minutes 1440
-python scripts/monthly_review.py --days 30
-python scripts/paper_acceptance.py --days 30 --min-snapshot-days 20 --json
+python scripts/monthly_review.py --start 20260710 --end 20260810 --run-id RUN_ID --json
+python scripts/paper_v2_acceptance.py --start 20260710 --end 20260810 --run-id RUN_ID
 ```
 
 健康检查关注点：
 
-- 现金不能为负。
-- 持仓必须是沪深 A 股且为整手。
-- 总仓位不能超过配置阈值。
-- 快照、日报和账户状态要一致。
-- 每笔成交都能追溯到信号、风控通过和成交回报。
+- 零 T+1/限制板块违规、零重复幂等订单、零旧策略来源成交。
+- 同时活动的账户写会话不得超过一个，净值不得疑似重置到 50,000 元。
+- 每月成交不超过 24 笔，成本不超过平均净值 0.5%。
+- 满 60 个交易日后最大回撤目标不超过 10%，并与沪深 300 基准比较。
 
 ## 月度观察期验收
 
 进入 QMT dry-run 前建议至少满足：
 
 - 连续运行 20 个以上交易日。
-- `paper_healthcheck.py` 无失败项。
-- `data/rps_state.json` 最近一次状态为 `ok` 且 ETF 数据成功加载。
-- `monthly_review.py` 指标可解释，最大回撤和交易次数符合策略预期。
-- `paper_acceptance.py` 输出 `ready_for_qmt_dry_run=true`。
-- `trade_events.jsonl` 能串起每笔成交对应的信号、风控和成交。
-- 收盘日报 `reports/daily_YYYYMMDD.txt` 的总资产与最新账户快照一致。
+- `paper_v2_acceptance.py` 20 日运维门槛全部通过。
+- 再完成至少 60 个交易日绩效观察，并比较净收益、Calmar、换手和成本。
+- `monthly_review.py` 必须指定起止日期；区间包含多个批次时必须指定 `run_id`。
+- 未完成复盘前不切换真实资金。
 
 ## 配置说明
 
 核心配置在 `config/settings.py`：
 
 - `INITIAL_CAPITAL`：回测和虚拟盘初始资金。
-- `MAX_TOTAL_POSITION`：总仓位上限。
-- `MAX_SINGLE_STOCK`：单只股票仓位上限。
+- `ROBUST_V2_MAX_TOTAL_POSITION`：V2 总仓位上限，默认 80%。
+- `ROBUST_V2_ETF_TARGET` / `ROBUST_V2_STOCK_TARGET`：默认 60% / 20%。
+- `ROBUST_V2_MIN_CASH`：现金下限，默认 20%。
+- `ROBUST_V2_LEDGER_PATH`：唯一 SQLite 账本。
 - `MIN_STOCK_ORDER_AMOUNT`：股票最低建议买入成交额，默认 8000 元。
 - `MIN_ETF_ORDER_AMOUNT`：ETF 最低建议买入成交额，默认 5000 元。
 - `PERMISSIONS_FILE`：可选账户权限配置文件，默认读取 `config/permissions.yaml`。
@@ -295,10 +277,11 @@ python scripts/paper_acceptance.py --days 30 --min-snapshot-days 20 --json
 环境变量配置见 `.env.example`：
 
 ```bash
-BROKER_MODE=paper
+BROKER_MODE=paper_v2
+ROBUST_V2_LEDGER_PATH=data/paper_v2.db
+ENFORCE_T1=true
 LIVE_TRADING_ENABLED=false
-LIVE_WATCH_INTERVAL_SECONDS=4
-LIVE_SCAN_INTERVAL_SECONDS=600
+ROBUST_V2_MONITOR_INTERVAL_SECONDS=60
 PERMISSIONS_FILE=config/permissions.yaml
 ALLOW_CHINEXT_STOCKS=false
 ALLOW_STAR_MARKET_STOCKS=false
@@ -310,7 +293,8 @@ QMT_CLIENT_PATH=
 
 安全默认值：
 
-- `BROKER_MODE=paper`：只使用虚拟盘。
+- `BROKER_MODE=paper_v2`：只使用 SQLite 虚拟盘。
+- `ENFORCE_T1=true`：V2 和 QMT dry-run 的强制启动条件。
 - `LIVE_TRADING_ENABLED=false`：禁止真实下单。
 - 即使误设 `LIVE_TRADING_ENABLED=true`，当前 `QmtBrokerAdapter` 也会拒绝连接真实通道。
 
@@ -318,14 +302,17 @@ QMT_CLIENT_PATH=
 
 ```text
 config/settings.py              全局配置
-main.py                         历史回测入口
-live_runner.py                  虚拟盘实时盯盘入口
+main.py                         旧研究回测入口
+robust_runner.py                robust_v2 唯一虚拟盘入口
+live_runner.py                  旧 Combo/RPS 研究入口（默认禁写）
 daily_runner.py                 每日执行入口
 paper_trading.py                虚拟盘示例入口
 data/ak_loader.py               AKShare / 腾讯 / BaoStock 数据加载
 data/bs_worker.py               BaoStock 子进程隔离
 risk/control.py                 风控模块
-rules/position.py               持仓状态管理
+trading/ledger.py               SQLite 单账本、T+1、幂等和租约
+trading/allocator.py            唯一目标组合订单分配器
+rules/position.py               旧 JSON 持仓基线
 rules/engine.py                 A 股交易规则
 strategies/                     策略模块
 trading/                        Broker 适配器和交易模型
@@ -338,14 +325,11 @@ tests/                          单元测试和集成测试
 运行态文件：
 
 ```text
-data/portfolio_state.json       当前现金、持仓、交易记录和日快照
-data/trade_log.json             Web 仪表盘读取的交易流水
-data/trade_events.jsonl         信号、风控、成交事件流水
-data/portfolio_snapshots.jsonl  账户快照流水
-data/paper_daemon.pid           后台守护进程 PID 元数据
-logs/live.log                   实时运行累计日志
-logs/live_today.log             当日实时日志
-logs/paper_daemon_service.log   后台服务日志
+data/paper_v2.db                V2 唯一账户账本
+data/universe/                  每交易日股票池和财务字段版本
+data/backups/paper_v2_*/        旧 JSON/日志只读归档
+logs/robust_v2.log              V2 轮转运行日志
+reports/daily_v2_YYYYMMDD.txt   含毛/净收益、成本、换手和版本的日报
 ```
 
 ## 策略与风控摘要
@@ -381,6 +365,14 @@ logs/paper_daemon_service.log   后台服务日志
 - 至少一个月虚拟盘观察期验收通过。
 
 ## 开发与测试
+
+提交前统一验证：
+
+```bash
+pytest -q
+mypy .
+git diff --check
+```
 
 运行全部测试：
 

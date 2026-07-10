@@ -3,16 +3,18 @@ A 股交易日历 — 基于 AKShare（新浪财经源）
 自动获取，覆盖到当年年底，无需手动维护
 """
 
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 # 缓存
-_trading_days_cache: set = None
+_trading_days_cache: set[str] | None = None
 
 
-def _load_trading_days() -> set:
+def _load_trading_days() -> set[str]:
     """从 AKShare 加载交易日历（带缓存）"""
     global _trading_days_cache
     if _trading_days_cache is not None:

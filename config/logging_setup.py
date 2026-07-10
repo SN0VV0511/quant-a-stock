@@ -54,19 +54,19 @@ def setup_logger(
     formatter.converter = logging_time_converter
 
     for filename in rotating_files:
-        handler = RotatingFileHandler(
+        rotating_handler = RotatingFileHandler(
             os.path.join(LOG_DIR, filename),
             maxBytes=_MAX_BYTES,
             backupCount=_BACKUP_COUNT,
             encoding="utf-8",
         )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        rotating_handler.setFormatter(formatter)
+        logger.addHandler(rotating_handler)
 
     for filename in plain_files:
-        handler = logging.FileHandler(os.path.join(LOG_DIR, filename), encoding="utf-8")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        file_handler = logging.FileHandler(os.path.join(LOG_DIR, filename), encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
     if console:
         stream = logging.StreamHandler()

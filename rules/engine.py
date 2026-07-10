@@ -3,22 +3,35 @@ A 股交易规则引擎
 处理涨跌停、佣金、印花税、过户费、T+1、整手等规则
 """
 
+from __future__ import annotations
+
 import math
 from datetime import datetime, timedelta
 
 from config.settings import (
-    COMMISSION_RATE, COMMISSION_MIN, STAMP_TAX_RATE, TRANSFER_FEE_RATE,
-    SLIPPAGE_STOCK, SLIPPAGE_ETF, LOT_SIZE,
-    LIMIT_MAINBOARD, LIMIT_ST, LIMIT_CHINEXT,
-    is_etf, is_chinext, is_star_market, CASH_BUFFER,
+    COMMISSION_RATE,
+    COMMISSION_MIN,
+    STAMP_TAX_RATE,
+    TRANSFER_FEE_RATE,
+    SLIPPAGE_STOCK,
+    SLIPPAGE_ETF,
+    LOT_SIZE,
+    LIMIT_MAINBOARD,
+    LIMIT_ST,
+    LIMIT_CHINEXT,
+    is_etf,
+    is_chinext,
+    is_star_market,
+    CASH_BUFFER,
 )
+from trading.instruments import get_instrument_profile
 
 
 class TradingRules:
     """A 股交易规则引擎"""
 
     @staticmethod
-    def get_price_limit_pct(code):
+    def get_price_limit_pct(code, name="", price_limit_override=None):
         """获取涨跌停幅度
 
         Args:
@@ -27,13 +40,11 @@ class TradingRules:
         Returns:
             涨跌停比例，如 0.10 表示 10%
         """
-        if is_etf(code):
-            return LIMIT_MAINBOARD  # ETF 跟随主板 10%
-        if is_chinext(code) or is_star_market(code):
-            return LIMIT_CHINEXT    # 创业板/科创板 20%
-        # ST 判断通过股票名称中包含 ST 来判断，这里返回默认值
-        # 调用方可通过传入额外信息覆盖
-        return LIMIT_MAINBOARD
+        return get_instrument_profile(
+            code,
+            name=name,
+            price_limit_override=price_limit_override,
+        ).price_limit_pct
 
     @staticmethod
     def is_st(code, name=""):
@@ -62,7 +73,7 @@ class TradingRules:
         if self.is_st(code, name):
             limit_pct = LIMIT_ST
         else:
-            limit_pct = self.get_price_limit_pct(code)
+            limit_pct = self.get_price_limit_pct(code, name=name)
 
         upper_limit = round(prev_close * (1 + limit_pct), 2)
         lower_limit = round(prev_close * (1 - limit_pct), 2)
@@ -111,7 +122,7 @@ class TradingRules:
         """
         return amount * TRANSFER_FEE_RATE
 
-    def calc_total_cost(self, amount, direction="buy", is_etf_flag=False):
+    def calc_total_cost(self, amount, direction="buy", is_etf_flag=False, code=None):
         """计算总交易成本（含滑点）
 
         Args:
@@ -129,8 +140,16 @@ class TradingRules:
                 "actual_amount": 实际交易金额（含滑点）
             }
         """
+        if amount < 0:
+            raise ValueError(f"交易金额不能为负数: {amount}")
+        if direction not in {"buy", "sell"}:
+            raise ValueError(f"不支持的交易方向: {direction}")
+
+        profile = get_instrument_profile(code) if code else None
+        effective_is_etf = profile.is_etf if profile is not None else is_etf_flag
+
         # 滑点
-        slippage_rate = SLIPPAGE_ETF if is_etf_flag else SLIPPAGE_STOCK
+        slippage_rate = SLIPPAGE_ETF if effective_is_etf else SLIPPAGE_STOCK
         if direction == "buy":
             slippage = amount * slippage_rate
             actual_amount = amount + slippage
@@ -142,10 +161,20 @@ class TradingRules:
         commission = self.calc_commission(actual_amount, direction)
 
         # 印花税（仅卖出）
-        stamp_tax = self.calc_stamp_tax(actual_amount) if direction == "sell" else 0.0
+        stamp_tax_rate = (
+            profile.stamp_tax_rate
+            if profile is not None
+            else (0.0 if effective_is_etf else STAMP_TAX_RATE)
+        )
+        stamp_tax = actual_amount * stamp_tax_rate if direction == "sell" else 0.0
 
         # 过户费
-        transfer_fee = self.calc_transfer_fee(actual_amount)
+        transfer_fee_rate = (
+            profile.transfer_fee_rate
+            if profile is not None
+            else (0.0 if effective_is_etf else TRANSFER_FEE_RATE)
+        )
+        transfer_fee = actual_amount * transfer_fee_rate
 
         total = slippage + commission + stamp_tax + transfer_fee
 

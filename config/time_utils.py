@@ -33,6 +33,8 @@ def today_yyyymmdd() -> str:
     return format_local("%Y%m%d")
 
 
-def logging_time_converter(timestamp: float) -> struct_time:
+def logging_time_converter(timestamp: float | None) -> struct_time:
     """logging.Formatter.converter 兼容函数。"""
+    if timestamp is None:
+        timestamp = now_local().timestamp()
     return datetime.fromtimestamp(timestamp, APP_TZ).timetuple()

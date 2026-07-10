@@ -227,7 +227,8 @@ def _check_trades(trades: list[dict[str, Any]], result: HealthcheckResult) -> No
 
 def _event_order_key(payload: dict[str, Any]) -> tuple[str, str, str | None] | None:
     """提取信号、风控、成交事件中的订单追踪键。"""
-    order = payload.get("order") if isinstance(payload.get("order"), dict) else payload
+    nested_order = payload.get("order")
+    order: dict[str, Any] = nested_order if isinstance(nested_order, dict) else payload
     code = order.get("code")
     action = order.get("action")
     if not code or not action:

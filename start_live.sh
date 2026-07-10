@@ -1,28 +1,22 @@
-#!/bin/bash
-# 量化盯盘启动脚本
-# 用法: ./start_live.sh
-# 功能: 清理旧进程 + 启动新实例 + 输出状态
+#!/usr/bin/env bash
+# robust_v2 前台启动入口；由 Docker、systemd、supervisor 或 tmux 负责进程托管。
 
-WORK_DIR="/root/.openclaw/workspace/quant-a-stock"
-PID_FILE="$WORK_DIR/data/live_runner.pid"
+set -euo pipefail
 
-# 1. 杀旧进程（用 [l]ive_runner 技巧避免匹配到自己）
-pkill -f "[l]ive_runner.py" 2>/dev/null
-sleep 2
-
-# 2. 清理 PID 文件
-rm -f "$PID_FILE"
-
-# 3. 启动新实例
-cd "$WORK_DIR"
-nohup python3 live_runner.py > /dev/null 2>&1 &
-NEW_PID=$!
-
-# 4. 等待确认
-sleep 3
-if ps -p "$NEW_PID" > /dev/null 2>&1; then
-    echo "✅ 盯盘已启动 PID=$NEW_PID"
-else
-    echo "❌ 启动失败，进程已退出"
-    exit 1
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
 fi
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  PYTHON_EXECUTABLE="$PYTHON_BIN"
+elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_EXECUTABLE="$ROOT_DIR/.venv/bin/python"
+else
+  PYTHON_EXECUTABLE="python3"
+fi
+
+cd "$ROOT_DIR"
+exec "$PYTHON_EXECUTABLE" "$ROOT_DIR/robust_runner.py" daemon "$@"

@@ -81,25 +81,25 @@ def build_status(
     root_dir = root_dir.resolve()
     errors: list[str] = []
 
-    service = _safe_section(
+    service: dict[str, Any] = _safe_section(
         "服务状态",
         errors,
         lambda: asdict(get_status(root_dir)),
-        {},
+        dict[str, Any](),
     )
-    health = _safe_section(
+    health: dict[str, Any] = _safe_section(
         "健康检查",
         errors,
         lambda: asdict(run_healthcheck(root_dir)),
-        {},
+        dict[str, Any](),
     )
-    review = _safe_section(
+    review: dict[str, Any] = _safe_section(
         "观察期复盘",
         errors,
         lambda: asdict(build_review(root_dir, days=days)),
-        {},
+        dict[str, Any](),
     )
-    acceptance = _safe_section(
+    acceptance: dict[str, Any] = _safe_section(
         "观察期验收",
         errors,
         lambda: asdict(run_acceptance(
@@ -108,7 +108,7 @@ def build_status(
             min_snapshot_days=min_snapshot_days,
             max_drawdown=max_drawdown,
         )),
-        {},
+        dict[str, Any](),
     )
 
     logs = {

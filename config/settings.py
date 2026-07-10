@@ -11,6 +11,11 @@ import os
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _project_path(value: str) -> str:
+    """把相对运行路径固定到项目根目录，避免部署工作目录改变状态位置。"""
+    return value if os.path.isabs(value) else os.path.join(BASE_DIR, value)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     """读取布尔环境变量，便于在不同账户权限下切换交易范围。"""
     raw = os.getenv(name)
@@ -136,11 +141,37 @@ LIMIT_ST = 0.05           # ST 板块 ±5%
 LIMIT_CHINEXT = 0.20      # 创业板 ±20%
 
 # ==================== 持仓限制 ====================
-MAX_TOTAL_POSITION = 0.90   # 总仓位上限 90%,为 5 万小资金保留现金缓冲
+MAX_TOTAL_POSITION = 0.90   # 旧研究基线使用；robust_v2 使用下方独立的 80% 上限
 MAX_SINGLE_ETF = 0.30       # 单只 ETF 上限 30%,为个股留空间
 MAX_SINGLE_STOCK = 0.20     # 单只股票上限 20%,兼顾 8000 元最低成交额与集中度
 MAX_SINGLE_STOCK_PCT = MAX_SINGLE_STOCK  # 统一策略配置命名
 CASH_BUFFER = 0.10          # 现金缓冲 10%
+
+# ==================== robust_v2 稳健虚拟盘 ====================
+ROBUST_V2_ACCOUNT_ID = os.getenv("ROBUST_V2_ACCOUNT_ID", "paper_v2")
+ROBUST_V2_STRATEGY_VERSION = "robust_v2"
+ROBUST_V2_LEDGER_PATH = _project_path(
+    os.getenv("ROBUST_V2_LEDGER_PATH", os.path.join(BASE_DIR, "data", "paper_v2.db"))
+)
+ROBUST_V2_MAX_TOTAL_POSITION = float(os.getenv("ROBUST_V2_MAX_TOTAL_POSITION", "0.80"))
+ROBUST_V2_ETF_TARGET = float(os.getenv("ROBUST_V2_ETF_TARGET", "0.60"))
+ROBUST_V2_STOCK_TARGET = float(os.getenv("ROBUST_V2_STOCK_TARGET", "0.20"))
+ROBUST_V2_MIN_CASH = float(os.getenv("ROBUST_V2_MIN_CASH", "0.20"))
+ROBUST_V2_MAX_SINGLE_ETF = float(os.getenv("ROBUST_V2_MAX_SINGLE_ETF", "0.30"))
+ROBUST_V2_MAX_SINGLE_STOCK = float(os.getenv("ROBUST_V2_MAX_SINGLE_STOCK", "0.20"))
+ROBUST_V2_REBALANCE_DAYS = int(os.getenv("ROBUST_V2_REBALANCE_DAYS", "5"))
+ROBUST_V2_STOCK_STOP_PCT = float(os.getenv("ROBUST_V2_STOCK_STOP_PCT", "0.07"))
+ROBUST_V2_ETF_STOP_PCT = float(os.getenv("ROBUST_V2_ETF_STOP_PCT", "0.10"))
+ROBUST_V2_MAX_DATA_AGE_SECONDS = int(os.getenv("ROBUST_V2_MAX_DATA_AGE_SECONDS", "86400"))
+ROBUST_V2_LEASE_TTL_SECONDS = int(os.getenv("ROBUST_V2_LEASE_TTL_SECONDS", "90"))
+ROBUST_V2_STOCK_CANDIDATE_LIMIT = int(os.getenv("ROBUST_V2_STOCK_CANDIDATE_LIMIT", "500"))
+ROBUST_V2_MONITOR_INTERVAL_SECONDS = int(os.getenv("ROBUST_V2_MONITOR_INTERVAL_SECONDS", "60"))
+ROBUST_V2_SELECTED_CONFIG_PATH = _project_path(
+    os.getenv(
+        "ROBUST_V2_SELECTED_CONFIG_PATH",
+        os.path.join(BASE_DIR, "data", "robust_v2_selected.json"),
+    )
+)
 
 # ==================== 风控参数 ====================
 DAILY_LOSS_THRESHOLD = 0.025    # 单日最大亏损 2.5% 触发降仓

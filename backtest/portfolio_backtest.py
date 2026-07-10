@@ -93,6 +93,7 @@ class PortfolioBacktester:
         self.rebalance_every = max(1, rebalance_every)
         self.max_single_stock = max_single_stock
         self.combo = ComboSignalStrategy()
+        self._last_candidates: list[str] = []
 
     # ==================== 纯函数回测核心 ====================
 
@@ -313,7 +314,7 @@ class PortfolioBacktester:
             sig = self.combo.check_realtime(sl)
             combo_sell = sig.get("signal") == "sell"
             combo_reason = str(sig.get("reason", "策略信号"))
-            rsi = float(sig["rsi"]) if sig.get("rsi") is not None else None
+            rsi = float(str(sig["rsi"])) if sig.get("rsi") is not None else None
         if sl is not None and len(sl) >= 20:
             ma20 = float(pd.to_numeric(sl["close"], errors="coerce").tail(20).mean())
         if sl is not None and len(sl) >= 60:
@@ -578,7 +579,7 @@ class PortfolioBacktester:
             trading_days = loader.get_trading_calendar(start_date, end_date)
             if not trading_days:
                 logger.warning("交易日历获取失败,改用历史数据日期并集")
-                all_dates = set()
+                all_dates: set[str] = set()
                 for df in history_map.values():
                     all_dates.update(str(d).replace("-", "")[:8] for d in df["date"])
                 trading_days = sorted(d for d in all_dates if start_date <= d <= end_date)
