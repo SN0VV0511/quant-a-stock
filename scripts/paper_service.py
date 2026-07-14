@@ -1,6 +1,6 @@
-"""虚拟盘观察期后台服务管理。
+"""robust_v2 虚拟盘观察期后台服务管理。
 
-这个脚本负责安全地启动、查询、停止 `paper_daemon.py`，避免一个月观察期内重复
+这个脚本负责安全地启动、查询、停止 `robust_runner.py daemon`，避免观察期内重复
 启动多个守护进程。它只管理虚拟盘，不会连接 QMT 或发送真实委托。
 """
 
@@ -30,7 +30,7 @@ class ServiceConfig:
     watch_interval: int = 4
     scan_interval: int = 600
     top_n: int = 20
-    poll_seconds: int = 300
+    poll_seconds: int = 60
     review_days: int = 30
     ignore_calendar: bool = False
 
@@ -93,21 +93,16 @@ def is_pid_running(pid: int) -> bool:
 
 def build_daemon_command(config: ServiceConfig) -> list[str]:
     """构建后台守护命令。"""
+    if not 1 <= config.poll_seconds <= 60:
+        raise ValueError("robust_v2 轮询间隔必须位于 1-60 秒")
     command = [
         sys.executable,
-        str(config.root_dir / "scripts" / "paper_daemon.py"),
-        "--root",
-        str(config.root_dir),
-        "--watch-interval",
-        str(config.watch_interval),
-        "--scan-interval",
-        str(config.scan_interval),
-        "--top-n",
-        str(config.top_n),
+        str(config.root_dir / "robust_runner.py"),
+        "daemon",
+        "--ledger",
+        str(config.root_dir / "data" / "paper_v2.db"),
         "--poll-seconds",
         str(config.poll_seconds),
-        "--review-days",
-        str(config.review_days),
     ]
     if config.ignore_calendar:
         command.append("--ignore-calendar")
@@ -131,7 +126,9 @@ def _read_pid_metadata(pid_file: Path) -> dict[str, Any]:
             return {}
 
 
-def write_pid_metadata(pid_file: Path, pid: int, command: list[str], log_file: Path) -> None:
+def write_pid_metadata(
+    pid_file: Path, pid: int, command: list[str], log_file: Path
+) -> None:
     """写入 PID 元数据。"""
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -140,17 +137,25 @@ def write_pid_metadata(pid_file: Path, pid: int, command: list[str], log_file: P
         "log_file": str(log_file),
         "started_at": _now_str(),
     }
-    pid_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    pid_file.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
 
-def get_status(root_dir: Path, pid_checker: PidChecker = is_pid_running) -> ServiceStatus:
+def get_status(
+    root_dir: Path, pid_checker: PidChecker = is_pid_running
+) -> ServiceStatus:
     """查询后台服务状态。"""
     root_dir = root_dir.resolve()
     pid_file = _pid_file(root_dir)
     log_file = _log_file(root_dir)
     metadata = _read_pid_metadata(pid_file)
     pid = metadata.get("pid")
-    pid_value = int(pid) if isinstance(pid, int) or (isinstance(pid, str) and pid.isdigit()) else None
+    pid_value = (
+        int(pid)
+        if isinstance(pid, int) or (isinstance(pid, str) and pid.isdigit())
+        else None
+    )
     running = pid_checker(pid_value) if pid_value is not None else False
     stale = pid_file.exists() and pid_value is not None and not running
     if pid_file.exists() and pid_value is None:
@@ -162,7 +167,9 @@ def get_status(root_dir: Path, pid_checker: PidChecker = is_pid_running) -> Serv
         pid_file=str(pid_file),
         log_file=str(log_file),
         stale_pid_file=stale,
-        command=[str(item) for item in metadata.get("command", [])] if isinstance(metadata.get("command"), list) else [],
+        command=[str(item) for item in metadata.get("command", [])]
+        if isinstance(metadata.get("command"), list)
+        else [],
         started_at=str(metadata.get("started_at", "")),
         message="running" if running else "stopped",
     )
@@ -238,12 +245,16 @@ def stop_service(
     if status.pid is None:
         if pid_file.exists():
             pid_file.unlink()
-        return ServiceActionResult(ok=True, action="stop", status=status, message="虚拟盘守护进程未运行")
+        return ServiceActionResult(
+            ok=True, action="stop", status=status, message="虚拟盘守护进程未运行"
+        )
 
     if not status.running:
         if pid_file.exists():
             pid_file.unlink()
-        return ServiceActionResult(ok=True, action="stop", status=status, message="已清理过期 PID 文件")
+        return ServiceActionResult(
+            ok=True, action="stop", status=status, message="已清理过期 PID 文件"
+        )
 
     os.kill(status.pid, signal.SIGTERM)
     deadline = time.time() + timeout_seconds
@@ -252,7 +263,9 @@ def stop_service(
             if pid_file.exists():
                 pid_file.unlink()
             stopped = get_status(root_dir, pid_checker=pid_checker)
-            return ServiceActionResult(ok=True, action="stop", status=stopped, message="虚拟盘守护进程已停止")
+            return ServiceActionResult(
+                ok=True, action="stop", status=stopped, message="虚拟盘守护进程已停止"
+            )
         time.sleep(0.2)
 
     if force:
@@ -260,7 +273,9 @@ def stop_service(
         if pid_file.exists():
             pid_file.unlink()
         stopped = get_status(root_dir, pid_checker=pid_checker)
-        return ServiceActionResult(ok=True, action="stop", status=stopped, message="虚拟盘守护进程已强制停止")
+        return ServiceActionResult(
+            ok=True, action="stop", status=stopped, message="虚拟盘守护进程已强制停止"
+        )
 
     return ServiceActionResult(
         ok=False,
@@ -276,24 +291,38 @@ def restart_service(
     force: bool = False,
 ) -> ServiceActionResult:
     """重启后台服务。"""
-    stopped = stop_service(config.root_dir, timeout_seconds=timeout_seconds, force=force)
+    stopped = stop_service(
+        config.root_dir, timeout_seconds=timeout_seconds, force=force
+    )
     if not stopped.ok:
-        return ServiceActionResult(ok=False, action="restart", status=stopped.status, message=stopped.message)
+        return ServiceActionResult(
+            ok=False, action="restart", status=stopped.status, message=stopped.message
+        )
     started = start_service(config)
-    return ServiceActionResult(ok=started.ok, action="restart", status=started.status, message=started.message)
+    return ServiceActionResult(
+        ok=started.ok, action="restart", status=started.status, message=started.message
+    )
 
 
 def _parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="管理 A 股虚拟盘观察期后台服务")
-    parser.add_argument("action", choices=["start", "status", "stop", "restart"], help="操作")
+    parser.add_argument(
+        "action", choices=["start", "status", "stop", "restart"], help="操作"
+    )
     parser.add_argument("--root", default=str(ROOT_DIR), help="项目根目录")
-    parser.add_argument("--watch-interval", type=int, default=4, help="盯盘刷新秒数")
-    parser.add_argument("--scan-interval", type=int, default=600, help="扫描间隔秒数")
-    parser.add_argument("--top-n", type=int, default=20, help="候选股数量")
-    parser.add_argument("--poll-seconds", type=int, default=300, help="守护循环轮询秒数")
-    parser.add_argument("--review-days", type=int, default=30, help="收盘复盘天数")
-    parser.add_argument("--ignore-calendar", action="store_true", help="忽略交易日历，便于联调")
+    parser.add_argument(
+        "--watch-interval", type=int, default=4, help="旧参数，保留兼容"
+    )
+    parser.add_argument(
+        "--scan-interval", type=int, default=600, help="旧参数，保留兼容"
+    )
+    parser.add_argument("--top-n", type=int, default=20, help="旧参数，保留兼容")
+    parser.add_argument("--poll-seconds", type=int, default=60, help="守护循环轮询秒数")
+    parser.add_argument("--review-days", type=int, default=30, help="旧参数，保留兼容")
+    parser.add_argument(
+        "--ignore-calendar", action="store_true", help="忽略交易日历，便于联调"
+    )
     parser.add_argument("--timeout-seconds", type=int, default=10, help="停止等待秒数")
     parser.add_argument("--force", action="store_true", help="停止超时后强制结束")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
@@ -304,7 +333,9 @@ def _print_result(result: ServiceActionResult, as_json: bool) -> None:
     """输出操作结果。"""
     payload = asdict(result)
     if as_json:
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n")
+        sys.stdout.write(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
+        )
         return
     prefix = "OK" if result.ok else "FAIL"
     sys.stdout.write(f"{prefix} {result.message}\n")
@@ -329,13 +360,19 @@ def main() -> int:
 
     if args.action == "status":
         status = get_status(root_dir)
-        result = ServiceActionResult(ok=True, action="status", status=status, message=status.message)
+        result = ServiceActionResult(
+            ok=True, action="status", status=status, message=status.message
+        )
     elif args.action == "start":
         result = start_service(config)
     elif args.action == "stop":
-        result = stop_service(root_dir, timeout_seconds=args.timeout_seconds, force=args.force)
+        result = stop_service(
+            root_dir, timeout_seconds=args.timeout_seconds, force=args.force
+        )
     else:
-        result = restart_service(config, timeout_seconds=args.timeout_seconds, force=args.force)
+        result = restart_service(
+            config, timeout_seconds=args.timeout_seconds, force=args.force
+        )
 
     _print_result(result, args.json)
     return 0 if result.ok else 1

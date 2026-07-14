@@ -20,7 +20,7 @@ import { useReducedMotion } from "./hooks/useReducedMotion";
 import { AllocationChart, BacktestChart, EquityCharts } from "./components/Charts";
 import { HudCard } from "./components/HudCard";
 import { StrategyTheater, type WorkspaceSection } from "./components/StrategyTheater";
-import type { BacktestSeries, Candidate, ObservationResponse, Position, ProfitRankItem, RpsOrder, RpsSignal, Trade } from "./types";
+import type { BacktestSeries, Candidate, CandidatesResponse, ObservationResponse, Position, ProfitRankItem, RpsOrder, RpsSignal, Trade } from "./types";
 
 function toneClass(value: number | null | undefined) {
   return `tone-${toneByValue(value)}`;
@@ -232,6 +232,8 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
   const [autoScroll, setAutoScroll] = useState(true);
   const [showRejected, setShowRejected] = useState(false);
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [scanTriggering, setScanTriggering] = useState(false);
+  const [scanMessage, setScanMessage] = useState<string | null>(null);
 
   const status = usePolling(api.status, 5000);
   const portfolio = usePolling(api.portfolio, 5000);
@@ -248,6 +250,20 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
     await api.logout();
     onLogout();
     window.history.replaceState({}, "", "/quantify/login");
+  };
+
+  const triggerPreviewScan = async () => {
+    setScanTriggering(true);
+    setScanMessage(null);
+    try {
+      const response = await api.triggerScan();
+      setScanMessage(response.message);
+      await Promise.all([candidates.refresh(), status.refresh()]);
+    } catch (error) {
+      setScanMessage(error instanceof Error ? error.message : "安全预览扫描启动失败");
+    } finally {
+      setScanTriggering(false);
+    }
   };
 
   const portfolioData = portfolio.data;
@@ -299,7 +315,12 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
               {equity.data?.points?.length ? <EquityCharts points={equity.data.points} reducedMotion={reducedMotion} /> : <EmptyState text="暂无净值数据，运行虚拟盘后生成快照。" />}
             </HudCard>
             <HudCard title="候选股雷达" icon={<Search size={18} />} meta={candidates.data?.updated_at || "--"}>
-              <CandidateList items={candidates.data?.candidates ?? []} />
+              <CandidatePanel
+                data={candidates.data}
+                triggering={scanTriggering}
+                message={scanMessage}
+                onTrigger={triggerPreviewScan}
+              />
             </HudCard>
             <HudCard title="运行观察" icon={<Radar size={18} />} meta={healthMeta(observation.data)}>
               <ObservationPanel data={observation.data} error={observation.error} />
@@ -310,7 +331,12 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
         return (
           <section className="workspace-grid">
             <HudCard title="主板候选池" icon={<Search size={18} />} meta={candidates.data?.updated_at || "--"}>
-              <CandidateList items={candidates.data?.candidates ?? []} />
+              <CandidatePanel
+                data={candidates.data}
+                triggering={scanTriggering}
+                message={scanMessage}
+                onTrigger={triggerPreviewScan}
+              />
             </HudCard>
             <HudCard title="ETF / RPS 研究基线" icon={<Radar size={18} />} meta={rpsStatus(rps.data)}>
               <RpsPanel signals={rps.data?.etf_signals ?? []} industries={rps.data?.industry_signals ?? []} orders={activeOrders} hiddenCount={rpsOrders.length - activeOrders.length} errors={rps.data?.errors ?? []} />
@@ -385,8 +411,11 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
               <div className="metric-stack">
                 <div className="kv-row"><span>策略进程</span><strong className={status.data?.live_runner ? "tone-positive" : "tone-negative"}>{status.data?.live_runner ? "运行中" : "已停止"}</strong></div>
                 <div className="kv-row"><span>Web 服务</span><strong className={status.data?.web_server === false ? "tone-negative" : "tone-positive"}>{status.data?.web_server === false ? "异常" : "正常"}</strong></div>
-                <div className="kv-row"><span>盯盘线程</span><strong>{status.data?.watch_thread ? "运行中" : "未运行"}</strong></div>
-                <div className="kv-row"><span>扫描线程</span><strong>{status.data?.scan_thread ? "运行中" : "未运行"}</strong></div>
+                <div className="kv-row"><span>策略模式</span><strong>周度收盘选股</strong></div>
+                <div className="kv-row"><span>预览扫描</span><strong>{status.data?.scan_running ? "运行中" : "空闲"}</strong></div>
+                <div className="kv-row"><span>最近扫描</span><strong>{status.data?.latest_scan_at || "尚未扫描"}</strong></div>
+                <div className="kv-row"><span>下次扫描</span><strong>{status.data?.next_scan_at || status.data?.scan_schedule || "--"}</strong></div>
+                <div className="kv-row"><span>守护心跳</span><strong>{status.data?.daemon_heartbeat_at || "--"}</strong></div>
                 <div className="kv-row"><span>最后日志</span><strong>{status.data?.last_log_time || "--"}</strong></div>
               </div>
             </HudCard>
@@ -410,6 +439,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
       status={status.data}
       portfolio={portfolioData}
       candidates={candidates.data?.candidates ?? []}
+      candidateScan={candidates.data}
       rps={rps.data}
       trades={allTrades}
       equity={equity.data?.points ?? []}
@@ -445,8 +475,71 @@ function DateFilter({ dates, selected, onSelect }: { dates: string[]; selected: 
   );
 }
 
-function CandidateList({ items }: { items: Candidate[] }) {
-  if (!items.length) return <EmptyState text="等待扫描..." />;
+function CandidatePanel({
+  data,
+  triggering,
+  message,
+  onTrigger
+}: {
+  data: CandidatesResponse | null;
+  triggering: boolean;
+  message: string | null;
+  onTrigger: () => Promise<void>;
+}) {
+  const status = data?.status ?? "never_run";
+  const running = Boolean(data?.scan_running || triggering);
+  const filters = [
+    ...Object.entries(data?.prefilter_counts ?? {}).map(([key, count]) => ({
+      key: `prefilter:${key}`,
+      label: data?.prefilter_labels?.[key] || key,
+      count
+    })),
+    ...Object.entries(data?.filter_counts ?? {}).map(([key, count]) => ({
+      key: `factor:${key}`,
+      label: data?.filter_labels?.[key] || key,
+      count
+    }))
+  ]
+    .filter((item) => item.count > 0)
+    .sort((left, right) => right.count - left.count)
+    .slice(0, 5);
+  const summary = status === "failed"
+    ? `扫描失败：${data?.error || "未知错误"}`
+    : status === "completed"
+      ? `主板 ${data?.universe?.mainboard_count ?? 0} · 粗筛 ${data?.universe?.rough_candidate_count ?? 0} · 完整历史 ${data?.input_count ?? 0} · 合格 ${data?.eligible_count ?? 0}`
+      : "尚无结构化扫描记录";
+
+  return (
+    <div className="list-stack">
+      <div className={`alert-line ${status === "failed" ? "negative" : ""}`}>{summary}</div>
+      <div className="inline-actions">
+        <button className="chip active" type="button" disabled={running} onClick={() => void onTrigger()}>
+          {running ? "扫描中..." : "安全预览扫描"}
+        </button>
+        <span className="muted-note">{data?.schedule || "每周收盘扫描"}</span>
+      </div>
+      {message && <div className="muted-note" role="status">{message}</div>}
+      {filters.length > 0 && (
+        <div className="metric-stack">
+          {filters.map((item) => (
+            <div className="kv-row" key={item.key}>
+              <span>{item.label}</span>
+              <strong>{item.count} 只</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      <CandidateList
+        items={data?.candidates ?? []}
+        emptyText={status === "completed" ? "本次扫描没有个股通过全部条件" : "等待首次扫描"}
+      />
+      {data?.next_scheduled_scan_at && <div className="muted-note">下次计划扫描：{data.next_scheduled_scan_at}</div>}
+    </div>
+  );
+}
+
+function CandidateList({ items, emptyText = "等待扫描" }: { items: Candidate[]; emptyText?: string }) {
+  if (!items.length) return <EmptyState text={emptyText} />;
   return (
     <div className="list-stack">
       {items.map((item) => (
@@ -454,11 +547,12 @@ function CandidateList({ items }: { items: Candidate[] }) {
           <span className="rank">#{item.rank}</span>
           <div className="row-main">
             <strong>{item.name}</strong>
-            <span>{item.code} · 得分 {formatNumber(item.score, 4)}</span>
+            <span>{item.code} · PB {formatNumber(item.pb, 2)} · 得分 {formatNumber(item.score, 4)}</span>
           </div>
           <div className="row-right">
             <strong>{item.current_price ? formatCurrency(item.current_price, 2) : "--"}</strong>
-            <span className={toneClass(item.momentum)}>{formatPercent(item.momentum)}</span>
+            <span className={toneClass(item.reversal)}>{formatPercent(item.reversal)}</span>
+            {item.selected && <span className="badge buy">拟选</span>}
           </div>
         </div>
       ))}
@@ -739,7 +833,7 @@ function BacktestTable({ series }: { series: BacktestSeries[] }) {
           ))}
         </tbody>
       </table>
-      <div className="muted-note">注：回测含幸存者偏差，绝对收益偏乐观，重点看相对优劣。</div>
+      <div className="muted-note">注：仅展示 robust_v2 历史股票池滚动样本外结果；缺少版本化数据时不会用当前股票池回填。</div>
     </div>
   );
 }

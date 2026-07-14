@@ -28,6 +28,7 @@ import {
 import { formatCurrency, formatNumber, formatPercent, toneByValue } from "../lib/format";
 import type {
   Candidate,
+  CandidatesResponse,
   EquityPoint,
   ObservationResponse,
   PortfolioResponse,
@@ -54,6 +55,7 @@ interface StrategyTheaterProps {
   status: StatusResponse | null;
   portfolio: PortfolioResponse | null;
   candidates: Candidate[];
+  candidateScan: CandidatesResponse | null;
   rps: RpsResponse | null;
   trades: Trade[];
   equity: EquityPoint[];
@@ -121,7 +123,8 @@ function buildEvents(
   trades: Trade[],
   status: StatusResponse | null,
   portfolio: PortfolioResponse | null,
-  candidates: Candidate[]
+  candidates: Candidate[],
+  candidateScan: CandidatesResponse | null
 ): TimelineEvent[] {
   const events: TimelineEvent[] = trades.slice(0, 3).map((trade, index) => {
     const action = (trade.action ?? trade.direction) === "buy" ? "买入" : "卖出";
@@ -143,6 +146,22 @@ function buildEvents(
       time: shortTime(status?.now),
       title: "因子候选更新",
       detail: `${candidates.length} 个主板候选通过初筛`,
+      tone: "active"
+    });
+  } else if (candidateScan?.status === "completed") {
+    events.push({
+      id: "candidate-refresh-empty",
+      time: shortTime(candidateScan.updated_at),
+      title: "个股扫描完成",
+      detail: `${candidateScan.input_count} 只进入因子筛选，本次 0 只合格`,
+      tone: "muted"
+    });
+  } else if (candidateScan?.status === "failed") {
+    events.push({
+      id: "candidate-refresh-failed",
+      time: shortTime(candidateScan.updated_at),
+      title: "个股扫描失败",
+      detail: candidateScan.error || "请检查 robust_v2 日志",
       tone: "active"
     });
   }
@@ -381,29 +400,48 @@ function MarketCard({
 
 function FactorCard({
   candidates,
+  candidateScan,
   rps,
   observation,
   portfolio,
   status,
   active,
   onClick
-}: Pick<StrategyTheaterProps, "candidates" | "rps" | "observation" | "portfolio" | "status"> & {
+}: Pick<StrategyTheaterProps, "candidates" | "candidateScan" | "rps" | "observation" | "portfolio" | "status"> & {
   active: boolean;
   onClick: () => void;
 }) {
   const healthOk = observation?.health?.ok !== false && !(observation?.health?.failures?.length);
   const readiness = [
     { label: "数据健康", value: healthOk ? 100 : 35 },
-    { label: "主板候选", value: candidates.length ? clamp(55 + candidates.length * 5, 0, 100) : 0 },
+    {
+      label: "主板候选",
+      value: candidates.length
+        ? clamp(55 + candidates.length * 5, 0, 100)
+        : candidateScan?.status === "completed" ? 25 : 0
+    },
     { label: "ETF 趋势", value: rps?.status === "ok" ? 90 : rps?.available === false ? 45 : 20 },
     { label: "风险预算", value: clamp(100 - Math.max(0, (portfolio?.position_ratio ?? 0) - 0.6) * 150, 0, 100) },
     { label: "T+1 规则", value: 100 }
   ];
   const conclusion = !status?.live_runner
     ? "等待策略启动"
-    : candidates.length
-      ? "候选池已就绪"
-      : "等待收盘信号";
+    : candidateScan?.scan_running
+      ? "安全预览扫描中"
+      : candidateScan?.status === "failed"
+        ? "个股扫描异常"
+        : candidates.length
+          ? "候选池已就绪"
+          : candidateScan?.status === "completed"
+            ? "本次无合格个股"
+            : "等待首次扫描";
+  const scanDetail = candidates.length
+    ? `${candidateScan?.eligible_count ?? candidates.length} 个候选等待目标组合确认`
+    : candidateScan?.status === "completed"
+      ? `${candidateScan.input_count} 只进入因子筛选，0 只通过全部条件`
+      : candidateScan?.status === "failed"
+        ? candidateScan.error || "请检查扫描日志"
+        : "尚无结构化扫描记录";
 
   return (
     <button className={`stage-card factor-card ${active ? "is-active" : ""}`} type="button" aria-label="查看因子判断详情" onClick={onClick}>
@@ -417,7 +455,7 @@ function FactorCard({
       <div className="signal-conclusion">
         <span>信号结论</span>
         <strong>{conclusion}</strong>
-        <small>{candidates.length ? `${candidates.length} 个候选等待目标组合确认` : "不在盘中追涨，不强制开仓"}</small>
+        <small>{scanDetail}</small>
       </div>
     </button>
   );
@@ -521,7 +559,7 @@ function RecentEvents({ events }: { events: TimelineEvent[] }) {
 }
 
 function TheaterOverview(props: Omit<StrategyTheaterProps, "activeSection" | "onSectionChange" | "onLogout" | "clock" | "children">) {
-  const { status, portfolio, candidates, rps, trades, equity, observation, reducedMotion } = props;
+  const { status, portfolio, candidates, candidateScan, rps, trades, equity, observation, reducedMotion } = props;
   const todayTrades = trades.filter((trade) => trade.date === dateKey());
   const derivedStage = todayTrades.length ? 3 : (portfolio?.position_count ?? 0) > 0 ? 2 : candidates.length ? 1 : status?.live_runner ? 0 : 1;
   const [focusedStage, setFocusedStage] = useState(derivedStage);
@@ -531,12 +569,16 @@ function TheaterOverview(props: Omit<StrategyTheaterProps, "activeSection" | "on
   }, [derivedStage]);
 
   const events = useMemo(
-    () => buildEvents(trades, status, portfolio, candidates),
-    [trades, status, portfolio, candidates]
+    () => buildEvents(trades, status, portfolio, candidates, candidateScan),
+    [trades, status, portfolio, candidates, candidateScan]
   );
   const stageStatus = [
     status?.now ? `已更新 ${shortTime(status.now)}` : "等待数据",
-    candidates.length ? `${candidates.length} 个候选` : status?.live_runner ? "分析中" : "等待启动",
+    candidateScan?.scan_running
+      ? "扫描中"
+      : candidates.length
+        ? `${candidateScan?.eligible_count ?? candidates.length} 个候选`
+        : candidateScan?.status === "completed" ? "0 个合格" : status?.live_runner ? "等待扫描" : "等待启动",
     (portfolio?.position_count ?? 0) > 0 ? "组合已持有" : "待生成",
     todayTrades.length ? `${todayTrades.length} 笔记录` : "等待收盘信号"
   ];
@@ -596,7 +638,7 @@ function TheaterOverview(props: Omit<StrategyTheaterProps, "activeSection" | "on
 
       <section className="stage-grid" aria-label="策略四阶段详情">
         <MarketCard {...{ equity, portfolio, status, reducedMotion }} active={focusedStage === 0} onClick={() => setFocusedStage(0)} />
-        <FactorCard {...{ candidates, rps, observation, portfolio, status }} active={focusedStage === 1} onClick={() => setFocusedStage(1)} />
+        <FactorCard {...{ candidates, candidateScan, rps, observation, portfolio, status }} active={focusedStage === 1} onClick={() => setFocusedStage(1)} />
         <TargetCard portfolio={portfolio} active={focusedStage === 2} onClick={() => setFocusedStage(2)} />
         <ExecutionCard trades={trades} active={focusedStage === 3} onClick={() => setFocusedStage(3)} />
       </section>
@@ -622,6 +664,7 @@ export function StrategyTheater({
   status,
   portfolio,
   candidates,
+  candidateScan,
   rps,
   trades,
   equity,
@@ -640,6 +683,7 @@ export function StrategyTheater({
               status={status}
               portfolio={portfolio}
               candidates={candidates}
+              candidateScan={candidateScan}
               rps={rps}
               trades={trades}
               equity={equity}

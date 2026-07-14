@@ -1,4 +1,4 @@
-"""股票池缓存优先与 BaoStock 超时隔离测试。"""
+"""股票主数据完整性与 BaoStock 超时隔离测试。"""
 
 from __future__ import annotations
 
@@ -16,26 +16,60 @@ def _touch(path: Path) -> None:
     path.touch()
 
 
-def test_get_all_stocks_prefers_cache_and_deduplicates(
+def test_history_file_fallback_is_marked_incomplete_and_deduplicated(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """存在普通或扩展历史缓存时，不应调用 BaoStock。"""
+    """历史文件名只能用于诊断性回退，不能冒充完整股票池。"""
     _touch(tmp_path / "hist_600519_60.pkl")
     _touch(tmp_path / "hist_600519_120.pkl")
     _touch(tmp_path / "histext_000001_40.pkl")
     _touch(tmp_path / "hist_invalid_120.pkl")
 
-    def _fail_remote(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("存在本地缓存时不应访问 BaoStock")
+    calls = 0
 
-    monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _fail_remote)
+    def _timeout(*_args: object, **_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        return None
 
-    stocks = AKDataLoader(cache_dir=str(tmp_path)).get_all_stocks()
+    monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _timeout)
+    loader = AKDataLoader(cache_dir=str(tmp_path))
+    monkeypatch.setattr(loader, "get_stock_name_map", lambda: {})
+
+    stocks = loader.get_all_stocks()
 
     assert [stock["code"] for stock in stocks] == ["000001", "600519"]
     assert stocks[0]["bs_code"] == "sz.000001"
     assert stocks[1]["bs_code"] == "sh.600519"
+    assert calls == 1
+    assert loader.get_stock_universe_info()["authoritative"] is False
+    assert loader.get_stock_universe_info()["source"] == "history-file-names"
+
+
+def test_get_all_stocks_prefers_full_market_master_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AKShare 全市场主数据应优先于零散历史文件，并写独立缓存。"""
+    _touch(tmp_path / "hist_600519_120.pkl")
+    loader = AKDataLoader(cache_dir=str(tmp_path))
+    monkeypatch.setattr(
+        loader,
+        "get_stock_name_map",
+        lambda: {"600519": "贵州茅台", "000001": "平安银行"},
+    )
+
+    def _fail_baostock(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("已有全市场主数据时不应访问 BaoStock")
+
+    monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _fail_baostock)
+
+    stocks = loader.get_all_stocks()
+
+    assert [stock["code"] for stock in stocks] == ["000001", "600519"]
+    assert loader.get_stock_universe_info()["authoritative"] is True
+    assert (tmp_path / "stock_universe_v1.json").exists()
 
 
 def test_get_all_stocks_stops_after_first_remote_timeout(
@@ -51,6 +85,7 @@ def test_get_all_stocks_stops_after_first_remote_timeout(
 
     monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _timeout)
     loader = AKDataLoader(cache_dir=str(tmp_path))
+    monkeypatch.setattr(loader, "get_stock_name_map", lambda: {})
 
     assert loader.get_all_stocks() == []
     assert len(calls) == 1

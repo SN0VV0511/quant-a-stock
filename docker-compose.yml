@@ -1,0 +1,61 @@
+services:
+  paper-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.live
+    command: ["python3", "scripts/paper_v2_init.py", "--confirm", "--json"]
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - quant-data:/app/data
+      - quant-logs:/app/logs
+      - quant-reports:/app/reports
+    restart: "no"
+
+  paper-live:
+    build:
+      context: .
+      dockerfile: Dockerfile.live
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      paper-init:
+        condition: service_completed_successfully
+    volumes:
+      - quant-data:/app/data
+      - quant-logs:/app/logs
+      - quant-reports:/app/reports
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
+    depends_on:
+      paper-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - quant-data:/app/data
+      - quant-logs:/app/logs:ro
+      - quant-reports:/app/reports
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m
+    restart: unless-stopped
+
+volumes:
+  quant-data:
+  quant-logs:
+  quant-reports:

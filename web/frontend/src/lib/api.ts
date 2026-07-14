@@ -8,6 +8,7 @@ import type {
   PortfolioResponse,
   ProfitRankingResponse,
   RpsResponse,
+  ScanTriggerResponse,
   StatusResponse,
   TradesResponse
 } from "../types";
@@ -46,8 +47,8 @@ async function requestJson<T>(
     }
     let message = `请求失败: HTTP ${response.status}`;
     try {
-      const data = (await response.json()) as { error?: string };
-      message = data.error ?? message;
+      const data = (await response.json()) as { error?: string; message?: string };
+      message = data.error ?? data.message ?? message;
     } catch {
       // 服务端可能返回 HTML 登录页，此处保留 HTTP 状态信息。
     }
@@ -85,6 +86,12 @@ export const api = {
   },
   candidates(): Promise<CandidatesResponse> {
     return requestJson<CandidatesResponse>(`${BASE}/api/candidates`);
+  },
+  triggerScan(): Promise<ScanTriggerResponse> {
+    return requestJson<ScanTriggerResponse>(`${BASE}/api/scan/trigger`, {
+      method: "POST",
+      body: "{}"
+    });
   },
   rps(): Promise<RpsResponse> {
     return requestJson<RpsResponse>(`${BASE}/api/rps`);

@@ -14,15 +14,16 @@ import os
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
+import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, replace
+from collections import Counter
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date as date_type
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 import pandas as pd
 
@@ -32,14 +33,24 @@ from config.settings import (
     ALLOW_MAIN_BOARD_STOCKS,
     ALLOW_STAR_MARKET_STOCKS,
     DEFAULT_RPS_ETF_POOL,
+    DAILY_LOSS_THRESHOLD,
     ENFORCE_T1,
     INITIAL_CAPITAL,
+    MAX_DRAWDOWN_THRESHOLD,
     REPORT_DIR,
     ROBUST_V2_ACCOUNT_ID,
+    ROBUST_V2_BACKUP_DIR,
+    ROBUST_V2_BACKUP_RETENTION_DAYS,
     ROBUST_V2_LEASE_TTL_SECONDS,
     ROBUST_V2_LEDGER_PATH,
+    ROBUST_V2_MAX_EXECUTION_QUOTE_AGE_SECONDS,
+    ROBUST_V2_MIN_ETF_HISTORY_COVERAGE,
+    ROBUST_V2_MIN_HISTORY_COVERAGE,
+    ROBUST_V2_MIN_MAINBOARD_UNIVERSE,
+    ROBUST_V2_MIN_REALTIME_QUOTE_COVERAGE,
     ROBUST_V2_MONITOR_INTERVAL_SECONDS,
     ROBUST_V2_SELECTED_CONFIG_PATH,
+    ROBUST_V2_SIGNAL_RETRY_SECONDS,
     ROBUST_V2_STOCK_CANDIDATE_LIMIT,
     ROBUST_V2_STRATEGY_VERSION,
     get_stock_board,
@@ -48,20 +59,44 @@ from config.settings import (
 )
 from config.time_utils import now_local, today_yyyymmdd
 from data.ak_loader import AKDataLoader
-from data.holidays import is_trading_day as calendar_is_trading_day
+from data.holidays import (
+    is_trading_day as calendar_is_trading_day,
+    previous_trading_day,
+)
+from data.scan_store import ScanMode, StockScanSnapshot, StockScanStore
 from reports.ledger_report import build_daily_ledger_report, save_daily_ledger_report
 from strategies.robust_v2 import (
+    STOCK_FILTER_LABELS,
     RobustV2Config,
     RobustV2Strategy,
+    StockScanResult,
     build_market_data_hash,
     validate_realtime_alignment,
 )
 from trading.allocator import AllocationResult, PortfolioAllocator
-from trading.brokers import SQLitePaperBrokerAdapter
-from trading.models import ExecutionReport, MarketSnapshot, TargetPortfolio
+from trading.brokers import BrokerAdapter, SQLitePaperBrokerAdapter
+from trading.ledger import PaperLedger
+from trading.market import (
+    ExecutionQuote,
+    classify_trading_session,
+    is_strategy_execution_session,
+    order_is_tradable,
+    validate_execution_quote,
+)
+from trading.instruments import normalized_security_code
+from trading.models import ExecutionReport, MarketSnapshot, OrderIntent, TargetPortfolio
+from trading.schedule import rebalance_interval_elapsed
 
 LOGGER = logging.getLogger("robust_runner")
 ROOT_DIR = Path(__file__).resolve().parent
+STOCK_PREFILTER_LABELS: dict[str, str] = {
+    "missing_realtime_quote": "缺少实时行情",
+    "st_or_delisting": "粗筛排除 ST 或退市风险",
+    "price_out_of_range": "粗筛股价超出范围",
+    "lot_too_expensive": "粗筛一手金额超过预算",
+    "insufficient_liquidity": "粗筛实时成交额不足",
+    "candidate_limit": "流动性排名超出 500 只上限",
+}
 
 
 @dataclass(frozen=True)
@@ -73,6 +108,8 @@ class SignalData:
     stock_history: dict[str, pd.DataFrame]
     names: dict[str, str]
     quotes: dict[str, dict[str, Any]]
+    universe: dict[str, int] = field(default_factory=dict)
+    prefilter_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -84,6 +121,67 @@ class ExecutionOutcome:
     allocation: AllocationResult | None
     reports: tuple[ExecutionReport, ...]
     message: str
+
+
+class DataCompletenessError(RuntimeError):
+    """正式信号输入未达到可证明的完整性下限。"""
+
+
+class LeaseHeartbeat:
+    """在耗时行情扫描期间独立续租账户写锁。"""
+
+    def __init__(
+        self,
+        ledger: Any,
+        holder_id: str,
+        ttl_seconds: int,
+        *,
+        interval_seconds: float | None = None,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("租约 TTL 必须大于 0")
+        self.ledger = ledger
+        self.holder_id = holder_id
+        self.ttl_seconds = ttl_seconds
+        self.interval_seconds = interval_seconds or max(1.0, ttl_seconds / 3)
+        if self.interval_seconds >= ttl_seconds:
+            raise ValueError("续租间隔必须小于租约 TTL")
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+
+    def start(self) -> None:
+        """启动守护续租线程。"""
+        if self._thread is not None:
+            raise RuntimeError("租约续租线程不能重复启动")
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"lease-heartbeat-{self.holder_id[-12:]}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        """按固定间隔续租；失败会留给主线程显式处理。"""
+        while not self._stop_event.wait(self.interval_seconds):
+            try:
+                self.ledger.heartbeat_lease(self.holder_id, self.ttl_seconds)
+            except Exception as exc:
+                self._error = exc
+                self._stop_event.set()
+                return
+
+    def raise_if_failed(self) -> None:
+        """续租失败时阻断后续账户写入。"""
+        if self._error is not None:
+            raise RuntimeError("账户写租约续租失败，已停止交易") from self._error
+
+    def stop(self) -> None:
+        """停止续租线程并等待其退出。"""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 2))
+        self.raise_if_failed()
 
 
 def _latest_dates(history_map: Mapping[str, pd.DataFrame], cutoff: str) -> list[str]:
@@ -212,6 +310,10 @@ class RobustDataService:
         root_dir: Path = ROOT_DIR,
         stock_candidate_limit: int = ROBUST_V2_STOCK_CANDIDATE_LIMIT,
         max_data_age_seconds: int = 86_400,
+        min_mainboard_universe: int = ROBUST_V2_MIN_MAINBOARD_UNIVERSE,
+        min_realtime_quote_coverage: float = ROBUST_V2_MIN_REALTIME_QUOTE_COVERAGE,
+        min_history_coverage: float = ROBUST_V2_MIN_HISTORY_COVERAGE,
+        min_etf_history_coverage: float = ROBUST_V2_MIN_ETF_HISTORY_COVERAGE,
     ) -> None:
         if stock_candidate_limit <= 0:
             raise ValueError("股票候选数量必须大于 0")
@@ -219,10 +321,29 @@ class RobustDataService:
         self.root_dir = root_dir.resolve()
         self.stock_candidate_limit = stock_candidate_limit
         self.max_data_age_seconds = max_data_age_seconds
+        self.min_mainboard_universe = min_mainboard_universe
+        self.min_realtime_quote_coverage = min_realtime_quote_coverage
+        self.min_history_coverage = min_history_coverage
+        self.min_etf_history_coverage = min_etf_history_coverage
+        if min_mainboard_universe <= 0:
+            raise ValueError("主板股票池完整性下限必须大于 0")
+        for name, value in {
+            "实时行情覆盖率": min_realtime_quote_coverage,
+            "历史行情覆盖率": min_history_coverage,
+            "ETF 历史覆盖率": min_etf_history_coverage,
+        }.items():
+            if not 0 < value <= 1:
+                raise ValueError(f"{name}必须位于 (0, 1]")
 
     def _stock_candidates(
         self, account_value: float
-    ) -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
+    ) -> tuple[
+        list[str],
+        dict[str, str],
+        dict[str, dict[str, Any]],
+        dict[str, int],
+        dict[str, int],
+    ]:
         """用实时流动性做 IO 粗筛，因子筛选仍使用 T 日收盘历史。"""
         stocks = [
             stock
@@ -233,23 +354,97 @@ class RobustDataService:
         codes = [stock["code"] for stock in stocks]
         quotes = self.loader.get_realtime_quotes(codes) if codes else {}
         ranked: list[tuple[float, str]] = []
-        for code, quote in quotes.items():
+        prefilter_counts: Counter[str] = Counter()
+        missing_quotes = len(set(codes) - set(quotes))
+        if missing_quotes > 0:
+            prefilter_counts["missing_realtime_quote"] = missing_quotes
+        for code in codes:
+            quote = quotes.get(code)
+            if quote is None:
+                continue
             name = str(quote.get("name") or names.get(code, code))
             price = float(quote.get("price", 0) or 0)
             volume = float(quote.get("volume", 0) or 0)
             if "ST" in name.upper() or "退" in name:
+                prefilter_counts["st_or_delisting"] += 1
                 continue
-            if not 3 <= price <= 80 or price * 100 > account_value * 0.2:
+            if not 3 <= price <= 80:
+                prefilter_counts["price_out_of_range"] += 1
+                continue
+            if price * 100 > account_value * 0.2:
+                prefilter_counts["lot_too_expensive"] += 1
                 continue
             amount_proxy = price * volume
             if amount_proxy < 100_000_000:
+                prefilter_counts["insufficient_liquidity"] += 1
                 continue
             ranked.append((amount_proxy, code))
             names[code] = name
         ranked.sort(reverse=True)
+        if len(ranked) > self.stock_candidate_limit:
+            prefilter_counts["candidate_limit"] = (
+                len(ranked) - self.stock_candidate_limit
+            )
         selected = [code for _, code in ranked[: self.stock_candidate_limit]]
         selected_quotes = {code: quotes[code] for code in selected if code in quotes}
-        return selected, names, selected_quotes
+        universe = {
+            "mainboard_count": len(stocks),
+            "realtime_quote_count": len(quotes),
+            "rough_candidate_count": len(selected),
+        }
+        universe_info_getter = getattr(self.loader, "get_stock_universe_info", None)
+        if callable(universe_info_getter):
+            info = universe_info_getter()
+            universe["universe_authoritative"] = int(
+                bool(info.get("authoritative", False))
+            )
+            universe["universe_cache_stale"] = int(bool(info.get("stale", True)))
+        ordered_prefilter_counts = {
+            reason: prefilter_counts[reason]
+            for reason in STOCK_PREFILTER_LABELS
+            if prefilter_counts[reason] > 0
+        }
+        return selected, names, selected_quotes, universe, ordered_prefilter_counts
+
+    def _require_complete_signal_data(
+        self,
+        *,
+        universe: Mapping[str, int],
+        etf_history_count: int,
+    ) -> None:
+        """数据不足时拒绝生成正式目标，避免把数据故障伪装成空候选。"""
+        mainboard_count = int(universe.get("mainboard_count", 0))
+        quote_count = int(universe.get("realtime_quote_count", 0))
+        rough_count = int(universe.get("rough_candidate_count", 0))
+        history_count = int(universe.get("history_loaded_count", 0))
+        if int(universe.get("universe_authoritative", 1)) != 1:
+            raise DataCompletenessError("股票池来源不可证明完整，拒绝生成正式信号")
+        if mainboard_count < self.min_mainboard_universe:
+            raise DataCompletenessError(
+                f"主板股票池仅 {mainboard_count} 只，低于完整性下限 "
+                f"{self.min_mainboard_universe}"
+            )
+        quote_coverage = quote_count / mainboard_count if mainboard_count else 0.0
+        if quote_coverage < self.min_realtime_quote_coverage:
+            raise DataCompletenessError(
+                f"实时行情覆盖率 {quote_coverage:.2%} 低于下限 "
+                f"{self.min_realtime_quote_coverage:.2%}"
+            )
+        history_coverage = history_count / rough_count if rough_count else 1.0
+        if history_coverage < self.min_history_coverage:
+            raise DataCompletenessError(
+                f"候选历史行情覆盖率 {history_coverage:.2%} 低于下限 "
+                f"{self.min_history_coverage:.2%}"
+            )
+        required_etfs = max(
+            1,
+            int(len(DEFAULT_RPS_ETF_POOL) * self.min_etf_history_coverage + 0.999999),
+        )
+        if etf_history_count < required_etfs:
+            raise DataCompletenessError(
+                f"ETF 历史行情仅 {etf_history_count}/{len(DEFAULT_RPS_ETF_POOL)}，"
+                f"至少需要 {required_etfs} 只"
+            )
 
     def _persist_universe(
         self,
@@ -307,11 +502,18 @@ class RobustDataService:
         etf_history = self.loader.get_batch_etf_history(
             etf_codes, days=420, adjust="qfq"
         )
-        stock_codes, names, quotes = self._stock_candidates(account_value)
+        stock_codes, names, quotes, universe, prefilter_counts = self._stock_candidates(
+            account_value
+        )
         stock_history = self.loader.get_batch_history_ext(
             stock_codes,
             days=420,
             max_batch=self.stock_candidate_limit,
+        )
+        universe["history_loaded_count"] = len(stock_history)
+        self._require_complete_signal_data(
+            universe=universe,
+            etf_history_count=len(etf_history),
         )
         all_history = {**etf_history, **stock_history}
         dates = _latest_dates(all_history, trade_date)
@@ -338,6 +540,8 @@ class RobustDataService:
             stock_history=stock_history,
             names=names,
             quotes=quotes,
+            universe=universe,
+            prefilter_counts=prefilter_counts,
         )
 
     def load_execution_data(
@@ -385,12 +589,8 @@ def _last_trading_day_of_week(day: date_type, ignore_calendar: bool = False) -> 
         return day.weekday() == 4
     cursor = day + timedelta(days=1)
     while cursor.weekday() <= 4:
-        try:
-            if calendar_is_trading_day(cursor.strftime("%Y%m%d")):
-                return False
-        except Exception:
-            if cursor.weekday() < 5:
-                return False
+        if calendar_is_trading_day(cursor.strftime("%Y%m%d")):
+            return False
         cursor += timedelta(days=1)
     return True
 
@@ -400,10 +600,11 @@ class RobustV2Runner:
 
     def __init__(
         self,
-        broker: SQLitePaperBrokerAdapter,
+        broker: BrokerAdapter,
         loader: AKDataLoader,
         config: RobustV2Config | None = None,
         root_dir: Path = ROOT_DIR,
+        ledger: PaperLedger | None = None,
     ) -> None:
         self.config = config or RobustV2Config()
         self.broker = broker
@@ -416,11 +617,79 @@ class RobustV2Runner:
             max_data_age_seconds=self.config.max_data_age_seconds,
         )
         self.root_dir = root_dir.resolve()
+        self.scan_store = StockScanStore(self.root_dir / "data" / "scans")
+        broker_ledger = getattr(broker, "ledger", None)
+        selected_ledger = ledger or broker_ledger
+        if not isinstance(selected_ledger, PaperLedger):
+            raise TypeError("robust_v2 必须显式提供独立审计账本")
+        self._ledger = selected_ledger
 
     @property
-    def ledger(self):
-        """返回 paper_v2 单账本。"""
-        return self.broker.ledger
+    def ledger(self) -> PaperLedger:
+        """返回与交易通道解耦的信号、运行和审计账本。"""
+        return self._ledger
+
+    def _validated_execution_quotes(
+        self,
+        codes: set[str],
+        quotes: Mapping[str, Mapping[str, Any]],
+        *,
+        execution_date: str,
+        current_time: datetime,
+    ) -> tuple[dict[str, ExecutionQuote], dict[str, str]]:
+        """对目标和持仓行情做交易所时间、停牌与价格制度校验。"""
+        contexts: dict[str, ExecutionQuote] = {}
+        rejected: dict[str, str] = {}
+        quote_by_raw = {
+            normalized_security_code(code): (code, quote)
+            for code, quote in quotes.items()
+        }
+        for code in codes:
+            raw = normalized_security_code(code)
+            entry = quote_by_raw.get(raw)
+            if entry is None:
+                rejected[code] = "缺少实时行情"
+                continue
+            quote_code, quote = entry
+            result = validate_execution_quote(
+                quote_code,
+                quote,
+                execution_date=execution_date,
+                now=current_time,
+                max_age_seconds=ROBUST_V2_MAX_EXECUTION_QUOTE_AGE_SECONDS,
+            )
+            if result.context is None:
+                rejected[code] = result.reason
+                continue
+            contexts[raw] = result.context
+        return contexts, rejected
+
+    def _buy_risk_block_reason(
+        self,
+        prices: Mapping[str, float],
+        *,
+        execution_date: str,
+    ) -> str:
+        """把全局日亏与回撤熔断接入 robust_v2 买入边界。"""
+        snapshot = self.broker.query_snapshot(dict(prices))
+        if snapshot.drawdown >= MAX_DRAWDOWN_THRESHOLD:
+            return (
+                f"账户回撤 {snapshot.drawdown:.2%} 达到熔断线 "
+                f"{MAX_DRAWDOWN_THRESHOLD:.2%}，暂停新买入"
+            )
+        previous = self.ledger.latest_nav_before(execution_date)
+        if previous is None:
+            return ""
+        previous_value = float(previous.get("total_value", 0) or 0)
+        if previous_value <= 0:
+            return ""
+        daily_return = snapshot.total_value / previous_value - 1
+        if daily_return <= -DAILY_LOSS_THRESHOLD:
+            return (
+                f"账户当日亏损 {daily_return:.2%} 达到熔断线 "
+                f"-{DAILY_LOSS_THRESHOLD:.2%}，暂停新买入"
+            )
+        return ""
 
     def is_rebalance_due(
         self, trade_date: str, *, ignore_calendar: bool = False
@@ -432,10 +701,193 @@ class RobustV2Runner:
         latest = self.ledger.latest_signal_date(self.config.strategy_version)
         if latest is None:
             return True
-        previous = datetime.strptime(latest, "%Y%m%d").date()
-        required_weeks = 1 if self.config.rebalance_days == 5 else 2
-        week_delta = (current - previous).days // 7
-        return week_delta >= required_weeks
+        return rebalance_interval_elapsed(
+            trade_date,
+            latest,
+            self.config.rebalance_days,
+        )
+
+    def next_scheduled_scan_at(self, from_date: str) -> str:
+        """计算不早于指定日期的下一次调仓扫描时间。"""
+        cursor = datetime.strptime(from_date, "%Y%m%d").date()
+        latest_text = self.ledger.latest_signal_date(self.config.strategy_version)
+        latest = (
+            datetime.strptime(latest_text, "%Y%m%d").date()
+            if latest_text is not None
+            else None
+        )
+        for offset in range(46):
+            candidate = cursor + timedelta(days=offset)
+            date_text = candidate.strftime("%Y%m%d")
+            if not _is_trading_day(date_text, ignore_calendar=False):
+                continue
+            if not _last_trading_day_of_week(candidate):
+                continue
+            if rebalance_interval_elapsed(
+                date_text,
+                latest.strftime("%Y%m%d") if latest is not None else None,
+                self.config.rebalance_days,
+            ):
+                return f"{candidate.isoformat()} 15:05:00"
+        return ""
+
+    def _stock_scan_snapshot(
+        self,
+        signal_data: SignalData,
+        result: StockScanResult,
+        *,
+        account_value: float,
+        mode: ScanMode,
+        selected_codes: tuple[str, ...],
+    ) -> StockScanSnapshot:
+        """把策略扫描结果补齐行情、排名和调度信息。"""
+        rows: list[dict[str, Any]] = []
+        selected = set(selected_codes)
+        for rank, candidate in enumerate(result.candidates, start=1):
+            code = str(candidate["code"])
+            quote = signal_data.quotes.get(code, {})
+            current_price = _json_number(quote.get("price"))
+            rows.append(
+                {
+                    **candidate,
+                    "rank": rank,
+                    "current_price": current_price or float(candidate["price"]),
+                    "selected": code in selected,
+                }
+            )
+        return StockScanSnapshot(
+            strategy_version=self.config.strategy_version,
+            trade_date=signal_data.snapshot.trade_date,
+            generated_at=now_local().strftime("%Y-%m-%d %H:%M:%S"),
+            mode=mode,
+            status="completed",
+            account_value=account_value,
+            source_snapshot_hash=signal_data.snapshot.data_hash,
+            universe=dict(signal_data.universe),
+            input_count=result.input_count,
+            eligible_count=result.eligible_count,
+            prefilter_counts=dict(signal_data.prefilter_counts),
+            prefilter_labels=dict(STOCK_PREFILTER_LABELS),
+            filter_counts=dict(result.filter_counts),
+            filter_labels=dict(STOCK_FILTER_LABELS),
+            candidates=tuple(rows),
+            selected_codes=selected_codes,
+            next_scheduled_scan_at=self.next_scheduled_scan_at(
+                signal_data.snapshot.trade_date
+            ),
+        )
+
+    def _save_stock_scan(
+        self,
+        signal_data: SignalData,
+        result: StockScanResult,
+        *,
+        account_value: float,
+        mode: ScanMode,
+        selected_codes: tuple[str, ...],
+    ) -> Path:
+        """保存扫描快照并记录关键计数。"""
+        snapshot = self._stock_scan_snapshot(
+            signal_data,
+            result,
+            account_value=account_value,
+            mode=mode,
+            selected_codes=selected_codes,
+        )
+        path = self.scan_store.save(snapshot)
+        LOGGER.info(
+            "个股扫描完成: mode=%s date=%s input=%d eligible=%d selected=%s file=%s",
+            snapshot.mode,
+            snapshot.trade_date,
+            snapshot.input_count,
+            snapshot.eligible_count,
+            list(snapshot.selected_codes),
+            path,
+        )
+        return path
+
+    def preview_stock_scan(
+        self,
+        trade_date: str,
+        *,
+        mode: Literal["daily_observation", "manual_preview"] = "manual_preview",
+    ) -> StockScanSnapshot:
+        """运行只读交易预览；仅写审计文件，不创建信号或订单。"""
+        account_value = self.broker.query_snapshot().total_value
+        try:
+            signal_data = self.data.load_signal_data(trade_date, account_value)
+            result = self.strategy.scan_stocks(
+                signal_data.stock_history,
+                signal_data.snapshot,
+                account_value,
+                signal_data.names,
+            )
+            target_preview = self.strategy.generate_target(
+                signal_data.snapshot,
+                signal_data.etf_history,
+                signal_data.stock_history,
+                account_value,
+                signal_data.names,
+                stock_scan_result=result,
+            )
+            selected_codes = tuple(
+                position.code
+                for position in target_preview.positions
+                if position.asset_type == "stock"
+            )
+            snapshot = self._stock_scan_snapshot(
+                signal_data,
+                result,
+                account_value=account_value,
+                mode=mode,
+                selected_codes=selected_codes,
+            )
+            self.scan_store.save(snapshot)
+            LOGGER.info(
+                "安全预览扫描完成: date=%s eligible=%d would_select=%s",
+                trade_date,
+                snapshot.eligible_count,
+                list(snapshot.selected_codes),
+            )
+            return snapshot
+        except Exception as exc:
+            failed = StockScanSnapshot(
+                strategy_version=self.config.strategy_version,
+                trade_date=trade_date,
+                generated_at=now_local().strftime("%Y-%m-%d %H:%M:%S"),
+                mode=mode,
+                status="failed",
+                account_value=max(account_value, 0),
+                source_snapshot_hash="unavailable",
+                universe={},
+                input_count=0,
+                eligible_count=0,
+                prefilter_counts={},
+                prefilter_labels=dict(STOCK_PREFILTER_LABELS),
+                filter_counts={},
+                filter_labels=dict(STOCK_FILTER_LABELS),
+                candidates=(),
+                selected_codes=(),
+                next_scheduled_scan_at=self.next_scheduled_scan_at(trade_date),
+                error=str(exc),
+            )
+            self.scan_store.save(failed)
+            LOGGER.exception("安全预览扫描失败: date=%s", trade_date)
+            raise
+
+    def ensure_daily_candidate_scan(self, trade_date: str) -> StockScanSnapshot | None:
+        """确保当日已有候选观察；正式调仓扫描存在时不重复拉取全市场。"""
+        try:
+            latest = self.scan_store.load_latest()
+        except RuntimeError:
+            latest = None
+        if (
+            latest is not None
+            and latest.get("trade_date") == trade_date
+            and latest.get("status") == "completed"
+        ):
+            return None
+        return self.preview_stock_scan(trade_date, mode="daily_observation")
 
     def generate_close_target(
         self, trade_date: str, *, force: bool = False
@@ -446,14 +898,36 @@ class RobustV2Runner:
             return None
         snapshot = self.broker.query_snapshot()
         signal_data = self.data.load_signal_data(trade_date, snapshot.total_value)
+        stock_scan = self.strategy.scan_stocks(
+            signal_data.stock_history,
+            signal_data.snapshot,
+            snapshot.total_value,
+            signal_data.names,
+        )
         target = self.strategy.generate_target(
             signal_data.snapshot,
             signal_data.etf_history,
             signal_data.stock_history,
             snapshot.total_value,
             signal_data.names,
+            stock_scan_result=stock_scan,
         )
         signal_id = self.ledger.record_signal(target)
+        selected_stocks = tuple(
+            position.code
+            for position in target.positions
+            if position.asset_type == "stock"
+        )
+        try:
+            self._save_stock_scan(
+                signal_data,
+                stock_scan,
+                account_value=snapshot.total_value,
+                mode="scheduled",
+                selected_codes=selected_stocks,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            LOGGER.exception("保存个股扫描快照失败，但已记录的目标组合保持有效")
         LOGGER.info(
             "收盘目标已记录: signal_id=%s date=%s exposure=%.2f%% cash=%.2f%% positions=%s",
             signal_id,
@@ -464,55 +938,201 @@ class RobustV2Runner:
         )
         return target
 
-    def execute_pending_target(self, execution_date: str) -> ExecutionOutcome:
-        """在 T+1 09:35 后执行最近一个未执行目标。"""
-        pending = self.ledger.pending_target(execution_date)
+    def execute_pending_target(
+        self,
+        execution_date: str,
+        *,
+        current_time: datetime | None = None,
+    ) -> ExecutionOutcome:
+        """仅在信号的下一交易日执行，并对暂时性市场失败持续重试。"""
+        execution_time = current_time or now_local()
+        pending = self.ledger.pending_target(execution_date, now=execution_time)
         if pending is None:
             return ExecutionOutcome(None, None, None, (), "没有待执行目标")
-        signal_id, target = pending
-        positions = self.broker.query_positions()
-        codes = {position.code for position in target.positions} | set(positions)
-        snapshot, history, quotes = self.data.load_execution_data(
-            codes, target.signal_date
+        _candidate_id, candidate = pending
+        expected_signal_date = previous_trading_day(execution_date)
+        self.ledger.expire_pending_targets_before(
+            expected_signal_date,
+            strategy_version=self.config.strategy_version,
         )
-        alignment = validate_realtime_alignment(snapshot, history, quotes)
-        prices = {
-            code: float(quote.get("price", 0) or 0) for code, quote in quotes.items()
-        }
-        allocation = self.allocator.allocate(
-            target,
-            cash=self.broker.query_cash(),
-            positions=positions,
-            prices=prices,
-            execution_date=execution_date,
-            tradable_codes=set(alignment.valid_codes),
-        )
-        checked_orders = tuple(
-            replace(
-                order,
-                metadata={
-                    **order.metadata,
-                    "data_health_checked": True,
-                    "alignment_snapshot_hash": snapshot.data_hash,
-                },
+        if candidate.signal_date != expected_signal_date:
+            LOGGER.error(
+                "拒绝跨日追旧目标: signal=%s expected=%s execute=%s",
+                candidate.signal_date,
+                expected_signal_date,
+                execution_date,
             )
-            for order in allocation.orders
+            return ExecutionOutcome(
+                None,
+                candidate,
+                None,
+                (),
+                "待执行目标不是上一交易日信号，已拒绝追单",
+            )
+
+        claimed = self.ledger.claim_pending_target(
+            execution_date,
+            signal_date=expected_signal_date,
+            now=execution_time,
         )
-        reports = tuple(self.broker.place_order(order) for order in checked_orders)
-        # 无论成交还是健康检查跳过，都结束该信号，防止旧目标跨日追单。
-        self.ledger.mark_signal_executed(signal_id)
-        LOGGER.info(
-            "目标执行完成: signal=%s orders=%d filled=%d skipped=%s alignment_rejected=%s",
-            signal_id,
-            len(reports),
-            sum(report.status == "filled" for report in reports),
-            allocation.skipped,
-            alignment.rejected,
-        )
-        return ExecutionOutcome(signal_id, target, allocation, reports, "目标执行完成")
+        if claimed is None:
+            return ExecutionOutcome(None, None, None, (), "目标正在执行或等待重试")
+
+        signal_id = claimed.signal_id
+        target = claimed.target
+        allocation: AllocationResult | None = None
+        reports: tuple[ExecutionReport, ...] = ()
+        try:
+            positions = self.broker.query_positions()
+            codes = {position.code for position in target.positions} | set(positions)
+            snapshot, history, quotes = self.data.load_execution_data(
+                codes, target.signal_date
+            )
+            contexts, quote_rejected = self._validated_execution_quotes(
+                codes,
+                quotes,
+                execution_date=execution_date,
+                current_time=execution_time,
+            )
+            healthy_quotes = {
+                code: quote
+                for code, quote in quotes.items()
+                if normalized_security_code(code) in contexts
+            }
+            alignment = validate_realtime_alignment(snapshot, history, healthy_quotes)
+            prices = {
+                context.code: context.current_price for context in contexts.values()
+            }
+            buy_risk_block = self._buy_risk_block_reason(
+                prices,
+                execution_date=execution_date,
+            )
+            allocation = self.allocator.allocate(
+                target,
+                cash=self.broker.query_cash(),
+                positions=positions,
+                prices=prices,
+                execution_date=execution_date,
+                tradable_codes=set(alignment.valid_codes),
+            )
+            checked_orders: list[OrderIntent] = []
+            market_skipped: dict[str, str] = {}
+            risk_skipped: dict[str, str] = {}
+            for order in allocation.orders:
+                if order.action == "buy" and buy_risk_block:
+                    risk_skipped[order.code] = buy_risk_block
+                    continue
+                context = contexts.get(normalized_security_code(order.code))
+                if context is None:
+                    market_skipped[order.code] = quote_rejected.get(
+                        order.code,
+                        "实时行情未通过执行校验",
+                    )
+                    continue
+                tradable, reason = order_is_tradable(order.action, context)
+                if not tradable:
+                    market_skipped[order.code] = reason
+                    continue
+                retry_key = hashlib.sha256(
+                    (
+                        f"{order.idempotency_key}|{execution_date}|"
+                        f"attempt={claimed.attempt_count}"
+                    ).encode("utf-8")
+                ).hexdigest()
+                checked_orders.append(
+                    replace(
+                        order,
+                        price=context.current_price,
+                        idempotency_key=retry_key,
+                        metadata={
+                            **order.metadata,
+                            "data_health_checked": True,
+                            "alignment_snapshot_hash": snapshot.data_hash,
+                            "execution_quote": context.to_dict(),
+                            "signal_attempt": claimed.attempt_count,
+                        },
+                    )
+                )
+            reports = tuple(self.broker.place_order(order) for order in checked_orders)
+            transient = {
+                **quote_rejected,
+                **alignment.rejected,
+                **market_skipped,
+                **{
+                    report.code: report.message or report.status
+                    for report in reports
+                    if report.status != "filled"
+                },
+            }
+            all_skipped = {**allocation.skipped, **risk_skipped, **transient}
+            allocation = replace(allocation, skipped=all_skipped)
+            if transient:
+                reason = "; ".join(
+                    f"{code}:{message}" for code, message in sorted(transient.items())
+                )
+                self.ledger.mark_signal_retryable(
+                    signal_id,
+                    reason,
+                    retry_after_seconds=ROBUST_V2_SIGNAL_RETRY_SECONDS,
+                    now=execution_time,
+                )
+                LOGGER.warning(
+                    "目标执行暂未完成，等待重试: signal=%s attempt=%d reasons=%s",
+                    signal_id,
+                    claimed.attempt_count,
+                    transient,
+                )
+                return ExecutionOutcome(
+                    signal_id,
+                    target,
+                    allocation,
+                    reports,
+                    "目标部分执行或行情受限，已安排重试",
+                )
+
+            self.ledger.mark_signal_completed(signal_id, "目标已完成或无需调仓")
+            if risk_skipped:
+                LOGGER.warning("目标买入被账户熔断阻止: %s", risk_skipped)
+            LOGGER.info(
+                "目标执行完成: signal=%s attempt=%d orders=%d filled=%d skipped=%s",
+                signal_id,
+                claimed.attempt_count,
+                len(reports),
+                sum(report.status == "filled" for report in reports),
+                allocation.skipped,
+            )
+            return ExecutionOutcome(
+                signal_id,
+                target,
+                allocation,
+                reports,
+                "目标执行完成",
+            )
+        except Exception as exc:
+            self.ledger.mark_signal_retryable(
+                signal_id,
+                str(exc),
+                retry_after_seconds=ROBUST_V2_SIGNAL_RETRY_SECONDS,
+                now=execution_time,
+            )
+            LOGGER.exception(
+                "目标执行异常，信号已保留重试: signal=%s attempt=%d",
+                signal_id,
+                claimed.attempt_count,
+            )
+            return ExecutionOutcome(
+                signal_id,
+                target,
+                allocation,
+                reports,
+                f"目标执行异常，已安排重试: {exc}",
+            )
 
     def monitor_catastrophic_stops(
-        self, trade_date: str
+        self,
+        trade_date: str,
+        *,
+        current_time: datetime | None = None,
     ) -> tuple[ExecutionReport, ...]:
         """盘中只执行灾难止损，不生成普通技术退出或追涨补仓。"""
         positions = self.broker.query_positions()
@@ -523,6 +1143,14 @@ class RobustV2Runner:
             datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=1)
         ).strftime("%Y%m%d")
         snapshot, history, quotes = self.data.load_execution_data(codes, previous)
+        contexts, quote_rejected = self._validated_execution_quotes(
+            codes,
+            quotes,
+            execution_date=trade_date,
+            current_time=current_time or now_local(),
+        )
+        if quote_rejected:
+            LOGGER.warning("灾难止损实时行情不可用: %s", quote_rejected)
         # 实际上一交易日可能跨周末，使用历史数据里的最近日期重新构建校验快照。
         dates = _latest_dates(history, previous)
         if not dates:
@@ -537,24 +1165,45 @@ class RobustV2Runner:
             data_hash=build_market_data_hash(history, signal_date),
             freshness_seconds=0,
         )
-        alignment = validate_realtime_alignment(health_snapshot, history, quotes)
-        prices = {
-            code: float(quote.get("price", 0) or 0)
+        healthy_quotes = {
+            code: quote
             for code, quote in quotes.items()
-            if code in alignment.valid_codes
+            if normalized_security_code(code) in contexts
+        }
+        alignment = validate_realtime_alignment(
+            health_snapshot,
+            history,
+            healthy_quotes,
+        )
+        prices = {
+            context.code: context.current_price
+            for raw, context in contexts.items()
+            if any(
+                normalized_security_code(code) == raw for code in alignment.valid_codes
+            )
         }
         orders = self.strategy.catastrophic_stop_orders(positions, prices, trade_date)
-        checked_orders = (
-            replace(
-                order,
-                metadata={
-                    **order.metadata,
-                    "data_health_checked": True,
-                    "alignment_snapshot_hash": health_snapshot.data_hash,
-                },
+        checked_orders = []
+        for order in orders:
+            context = contexts.get(normalized_security_code(order.code))
+            if context is None:
+                continue
+            tradable, reason = order_is_tradable(order.action, context)
+            if not tradable:
+                LOGGER.warning("灾难止损暂不可成交: %s", reason)
+                continue
+            checked_orders.append(
+                replace(
+                    order,
+                    price=context.current_price,
+                    metadata={
+                        **order.metadata,
+                        "data_health_checked": True,
+                        "alignment_snapshot_hash": health_snapshot.data_hash,
+                        "execution_quote": context.to_dict(),
+                    },
+                )
             )
-            for order in orders
-        )
         return tuple(self.broker.place_order(order) for order in checked_orders)
 
     def record_close_and_report(self, trade_date: str, data_version: str) -> Path:
@@ -580,7 +1229,23 @@ class RobustV2Runner:
         report = build_daily_ledger_report(
             self.ledger, trade_date, run_id=self.ledger.current_run_id
         )
-        return save_daily_ledger_report(report, Path(REPORT_DIR))
+        report_path = save_daily_ledger_report(report, Path(REPORT_DIR))
+        backup_dir = Path(ROBUST_V2_BACKUP_DIR)
+        backup_path = self.ledger.backup_to(backup_dir / f"paper_v2_{trade_date}.db")
+        retention_cutoff = now_local().timestamp() - (
+            ROBUST_V2_BACKUP_RETENTION_DAYS * 86_400
+        )
+        for old_path in backup_dir.glob("paper_v2_*.db"):
+            try:
+                if (
+                    old_path != backup_path
+                    and old_path.stat().st_mtime < retention_cutoff
+                ):
+                    old_path.unlink()
+            except OSError as exc:
+                LOGGER.warning("清理过期账本备份失败 %s: %s", old_path, exc)
+        LOGGER.info("账本每日备份: %s", backup_path)
+        return report_path
 
 
 def _configure_runtime(root_dir: Path) -> None:
@@ -590,28 +1255,44 @@ def _configure_runtime(root_dir: Path) -> None:
 
 
 def _is_trading_day(date: str, ignore_calendar: bool) -> bool:
-    """安全读取交易日历。"""
+    """读取交易日历；不可验证时向上抛错并停止交易。"""
     if ignore_calendar:
         return True
-    try:
-        return bool(calendar_is_trading_day(date))
-    except Exception as exc:
-        LOGGER.warning("交易日历不可用，回退到工作日判断: %s", exc)
-        return datetime.strptime(date, "%Y%m%d").weekday() < 5
+    return bool(calendar_is_trading_day(date))
+
+
+def _latest_completed_trade_date(reference: datetime | None = None) -> str:
+    """返回最近一个已完成收盘的交易日，避免盘中把当日当成完整日线。"""
+    current = reference or now_local()
+    cursor = current.date()
+    date_text = cursor.strftime("%Y%m%d")
+    if current.time() < dt_time(15, 5) or not _is_trading_day(
+        date_text, ignore_calendar=False
+    ):
+        cursor -= timedelta(days=1)
+    for _ in range(15):
+        date_text = cursor.strftime("%Y%m%d")
+        if _is_trading_day(date_text, ignore_calendar=False):
+            return date_text
+        cursor -= timedelta(days=1)
+    raise RuntimeError("无法确定最近一个已完成收盘的交易日")
 
 
 def _startup_log(
-    broker: SQLitePaperBrokerAdapter, config: RobustV2Config
+    broker: BrokerAdapter,
+    ledger: PaperLedger,
+    config: RobustV2Config,
 ) -> tuple[str, str]:
     """输出代码、配置、账本、权限、T+1 和容器标识。"""
     commit = _safe_git_commit(ROOT_DIR)
     digest = _config_hash(config)
     LOGGER.info(
-        "STARTUP commit=%s config_hash=%s ledger=%s account=%s T+1=%s "
+        "STARTUP commit=%s config_hash=%s broker=%s ledger=%s account=%s T+1=%s "
         "permissions=main:%s,chinext:%s,star:%s container=%s",
         commit,
         digest,
-        broker.ledger.path,
+        broker.broker_name,
+        ledger.path,
         config.account_id,
         ENFORCE_T1,
         ALLOW_MAIN_BOARD_STOCKS,
@@ -635,14 +1316,24 @@ def run_daemon(
     validate_startup(runner.config)
     holder_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     runner.ledger.acquire_lease(holder_id, ROBUST_V2_LEASE_TTL_SECONDS)
-    commit, digest = _startup_log(runner.broker, runner.config)
-    run = runner.ledger.start_run(
-        strategy_version=runner.config.strategy_version,
-        code_commit=commit,
-        config_hash=digest,
-        data_version="pending-close-snapshot",
-        container_id=socket.gethostname(),
+    heartbeat = LeaseHeartbeat(
+        runner.ledger,
+        holder_id,
+        ROBUST_V2_LEASE_TTL_SECONDS,
     )
+    try:
+        commit, digest = _startup_log(runner.broker, runner.ledger, runner.config)
+        run = runner.ledger.start_run(
+            strategy_version=runner.config.strategy_version,
+            code_commit=commit,
+            config_hash=digest,
+            data_version="pending-close-snapshot",
+            container_id=socket.gethostname(),
+        )
+        heartbeat.start()
+    except Exception:
+        runner.ledger.release_lease(holder_id)
+        raise
     stopping = False
     reported_dates: set[str] = set()
 
@@ -653,37 +1344,87 @@ def run_daemon(
     previous_sigterm = signal.signal(signal.SIGTERM, _stop)
     previous_sigint = signal.signal(signal.SIGINT, _stop)
     status = "completed"
+    last_idle_state = ""
     try:
         while not stopping:
+            heartbeat.raise_if_failed()
             now = now_local()
             trade_date = now.strftime("%Y%m%d")
             if not _is_trading_day(trade_date, ignore_calendar):
-                LOGGER.info("%s 非交易日，只续租不交易", trade_date)
-            elif dt_time(9, 35) <= now.time() < dt_time(15, 0):
-                runner.execute_pending_target(trade_date)
-                runner.monitor_catastrophic_stops(trade_date)
+                idle_state = f"non_trading:{trade_date}"
+                if idle_state != last_idle_state:
+                    LOGGER.info("%s 非交易日，只续租不交易", trade_date)
+                    last_idle_state = idle_state
+            elif is_strategy_execution_session(now):
+                last_idle_state = ""
+                runner.execute_pending_target(trade_date, current_time=now)
+                runner.monitor_catastrophic_stops(trade_date, current_time=now)
             elif now.time() >= dt_time(15, 5):
-                # 收盘处理每天只在首次进入收盘窗口时执行一次，
-                # 避免每分钟重复生成日报 / 重复打印“跳过目标生成”。
-                if trade_date not in reported_dates:
-                    target = runner.generate_close_target(trade_date)
-                    data_version = (
-                        target.source_snapshot_hash
-                        if target is not None
-                        else (
-                            runner.ledger.latest_signal_hash(runner.config.strategy_version)
-                            or "no-signal"
+                last_idle_state = "after_close"
+                if runner.ledger.claim_daily_job("close_cycle", trade_date):
+                    try:
+                        target = runner.generate_close_target(trade_date)
+                        data_version = (
+                            target.source_snapshot_hash
+                            if target is not None
+                            else (
+                                runner.ledger.latest_signal_hash(
+                                    runner.config.strategy_version
+                                )
+                                or "no-signal"
+                            )
                         )
-                    )
-                    path = runner.record_close_and_report(trade_date, data_version)
-                    LOGGER.info("收盘日报: %s", path)
-                    reported_dates.add(trade_date)
-                else:
-                    LOGGER.debug("%s 收盘处理今日已执行，跳过重复日报", trade_date)
+                        path = runner.record_close_and_report(
+                            trade_date,
+                            data_version,
+                        )
+                    except Exception as exc:
+                        runner.ledger.finish_daily_job(
+                            "close_cycle",
+                            trade_date,
+                            error=str(exc),
+                        )
+                        LOGGER.exception(
+                            "收盘任务失败，本日下一轮将重试: date=%s",
+                            trade_date,
+                        )
+                    else:
+                        runner.ledger.finish_daily_job("close_cycle", trade_date)
+                        LOGGER.info("收盘日报: %s", path)
+                if runner.ledger.claim_daily_job("daily_candidate_scan", trade_date):
+                    try:
+                        scan = runner.ensure_daily_candidate_scan(trade_date)
+                    except Exception as exc:
+                        runner.ledger.finish_daily_job(
+                            "daily_candidate_scan",
+                            trade_date,
+                            error=str(exc),
+                        )
+                        LOGGER.exception(
+                            "每日候选观察扫描失败，本日下一轮将重试: date=%s",
+                            trade_date,
+                        )
+                    else:
+                        runner.ledger.finish_daily_job(
+                            "daily_candidate_scan", trade_date
+                        )
+                        if scan is not None:
+                            LOGGER.info(
+                                "每日候选观察已更新: date=%s eligible=%d selected=%s",
+                                trade_date,
+                                scan.eligible_count,
+                                list(scan.selected_codes),
+                            )
             else:
-                LOGGER.info("当前不在 09:35-15:00 执行窗口或 15:05 后收盘窗口")
+                idle_state = classify_trading_session(now)
+                if idle_state != last_idle_state:
+                    LOGGER.info(
+                        "当前市场阶段=%s；只保持租约，不生成或执行订单",
+                        idle_state,
+                    )
+                    last_idle_state = idle_state
 
-            runner.ledger.heartbeat_lease(holder_id, ROBUST_V2_LEASE_TTL_SECONDS)
+            heartbeat.raise_if_failed()
             if once:
                 break
             time.sleep(poll_seconds)
@@ -695,9 +1436,14 @@ def run_daemon(
         try:
             runner.ledger.finish_run(run.run_id, status=status)
         finally:
-            runner.ledger.release_lease(holder_id)
-            signal.signal(signal.SIGTERM, previous_sigterm)
-            signal.signal(signal.SIGINT, previous_sigint)
+            try:
+                heartbeat.stop()
+            except RuntimeError:
+                LOGGER.exception("停止租约续租线程时发现故障")
+            finally:
+                runner.ledger.release_lease(holder_id)
+                signal.signal(signal.SIGTERM, previous_sigterm)
+                signal.signal(signal.SIGINT, previous_sigint)
     return 0
 
 
@@ -706,7 +1452,15 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="A 股 5 万元稳健虚拟盘 V2")
     parser.add_argument(
         "command",
-        choices=["daemon", "signal", "execute", "monitor", "report", "status"],
+        choices=[
+            "daemon",
+            "signal",
+            "execute",
+            "monitor",
+            "report",
+            "status",
+            "preview-scan",
+        ],
         nargs="?",
         default="daemon",
     )
@@ -744,7 +1498,11 @@ def main() -> int:
     broker.connect()
     loader = AKDataLoader()
     runner = RobustV2Runner(broker, loader, config, ROOT_DIR)
-    trade_date = args.date or today_yyyymmdd()
+    trade_date = args.date or (
+        _latest_completed_trade_date()
+        if args.command == "preview-scan"
+        else today_yyyymmdd()
+    )
     try:
         if args.command == "daemon":
             return run_daemon(
@@ -753,7 +1511,7 @@ def main() -> int:
                 ignore_calendar=args.ignore_calendar,
                 poll_seconds=args.poll_seconds,
             )
-        commit, digest = _startup_log(broker, config)
+        commit, digest = _startup_log(broker, runner.ledger, config)
         if args.command == "status":
             snapshot = broker.query_snapshot()
             LOGGER.info(
@@ -765,26 +1523,48 @@ def main() -> int:
                 runner.ledger.latest_signal_date(config.strategy_version),
             )
             return 0
+        if args.command == "preview-scan":
+            runner.preview_stock_scan(trade_date)
+            return 0
 
         holder_id = (
             f"manual:{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         )
         runner.ledger.acquire_lease(holder_id, ROBUST_V2_LEASE_TTL_SECONDS)
-        run = runner.ledger.start_run(
-            strategy_version=config.strategy_version,
-            code_commit=commit,
-            config_hash=digest,
-            data_version=f"manual-{args.command}",
-            container_id=socket.gethostname(),
-        )
+        try:
+            run = runner.ledger.start_run(
+                strategy_version=config.strategy_version,
+                code_commit=commit,
+                config_hash=digest,
+                data_version=f"manual-{args.command}",
+                container_id=socket.gethostname(),
+            )
+            heartbeat = LeaseHeartbeat(
+                runner.ledger,
+                holder_id,
+                ROBUST_V2_LEASE_TTL_SECONDS,
+            )
+            heartbeat.start()
+        except Exception:
+            runner.ledger.release_lease(holder_id)
+            raise
         command_status = "completed"
         try:
+            heartbeat.raise_if_failed()
+            command_now = now_local()
+            if args.command in {
+                "execute",
+                "monitor",
+            } and not is_strategy_execution_session(command_now):
+                raise RuntimeError(
+                    "手工执行只允许在 09:35-11:30 或 13:00-15:00 连续竞价时段"
+                )
             if args.command == "signal":
                 runner.generate_close_target(trade_date, force=args.force)
             elif args.command == "execute":
-                runner.execute_pending_target(trade_date)
+                runner.execute_pending_target(trade_date, current_time=command_now)
             elif args.command == "monitor":
-                runner.monitor_catastrophic_stops(trade_date)
+                runner.monitor_catastrophic_stops(trade_date, current_time=command_now)
             elif args.command == "report":
                 latest = (
                     runner.ledger.latest_signal_hash(config.strategy_version)
@@ -796,8 +1576,16 @@ def main() -> int:
             command_status = "failed"
             raise
         finally:
-            runner.ledger.finish_run(run.run_id, status=command_status)
-            runner.ledger.release_lease(holder_id)
+            try:
+                runner.ledger.finish_run(run.run_id, status=command_status)
+            finally:
+                try:
+                    try:
+                        heartbeat.stop()
+                    except RuntimeError:
+                        LOGGER.exception("停止手工任务租约续租线程时发现故障")
+                finally:
+                    runner.ledger.release_lease(holder_id)
         return 0
     finally:
         loader.close()

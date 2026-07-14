@@ -3,30 +3,46 @@
 双线程实时监控 + 日志 + 全记录
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import argparse
+import hashlib
+import hmac
 import json
+import secrets
 import time
 import logging
 import threading
 import mimetypes
 import sqlite3
-from datetime import datetime
+import subprocess
 from dataclasses import asdict
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (
-    INITIAL_CAPITAL, STATE_FILE, TRADE_LOG_FILE, REPORT_DIR, LOG_DIR, DATA_DIR,
-    SNAPSHOT_LOG_FILE, TRADE_EVENTS_FILE, RPS_STATE_FILE, normalize_a_share_code,
-    ROBUST_V2_ACCOUNT_ID, ROBUST_V2_LEDGER_PATH,
+    INITIAL_CAPITAL,
+    STATE_FILE,
+    TRADE_LOG_FILE,
+    REPORT_DIR,
+    LOG_DIR,
+    DATA_DIR,
+    SNAPSHOT_LOG_FILE,
+    TRADE_EVENTS_FILE,
+    RPS_STATE_FILE,
+    normalize_a_share_code,
+    ROBUST_V2_ACCOUNT_ID,
+    ROBUST_V2_LEDGER_PATH,
 )
 from config.time_utils import format_local
 from data.ak_loader import AKDataLoader
+from data.scan_store import StockScanStore
 from scripts.backtest_cache import ensure_backtest_cache
 from scripts.paper_status import build_status
 
@@ -38,6 +54,44 @@ DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
 LIVE_LOG = os.path.join(LOG_DIR, "robust_v2.log")
 LIVE_TODAY_LOG = LIVE_LOG
 ROOT_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SCAN_DIR = ROOT_DIR / "data" / "scans"
+_PREVIEW_SCAN_LOCK = threading.Lock()
+_PREVIEW_SCAN_PROCESS: subprocess.Popen[bytes] | None = None
+
+
+def _scan_store() -> StockScanStore:
+    """返回共享运行目录中的扫描快照存储。"""
+    return StockScanStore(SCAN_DIR)
+
+
+def _load_latest_scan() -> dict[str, Any]:
+    """读取最新结构化扫描，损坏时返回可展示的失败状态。"""
+    try:
+        payload = _scan_store().load_latest()
+    except RuntimeError as exc:
+        logger.error("读取个股扫描快照失败: %s", exc)
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "candidates": [],
+            "generated_at": "",
+        }
+    if payload is None:
+        return {
+            "status": "never_run",
+            "error": "",
+            "candidates": [],
+            "generated_at": "",
+        }
+    return payload
+
+
+def _preview_scan_running() -> bool:
+    """返回由当前 Web 实例启动的安全预览进程是否仍在运行。"""
+    with _PREVIEW_SCAN_LOCK:
+        return (
+            _PREVIEW_SCAN_PROCESS is not None and _PREVIEW_SCAN_PROCESS.poll() is None
+        )
 
 
 def _v2_connection():
@@ -46,7 +100,9 @@ def _v2_connection():
     if not path.exists():
         return None
     try:
-        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=2)
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", uri=True, timeout=2
+        )
         connection.row_factory = sqlite3.Row
         return connection
     except sqlite3.Error as exc:
@@ -181,7 +237,9 @@ def _load_v2_orders():
                 "reason": str(row["reason"]),
                 "sell_reason": str(row["reason"]) if row["action"] == "sell" else "",
                 "status": str(row["status"]),
-                "reject_reason": str(row["message"]) if row["status"] == "rejected" else "",
+                "reject_reason": str(row["message"])
+                if row["status"] == "rejected"
+                else "",
             }
             for row in rows
         ]
@@ -205,19 +263,72 @@ def _load_v2_equity():
             """,
             (ROBUST_V2_ACCOUNT_ID,),
         ).fetchall()
+        # 兼容升级前可能遗留的同日多条快照，只采用当天最后一次收盘记录。
+        latest_by_date = {str(row["snapshot_date"]): row for row in rows}
         points = []
         peak = INITIAL_CAPITAL
-        for row in rows:
+        for snapshot_date in sorted(latest_by_date):
+            row = latest_by_date[snapshot_date]
             value = float(row["total_value"])
             peak = max(peak, value)
-            points.append({
-                "t": str(row["captured_at"] or row["snapshot_date"]),
-                "value": value,
-                "drawdown": round((peak - value) / peak, 6) if peak > 0 else 0.0,
-            })
+            points.append(
+                {
+                    "t": str(row["captured_at"] or row["snapshot_date"]),
+                    "value": value,
+                    "drawdown": round((peak - value) / peak, 6) if peak > 0 else 0.0,
+                }
+            )
         return points
     except sqlite3.Error as exc:
         logger.warning("读取 paper_v2 净值失败: %s", exc)
+        return None
+    finally:
+        connection.close()
+
+
+def _load_v2_profit_ranking() -> list[dict[str, Any]] | None:
+    """按 FIFO 成交成本统计已实现收益，部分卖出不会扣除全部历史买入。"""
+    connection = _v2_connection()
+    if connection is None:
+        return None
+    try:
+        rows = connection.execute(
+            """
+            SELECT code,
+                   MAX(name) AS name,
+                   SUM(CASE WHEN action = 'buy' THEN amount ELSE 0 END) AS buy_amount,
+                   SUM(CASE WHEN action = 'sell' THEN amount ELSE 0 END) AS sell_amount,
+                   SUM(CASE WHEN action = 'sell' THEN shares ELSE 0 END) AS shares_sold,
+                   SUM(CASE WHEN action = 'sell' THEN COALESCE(net_pnl, 0) ELSE 0 END) AS net_pnl,
+                   SUM(CASE WHEN action = 'sell'
+                            THEN amount - COALESCE(gross_pnl, 0)
+                            ELSE 0 END) AS realized_cost_basis
+            FROM trades
+            WHERE account_id = ?
+            GROUP BY code
+            HAVING SUM(CASE WHEN action = 'sell' THEN shares ELSE 0 END) > 0
+            """,
+            (ROBUST_V2_ACCOUNT_ID,),
+        ).fetchall()
+        ranking: list[dict[str, Any]] = []
+        for row in rows:
+            net_profit = float(row["net_pnl"] or 0)
+            cost_basis = float(row["realized_cost_basis"] or 0)
+            ranking.append(
+                {
+                    "code": str(row["code"]),
+                    "name": str(row["name"] or row["code"]),
+                    "net_profit": round(net_profit, 2),
+                    "roi": round(net_profit / cost_basis, 4) if cost_basis > 0 else 0.0,
+                    "buy_amount": round(float(row["buy_amount"] or 0), 2),
+                    "sell_amount": round(float(row["sell_amount"] or 0), 2),
+                    "shares_traded": int(row["shares_sold"] or 0),
+                }
+            )
+        ranking.sort(key=lambda item: float(item["roi"]), reverse=True)
+        return ranking
+    except sqlite3.Error as exc:
+        logger.warning("读取 paper_v2 已实现收益榜失败: %s", exc)
         return None
     finally:
         connection.close()
@@ -376,40 +487,60 @@ def load_reports():
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
-                    reports.append({"date": fname.replace(".txt", "").replace("daily_", ""), "content": content})
+                    reports.append(
+                        {
+                            "date": fname.replace(".txt", "").replace("daily_", ""),
+                            "content": content,
+                        }
+                    )
                 except Exception:
                     pass
     return reports
 
 
-def is_process_running(name):
-    """检查进程是否在运行（优先检查心跳文件，fallback 到日志时间）"""
-    import time, json
-    # 1. 检查心跳文件（live_runner 每 30 秒写一次）
-    heartbeat_file = os.path.join(os.path.dirname(LIVE_TODAY_LOG), "..", "data", "live_heartbeat.json")
+def _load_v2_lease() -> dict[str, Any]:
+    """读取 robust_v2 守护实例租约，作为跨容器真实心跳。"""
+    connection = _v2_connection()
+    if connection is None:
+        return {}
     try:
-        if os.path.exists(heartbeat_file):
-            with open(heartbeat_file, "r") as f:
-                hb = json.load(f)
-            ts = hb.get("ts", 0)
-            if time.time() - ts < 90:
-                return True
-    except Exception:
-        pass
-    # 2. 检查日志文件修改时间
+        row = connection.execute(
+            """
+            SELECT holder_id, heartbeat_at, expires_at
+            FROM leases WHERE account_id = ?
+            """,
+            (ROBUST_V2_ACCOUNT_ID,),
+        ).fetchone()
+        if row is None:
+            return {}
+        return {
+            "holder_id": str(row["holder_id"]),
+            "heartbeat_at": str(row["heartbeat_at"]),
+            "expires_at": float(row["expires_at"]),
+            "active": float(row["expires_at"]) > time.time(),
+        }
+    except sqlite3.Error as exc:
+        logger.warning("读取 robust_v2 租约失败: %s", exc)
+        return {}
+    finally:
+        connection.close()
+
+
+def is_process_running(name: str) -> bool:
+    """检查进程状态；robust_v2 优先使用跨容器 SQLite 租约。"""
+    if name == "robust_runner.py":
+        lease = _load_v2_lease()
+        if lease:
+            return bool(lease.get("active"))
     try:
-        if os.path.exists(LIVE_TODAY_LOG):
-            mtime = os.path.getmtime(LIVE_TODAY_LOG)
-            if time.time() - mtime < 600:
-                return True
-    except Exception:
-        pass
-    # 3. fallback: pgrep
-    import subprocess
-    try:
-        result = subprocess.run(["pgrep", "-f", name], capture_output=True, text=True)
+        result = subprocess.run(
+            ["pgrep", "-f", name],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
         return result.returncode == 0
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -443,12 +574,51 @@ def is_robust_alive_via_ledger() -> bool:
 
 # ==================== 登录验证 ====================
 
-import hashlib
-import secrets
-import base64
-
 # 密码 hash 存储路径（不上传 git）
 _PASSWORD_FILE = os.path.join(DATA_DIR, ".password_hash")
+_PBKDF2_ITERATIONS = 600_000
+_MAX_REQUEST_BODY_BYTES = 64 * 1024
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_FAILURES = 5
+
+
+def _hash_password(password: str, *, salt: bytes | None = None) -> str:
+    """使用带随机盐的 PBKDF2 保存密码，避免离线彩虹表攻击。"""
+    if not password:
+        raise ValueError("密码不能为空")
+    selected_salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        selected_salt,
+        _PBKDF2_ITERATIONS,
+    )
+    return f"pbkdf2_sha256${_PBKDF2_ITERATIONS}${selected_salt.hex()}${digest.hex()}"
+
+
+def _verify_password(password: str, stored_hash: str) -> tuple[bool, bool]:
+    """校验密码，并标记旧 SHA-256 格式是否需要在登录后迁移。"""
+    parts = stored_hash.split("$")
+    if len(parts) == 4 and parts[0] == "pbkdf2_sha256":
+        try:
+            iterations = int(parts[1])
+            salt = bytes.fromhex(parts[2])
+            expected = bytes.fromhex(parts[3])
+        except (ValueError, TypeError):
+            return False, False
+        if iterations < 100_000 or not salt or not expected:
+            return False, False
+        actual_digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iterations
+        )
+        return hmac.compare_digest(actual_digest, expected), False
+
+    # 仅为现有部署提供一次平滑迁移；新密码不会再写入无盐 SHA-256。
+    if len(stored_hash) == 64:
+        legacy_digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        accepted = hmac.compare_digest(legacy_digest, stored_hash)
+        return accepted, accepted
+    return False, False
 
 
 def _load_password_hash() -> str:
@@ -460,13 +630,12 @@ def _load_password_hash() -> str:
         with open(_PASSWORD_FILE) as f:
             return f.read().strip()
     # 首次运行：生成随机密码并保存
-    import secrets as _secrets
-    import hashlib as _hashlib
-    pwd = _secrets.token_hex(8)
-    h = _hashlib.sha256(pwd.encode()).hexdigest()
+    pwd = secrets.token_hex(8)
+    h = _hash_password(pwd)
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(_PASSWORD_FILE, "w") as f:
+    with open(_PASSWORD_FILE, "w", encoding="utf-8") as f:
         f.write(h)
+    os.chmod(_PASSWORD_FILE, 0o600)
     logger.warning("首次运行，已生成随机密码: %s（请尽快修改）", pwd)
     return h
 
@@ -474,44 +643,97 @@ def _load_password_hash() -> str:
 def _save_password_hash(hash_val: str) -> None:
     """持久化密码 hash 到本地文件。"""
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(_PASSWORD_FILE, "w") as f:
+    temporary = f"{_PASSWORD_FILE}.tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
         f.write(hash_val)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, _PASSWORD_FILE)
 
 
 _DASHBOARD_PASSWORD_HASH = _load_password_hash()
 # 会话 token → 过期时间
 _sessions: dict[str, float] = {}
 _SESSION_TTL = 86400  # 24 小时
+_AUTH_LOCK = threading.RLock()
+_login_failures: dict[str, list[float]] = {}
 
 
-def _check_auth(handler) -> bool:
-    """检查请求是否已认证。返回 True 表示已登录。"""
+def _cookie_token(handler: Any) -> str:
+    """从 Cookie 中提取当前会话令牌。"""
     cookie = handler.headers.get("Cookie", "")
     for part in cookie.split(";"):
         part = part.strip()
         if part.startswith("quant_token="):
-            token = part[len("quant_token="):]
+            return part[len("quant_token=") :]
+    return ""
+
+
+def _client_identity(handler: Any) -> str:
+    """返回限速使用的客户端标识，不信任可伪造的转发头。"""
+    address = getattr(handler, "client_address", ("unknown", 0))
+    return str(address[0]) if address else "unknown"
+
+
+def _login_rate_limited(identity: str, *, now: float | None = None) -> bool:
+    """判断同一来源在时间窗内是否超过密码失败上限。"""
+    current = time.time() if now is None else now
+    with _AUTH_LOCK:
+        recent = [
+            value
+            for value in _login_failures.get(identity, [])
+            if current - value < _LOGIN_WINDOW_SECONDS
+        ]
+        _login_failures[identity] = recent
+        return len(recent) >= _LOGIN_MAX_FAILURES
+
+
+def _record_login_failure(identity: str) -> None:
+    """记录一次登录失败。"""
+    with _AUTH_LOCK:
+        _login_failures.setdefault(identity, []).append(time.time())
+
+
+def _clear_login_failures(identity: str) -> None:
+    """登录成功后清理当前来源的失败计数。"""
+    with _AUTH_LOCK:
+        _login_failures.pop(identity, None)
+
+
+def _check_auth(handler) -> bool:
+    """检查请求是否已认证。返回 True 表示已登录。"""
+    token = _cookie_token(handler)
+    if token:
+        with _AUTH_LOCK:
             if token in _sessions:
                 if time.time() - _sessions[token] < _SESSION_TTL:
                     _sessions[token] = time.time()  # 续期
                     return True
-                else:
-                    del _sessions[token]
+                del _sessions[token]
     return False
 
 
 def _set_auth_cookie(handler):
     """设置认证 cookie。"""
     token = secrets.token_hex(32)
-    _sessions[token] = time.time()
+    with _AUTH_LOCK:
+        _sessions[token] = time.time()
+    secure = os.getenv("DASHBOARD_COOKIE_SECURE", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    secure_attribute = "; Secure" if secure else ""
     handler.send_header(
         "Set-Cookie",
-        f"quant_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={_SESSION_TTL}",
+        f"quant_token={token}; Path=/; HttpOnly; SameSite=Lax; "
+        f"Max-Age={_SESSION_TTL}{secure_attribute}",
     )
 
 
 class QuantHandler(SimpleHTTPRequestHandler):
-
     def _require_auth(self) -> bool:
         """页面鉴权：未登录时重定向到登录页。"""
         if _check_auth(self):
@@ -548,11 +770,14 @@ class QuantHandler(SimpleHTTPRequestHandler):
         # 的是 /quantify/assets/...,本地直接访问时后端路由(/assets/、/api/)无该前缀,
         # 这里统一剥离,使本地直连和反向代理部署都能命中路由。
         if path.startswith("/quantify/"):
-            path = path[len("/quantify"):]
+            path = path[len("/quantify") :]
 
         # 登录页不需要认证（优先 React SPA）
         if path == "/login":
             return self._serve_spa("login.html")
+
+        if path == "/healthz":
+            return self._json_response({"ok": True, "service": "quant-dashboard"})
 
         # React/Vite 构建产物，登录页也需要加载 JS/CSS，因此静态资源不做鉴权。
         if path.startswith("/assets/"):
@@ -562,7 +787,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
         api_routes = {
             "/api/portfolio": lambda: self._json_response(self._api_portfolio()),
             "/api/trades": lambda: self._json_response(self._api_trades()),
-            "/api/profit-ranking": lambda: self._json_response(self._api_profit_ranking()),
+            "/api/profit-ranking": lambda: self._json_response(
+                self._api_profit_ranking()
+            ),
             "/api/scan": lambda: self._json_response(self._api_scan()),
             "/api/reports": lambda: self._json_response(self._api_reports()),
             "/api/logs": lambda: self._json_response(self._api_logs(params)),
@@ -593,7 +820,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/quantify/"):
-            path = path[len("/quantify"):]
+            path = path[len("/quantify") :]
 
         if path.startswith("/assets/"):
             return self._serve_static_asset(path, write_body=False)
@@ -622,17 +849,41 @@ class QuantHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/quantify/"):
-            path = path[len("/quantify"):]
-        content_len = int(self.headers.get("Content-Length", 0))
+            path = path[len("/quantify") :]
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._json_response({"error": "Content-Length 非法"}, status=400)
+            return
+        if content_len < 0 or content_len > _MAX_REQUEST_BODY_BYTES:
+            self._json_response({"error": "请求体过大"}, status=413)
+            return
         body = self.rfile.read(content_len) if content_len > 0 else b"{}"
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            data = {}
+            self._json_response({"error": "请求体不是有效 JSON"}, status=400)
+            return
+        if not isinstance(data, dict):
+            self._json_response({"error": "请求体必须是 JSON 对象"}, status=400)
+            return
 
         if path == "/api/login":
-            pwd = data.get("password", "")
-            if hashlib.sha256(pwd.encode()).hexdigest() == _DASHBOARD_PASSWORD_HASH:
+            identity = _client_identity(self)
+            if _login_rate_limited(identity):
+                self._json_response(
+                    {"success": False, "error": "尝试次数过多，请稍后再试"},
+                    status=429,
+                )
+                return
+            pwd = str(data.get("password", ""))
+            accepted, needs_upgrade = _verify_password(pwd, _DASHBOARD_PASSWORD_HASH)
+            if accepted:
+                if needs_upgrade:
+                    _DASHBOARD_PASSWORD_HASH = _hash_password(pwd)
+                    _save_password_hash(_DASHBOARD_PASSWORD_HASH)
+                    logger.info("仪表盘密码散列已迁移到 PBKDF2")
+                _clear_login_failures(identity)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -640,10 +891,15 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True}).encode())
             else:
+                _record_login_failure(identity)
                 self._json_response({"success": False, "error": "密码错误"}, status=401)
             return
 
         if path == "/api/logout":
+            token = _cookie_token(self)
+            if token:
+                with _AUTH_LOCK:
+                    _sessions.pop(token, None)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -658,22 +914,40 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if path == "/api/scan/trigger":
             if not self._require_api_auth():
                 return
-            self._json_response(self._api_scan_trigger())
+            payload, status = self._api_scan_trigger()
+            self._json_response(payload, status=status)
             return
 
         if path == "/api/change-password":
-            # 不要求认证：未登录状态下也可用旧密码修改新密码
-            old_pwd = data.get("old_password", "")
-            new_pwd = data.get("new_password", "")
-            if not new_pwd or len(new_pwd) < 6:
-                self._json_response({"success": False, "error": "新密码至少6位"}, status=400)
+            identity = _client_identity(self)
+            if _login_rate_limited(identity):
+                self._json_response(
+                    {"success": False, "error": "尝试次数过多，请稍后再试"},
+                    status=429,
+                )
                 return
-            if hashlib.sha256(old_pwd.encode()).hexdigest() != _DASHBOARD_PASSWORD_HASH:
-                self._json_response({"success": False, "error": "旧密码错误"}, status=401)
+            old_pwd = str(data.get("old_password", ""))
+            new_pwd = str(data.get("new_password", ""))
+            if len(new_pwd) < 12:
+                self._json_response(
+                    {"success": False, "error": "新密码至少12位"}, status=400
+                )
                 return
-            new_hash = hashlib.sha256(new_pwd.encode()).hexdigest()
+            accepted, _needs_upgrade = _verify_password(
+                old_pwd, _DASHBOARD_PASSWORD_HASH
+            )
+            if not accepted:
+                _record_login_failure(identity)
+                self._json_response(
+                    {"success": False, "error": "旧密码错误"}, status=401
+                )
+                return
+            new_hash = _hash_password(new_pwd)
             _DASHBOARD_PASSWORD_HASH = new_hash
             _save_password_hash(new_hash)
+            _clear_login_failures(identity)
+            with _AUTH_LOCK:
+                _sessions.clear()
             self._json_response({"success": True})
             return
 
@@ -686,21 +960,26 @@ class QuantHandler(SimpleHTTPRequestHandler):
         cash = state.get("cash", INITIAL_CAPITAL)
         positions = state.get("positions", {})
         codes = list(positions.keys())
-        prices = get_realtime_prices(codes) if codes else {}
-
-        # 从腾讯行情获取股票名称
-        name_map = {}
+        quotes: dict[str, dict[str, Any]] = {}
         try:
-            loader = AKDataLoader()
-            raw_codes = [normalize_code(c) for c in codes]
-            quotes = loader.get_realtime_quotes(raw_codes)
-            name_map = {k: v.get("name", "") for k, v in quotes.items()}
-        except Exception:
-            pass
+            if codes:
+                loader = AKDataLoader()
+                raw_codes = [normalize_code(c) for c in codes]
+                quotes = loader.get_realtime_quotes(raw_codes)
+        except Exception as exc:
+            logger.warning("持仓实时行情加载失败，回退账本最后价格: %s", exc)
+
+        prices = {
+            code: float(quotes.get(normalize_code(code), {}).get("price", 0) or 0)
+            for code in codes
+        }
+        name_map = {
+            code: str(quotes.get(normalize_code(code), {}).get("name", ""))
+            for code in codes
+        }
 
         def get_name(code):
-            raw = normalize_code(code)
-            return name_map.get(raw, code)
+            return name_map.get(code) or positions.get(code, {}).get("name") or code
 
         positions_value = 0
         position_list = []
@@ -711,16 +990,18 @@ class QuantHandler(SimpleHTTPRequestHandler):
             value = shares * current
             positions_value += value
             pnl = (current - avg_cost) / avg_cost if avg_cost > 0 else 0
-            position_list.append({
-                "code": code,
-                "name": get_name(code),
-                "shares": shares,
-                "avg_cost": round(avg_cost, 3),
-                "current_price": round(current, 3),
-                "value": round(value, 2),
-                "profit": round((current - avg_cost) * shares, 2),
-                "profit_pct": round(pnl, 4),
-            })
+            position_list.append(
+                {
+                    "code": code,
+                    "name": get_name(code),
+                    "shares": shares,
+                    "avg_cost": round(avg_cost, 3),
+                    "current_price": round(current, 3),
+                    "value": round(value, 2),
+                    "profit": round((current - avg_cost) * shares, 2),
+                    "profit_pct": round(pnl, 4),
+                }
+            )
 
         total_value = cash + positions_value
         pnl = total_value - INITIAL_CAPITAL
@@ -729,7 +1010,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "total_value": round(total_value, 2),
             "cash": round(cash, 2),
             "positions_value": round(positions_value, 2),
-            "position_ratio": round(positions_value / total_value, 4) if total_value > 0 else 0,
+            "position_ratio": round(positions_value / total_value, 4)
+            if total_value > 0
+            else 0,
             "position_count": len(positions),
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl / INITIAL_CAPITAL, 4),
@@ -746,7 +1029,6 @@ class QuantHandler(SimpleHTTPRequestHandler):
             if len(query_date) == 8:
                 query_date = query_date[:8]
         # 合并 trade_events.jsonl 中被风控拒绝的订单
-        today = datetime.now().strftime("%Y%m%d")
         events_file = os.path.join(DATA_DIR, "trade_events.jsonl")
         if _load_v2_state() is None and os.path.exists(events_file):
             try:
@@ -772,19 +1054,23 @@ class QuantHandler(SimpleHTTPRequestHandler):
                         )
                         if dup:
                             continue
-                        trades.append({
-                            "date": date_part,
-                            "time": time_part,
-                            "code": order.get("code", ""),
-                            "name": order.get("name", ""),
-                            "action": order.get("action", ""),
-                            "shares": order.get("shares", 0),
-                            "actual_price": order.get("price", 0),
-                            "strategy": order.get("strategy", ""),
-                            "reason": order.get("reason", ""),
-                            "status": "rejected",
-                            "reject_reason": evt.get("payload", {}).get("reason", ""),
-                        })
+                        trades.append(
+                            {
+                                "date": date_part,
+                                "time": time_part,
+                                "code": order.get("code", ""),
+                                "name": order.get("name", ""),
+                                "action": order.get("action", ""),
+                                "shares": order.get("shares", 0),
+                                "actual_price": order.get("price", 0),
+                                "strategy": order.get("strategy", ""),
+                                "reason": order.get("reason", ""),
+                                "status": "rejected",
+                                "reject_reason": evt.get("payload", {}).get(
+                                    "reason", ""
+                                ),
+                            }
+                        )
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("读取风控拒绝事件失败: %s", exc)
         # 获取股票名称映射
@@ -805,7 +1091,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 raw = normalize_code(code)
                 t["name"] = name_map.get(raw, "")
         # 提取所有日期列表
-        all_dates = sorted(set(t.get("date", "") for t in trades if t.get("date")), reverse=True)
+        all_dates = sorted(
+            set(t.get("date", "") for t in trades if t.get("date")), reverse=True
+        )
         # 按 (date, time) 升序排序，确保前端 reverse() 后最新在前
         trades.sort(key=lambda t: (str(t.get("date", "")), str(t.get("time", ""))))
         # 按日期过滤
@@ -815,12 +1103,23 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
     def _api_profit_ranking(self):
         """历史战绩榜：按已平仓股票累计收益率排名。"""
+        v2_ranking = _load_v2_profit_ranking()
+        if v2_ranking is not None:
+            return {"ranking": v2_ranking}
         trades = load_trade_log()
         from collections import defaultdict
-        stock = defaultdict(lambda: {
-            "name": "", "buy_amount": 0, "sell_amount": 0,
-            "buy_fee": 0, "sell_fee": 0, "shares_bought": 0, "shares_sold": 0,
-        })
+
+        stock = defaultdict(
+            lambda: {
+                "name": "",
+                "buy_amount": 0,
+                "sell_amount": 0,
+                "buy_fee": 0,
+                "sell_fee": 0,
+                "shares_bought": 0,
+                "shares_sold": 0,
+            }
+        )
         for t in trades:
             code = t["code"]
             stock[code]["name"] = t.get("name", code)
@@ -841,107 +1140,71 @@ class QuantHandler(SimpleHTTPRequestHandler):
             total_revenue = s["sell_amount"] - s["sell_fee"]
             net = total_revenue - total_cost
             roi = net / total_cost if total_cost > 0 else 0
-            ranking.append({
-                "code": code,
-                "name": s["name"],
-                "net_profit": round(net, 2),
-                "roi": round(roi, 4),
-                "buy_amount": round(s["buy_amount"], 2),
-                "sell_amount": round(s["sell_amount"], 2),
-                "shares_traded": s["shares_sold"],
-            })
+            ranking.append(
+                {
+                    "code": code,
+                    "name": s["name"],
+                    "net_profit": round(net, 2),
+                    "roi": round(roi, 4),
+                    "buy_amount": round(s["buy_amount"], 2),
+                    "sell_amount": round(s["sell_amount"], 2),
+                    "shares_traded": s["shares_sold"],
+                }
+            )
 
         ranking.sort(key=lambda x: x["roi"], reverse=True)
         return {"ranking": ranking}
 
-    def _api_scan(self):
-        """从 live_today.log 中提取扫描结果"""
-        result = {"stocks": [], "updated_at": ""}
-        if not os.path.exists(LIVE_TODAY_LOG):
-            return result
+    def _api_scan(self) -> dict[str, Any]:
+        """返回 robust_v2 最新结构化个股扫描。"""
+        snapshot = _load_latest_scan()
+        return {
+            **snapshot,
+            "stocks": snapshot.get("candidates", []),
+            "updated_at": snapshot.get("generated_at", ""),
+            "scan_running": _preview_scan_running(),
+        }
 
-        try:
-            with open(LIVE_TODAY_LOG, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-
-            stocks = []
-            scan_time = ""
-            for line in lines:
-                if "扫描完成，候选股" in line:
-                    # 新一轮扫描，重置候选列表
-                    stocks = []
-                    parts = line.split(" [INFO] ")
-                    if parts:
-                        scan_time = parts[0].strip()
-                if "#" in line and "动量=" in line and "得分=" in line:
-                    try:
-                        import re
-                        m = re.search(r'#(\d+)\s+(.+?)\((\d+)\)\s+动量=([+\-][\d.]+)%\s+得分=([\d.]+)', line)
-                        if m:
-                            stocks.append({
-                                "rank": int(m.group(1)),
-                                "name": m.group(2).strip(),
-                                "code": m.group(3),
-                                "momentum": float(m.group(4)) / 100,
-                                "score": float(m.group(5)),
-                            })
-                    except Exception:
-                        pass
-
-            result["stocks"] = stocks
-            result["updated_at"] = scan_time
-        except Exception:
-            pass
-        return result
-
-    def _api_candidates(self):
-        """候选标的实时价格。
-
-        robust_v2 不再产出旧版 live_runner 的“扫描完成，候选股”日志格式，
-        而是将目标组合写入 paper_v2.db 的 signals 表。因此直接读最新信号
-        的 target_json positions 作为候选雷达数据。旧日志解析作为 fallback。
-        """
-        signal = _load_latest_v2_signal()
-        if signal is not None:
-            positions = signal.get("positions", [])
-            codes = [str(p.get("code")) for p in positions if p.get("code")]
-            prices = get_realtime_prices(codes) if codes else {}
-            candidates = []
-            for idx, p in enumerate(positions, start=1):
-                code = str(p.get("code", ""))
-                price = prices.get(code, 0)
-                candidates.append({
-                    "rank": idx,
-                    "name": p.get("name", code),
-                    "code": code,
-                    "asset_type": p.get("asset_type", ""),
-                    "momentum": _parse_momentum_from_reason(p.get("reason", "")) or 0,
-                    "score": round(float(p.get("target_weight", 0)) * 100, 1),
-                    "reason": p.get("reason", ""),
-                    "current_price": round(price, 2) if price else 0,
-                })
-            return {
-                "candidates": candidates,
-                "updated_at": signal.get("executed_at") or signal.get("created_at", ""),
-                "fallback_reason": signal.get("fallback_reason", ""),
-            }
-
-        # fallback：旧版 live_runner 日志解析
+    def _api_candidates(self) -> dict[str, Any]:
+        """返回最新候选、过滤统计和实时价格。"""
         scan = self._api_scan()
-        stocks = scan.get("stocks", [])
-        if not stocks:
-            return {"candidates": [], "updated_at": ""}
+        stocks = scan.get("stocks", [])[:20]
+
         codes = [s["code"] for s in stocks]
-        prices = get_realtime_prices(codes)
+        prices = get_realtime_prices(codes) if codes else {}
+
         candidates = []
         for s in stocks:
             code = s["code"]
             price = prices.get(code, 0)
-            candidates.append({
-                **s,
-                "current_price": round(price, 2) if price else 0,
-            })
-        return {"candidates": candidates, "updated_at": scan.get("updated_at", "")}
+            candidates.append(
+                {
+                    **s,
+                    "current_price": round(price, 2)
+                    if price
+                    else s.get("current_price", s.get("price", 0)),
+                }
+            )
+
+        return {
+            "candidates": candidates,
+            "updated_at": scan.get("updated_at", ""),
+            "trade_date": scan.get("trade_date", ""),
+            "status": scan.get("status", "never_run"),
+            "mode": scan.get("mode", ""),
+            "scan_running": scan.get("scan_running", False),
+            "input_count": scan.get("input_count", 0),
+            "eligible_count": scan.get("eligible_count", 0),
+            "universe": scan.get("universe", {}),
+            "prefilter_counts": scan.get("prefilter_counts", {}),
+            "prefilter_labels": scan.get("prefilter_labels", {}),
+            "filter_counts": scan.get("filter_counts", {}),
+            "filter_labels": scan.get("filter_labels", {}),
+            "selected_codes": scan.get("selected_codes", []),
+            "next_scheduled_scan_at": scan.get("next_scheduled_scan_at", ""),
+            "error": scan.get("error", ""),
+            "schedule": "每个交易日 15:05 更新候选；周度调仓日才生成正式信号",
+        }
 
     def _api_logs(self, params):
         """读取日志文件（支持 tail）"""
@@ -972,10 +1235,12 @@ class QuantHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             return {"logs": [f"读取失败: {e}"], "file": log_file}
 
-    def _api_status(self):
+    def _api_status(self) -> dict[str, Any]:
         """系统状态"""
         live_running = is_robust_alive_via_ledger() or is_process_running("robust_runner.py")
         web_running = True  # 自己在跑
+        scan = _load_latest_scan()
+        lease = _load_v2_lease()
 
         # 读取最新日志时间
         last_log_time = ""
@@ -991,17 +1256,17 @@ class QuantHandler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
-        # robust_runner 以单进程 daemon 运行，主循环同时负责目标执行与暴跌监控，
-        # 并每轮续租 paper_v2 账本租约。用账本活跃租约统一代表盯盘/扫描状态，
-        # 避免旧版 live_runner 的日志/线程字符串检测对 robust_runner 全部失效。
-        watch_active = live_running
-        scan_active = live_running
-
         return {
             "live_runner": live_running,
             "web_server": web_running,
-            "watch_thread": watch_active,
-            "scan_thread": scan_active,
+            "strategy_mode": "weekly_close_target",
+            "scan_running": _preview_scan_running(),
+            "scan_status": scan.get("status", "never_run"),
+            "latest_scan_at": scan.get("generated_at", ""),
+            "latest_scan_trade_date": scan.get("trade_date", ""),
+            "next_scan_at": scan.get("next_scheduled_scan_at", ""),
+            "scan_schedule": "每日 15:05 候选观察；周度调仓生成正式信号",
+            "daemon_heartbeat_at": lease.get("heartbeat_at", ""),
             "last_log_time": last_log_time,
             "now": format_local(),
         }
@@ -1039,7 +1304,11 @@ class QuantHandler(SimpleHTTPRequestHandler):
         """
         v2_points = _load_v2_equity()
         if v2_points is not None:
-            return {"points": v2_points, "initial": INITIAL_CAPITAL, "source": "paper_v2"}
+            return {
+                "points": v2_points,
+                "initial": INITIAL_CAPITAL,
+                "source": "paper_v2",
+            }
 
         points: list[dict] = []
         seen_timestamps: set[str] = set()
@@ -1047,7 +1316,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
         # 1. 收盘快照
         if os.path.exists(SNAPSHOT_LOG_FILE):
             try:
-                with open(SNAPSHOT_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                with open(
+                    SNAPSHOT_LOG_FILE, "r", encoding="utf-8", errors="replace"
+                ) as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -1055,11 +1326,13 @@ class QuantHandler(SimpleHTTPRequestHandler):
                         obj = json.loads(line)
                         s = obj.get("summary", {})
                         t = obj.get("timestamp") or obj.get("date", "")
-                        points.append({
-                            "t": t,
-                            "value": s.get("total_value"),
-                            "drawdown": s.get("drawdown", 0),
-                        })
+                        points.append(
+                            {
+                                "t": t,
+                                "value": s.get("total_value"),
+                                "drawdown": s.get("drawdown", 0),
+                            }
+                        )
                         seen_timestamps.add(t)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("读取快照流水失败: %s", exc)
@@ -1068,7 +1341,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if os.path.exists(TRADE_EVENTS_FILE):
             try:
                 peak = INITIAL_CAPITAL
-                with open(TRADE_EVENTS_FILE, "r", encoding="utf-8", errors="replace") as f:
+                with open(
+                    TRADE_EVENTS_FILE, "r", encoding="utf-8", errors="replace"
+                ) as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -1085,11 +1360,16 @@ class QuantHandler(SimpleHTTPRequestHandler):
                             continue
                         seen_timestamps.add(t)
                         peak = max(peak, val)
-                        points.append({
-                            "t": t,
-                            "value": val,
-                            "drawdown": p.get("drawdown", round((peak - val) / peak, 4) if peak > 0 else 0),
-                        })
+                        points.append(
+                            {
+                                "t": t,
+                                "value": val,
+                                "drawdown": p.get(
+                                    "drawdown",
+                                    round((peak - val) / peak, 4) if peak > 0 else 0,
+                                ),
+                            }
+                        )
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("读取交易事件流水失败: %s", exc)
 
@@ -1103,11 +1383,13 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 if val is None:
                     continue
                 peak = max(peak, val)
-                points.append({
-                    "t": date,
-                    "value": val,
-                    "drawdown": round((peak - val) / peak, 4) if peak > 0 else 0,
-                })
+                points.append(
+                    {
+                        "t": date,
+                        "value": val,
+                        "drawdown": round((peak - val) / peak, 4) if peak > 0 else 0,
+                    }
+                )
 
         # 按时间排序
         points.sort(key=lambda p: p["t"])
@@ -1128,18 +1410,53 @@ class QuantHandler(SimpleHTTPRequestHandler):
             return data
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("读取回测结果失败: %s", exc)
-            return {**status.to_dict(), "available": False, "error": str(exc), "series": []}
+            return {
+                **status.to_dict(),
+                "available": False,
+                "error": str(exc),
+                "series": [],
+            }
 
     def _api_reports(self):
         return {"reports": load_reports()}
 
-    def _api_scan_trigger(self):
-        import subprocess
-        try:
-            # 通过信号触发 live_runner 的扫描（或直接调用 scanner）
-            return {"status": "ok", "message": "扫描已触发"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+    def _api_scan_trigger(self) -> tuple[dict[str, str], int]:
+        """异步启动不会写入交易信号和订单的安全预览扫描。"""
+        global _PREVIEW_SCAN_PROCESS
+        runner_path = ROOT_DIR / "robust_runner.py"
+        ledger_path = Path(ROBUST_V2_LEDGER_PATH).expanduser()
+        if not runner_path.exists():
+            return {"status": "error", "message": "未找到 robust_runner.py"}, 500
+        if not ledger_path.exists():
+            return {"status": "error", "message": "paper_v2 账本尚未初始化"}, 503
+
+        with _PREVIEW_SCAN_LOCK:
+            if (
+                _PREVIEW_SCAN_PROCESS is not None
+                and _PREVIEW_SCAN_PROCESS.poll() is None
+            ):
+                return {"status": "running", "message": "安全预览扫描正在运行"}, 409
+            try:
+                _PREVIEW_SCAN_PROCESS = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(runner_path),
+                        "preview-scan",
+                        "--ledger",
+                        str(ledger_path),
+                    ],
+                    cwd=ROOT_DIR,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                logger.exception("启动安全预览扫描失败")
+                return {"status": "error", "message": str(exc)}, 500
+        return {
+            "status": "started",
+            "message": "安全预览扫描已启动，不会生成交易信号或订单",
+        }, 202
 
     # ==================== 辅助 ====================
 
@@ -1187,7 +1504,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
         relative_path = request_path.lstrip("/")
         asset_path = os.path.abspath(os.path.join(DIST_DIR, relative_path))
         dist_root = os.path.abspath(DIST_DIR)
-        if not asset_path.startswith(dist_root + os.sep) or not os.path.exists(asset_path):
+        if not asset_path.startswith(dist_root + os.sep) or not os.path.exists(
+            asset_path
+        ):
             self.send_error(404)
             return
         mime_type, _ = mimetypes.guess_type(asset_path)
@@ -1209,15 +1528,20 @@ class QuantHandler(SimpleHTTPRequestHandler):
 def _parse_args(argv=None):
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="A 股虚拟盘 Web 仪表盘")
-    parser.add_argument("port", nargs="?", type=int, default=8888, help="监听端口，默认 8888")
+    parser.add_argument(
+        "port", nargs="?", type=int, default=8888, help="监听端口，默认 8888"
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     """启动 Web 仪表盘。"""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    )
     args = _parse_args(argv)
-    server = HTTPServer(("0.0.0.0", args.port), QuantHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), QuantHandler)
+    server.daemon_threads = True
     server.allow_reuse_address = True
     logger.info("量化系统仪表盘 v2: http://0.0.0.0:%s", args.port)
     try:

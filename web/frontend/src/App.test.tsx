@@ -65,4 +65,53 @@ describe("App login", () => {
 
     expect(await screen.findByText("新密码至少 6 位")).toBeInTheDocument();
   });
+
+  it("展示结构化扫描统计并能启动安全预览", async () => {
+    window.history.replaceState({}, "", "/quantify/");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/quantify/api/candidates") {
+        return new Response(JSON.stringify({
+          candidates: [],
+          updated_at: "2026-07-10 15:06:00",
+          trade_date: "20260710",
+          status: "completed",
+          mode: "scheduled",
+          scan_running: false,
+          input_count: 500,
+          eligible_count: 0,
+          universe: { mainboard_count: 3000, rough_candidate_count: 500 },
+          prefilter_counts: { candidate_limit: 400 },
+          prefilter_labels: { candidate_limit: "流动性排名超出 500 只上限" },
+          filter_counts: { below_ma120: 320 },
+          filter_labels: { below_ma120: "股价低于年线" },
+          selected_codes: [],
+          next_scheduled_scan_at: "2026-07-17 15:05:00",
+          error: "",
+          schedule: "每周最后一个交易日 15:05 后"
+        }), { status: 200 });
+      }
+      if (url === "/quantify/api/scan/trigger" && init?.method === "POST") {
+        return new Response(JSON.stringify({
+          status: "started",
+          message: "安全预览扫描已启动，不会生成交易信号或订单"
+        }), { status: 202 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /因子看板/ }));
+
+    expect(await screen.findByText(/主板 3000 · 粗筛 500 · 完整历史 500 · 合格 0/)).toBeInTheDocument();
+    expect(screen.getByText("股价低于年线")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "安全预览扫描" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/quantify/api/scan/trigger",
+      expect.objectContaining({ method: "POST" })
+    ));
+    expect(await screen.findByText("安全预览扫描已启动，不会生成交易信号或订单")).toBeInTheDocument();
+  });
 });

@@ -21,11 +21,9 @@ import socket
 import sys
 
 # 必须在导入 baostock 前设置，确保其底层 socket 继承有限超时。
-socket.setdefaulttimeout(
-    float(os.getenv("BAOSTOCK_SOCKET_TIMEOUT_SECONDS", "8"))
-)
+socket.setdefaulttimeout(float(os.getenv("BAOSTOCK_SOCKET_TIMEOUT_SECONDS", "8")))
 
-import baostock as bs
+import baostock as bs  # noqa: E402 - socket 超时必须先于第三方库导入设置
 
 
 HISTORY_FIELDS = "date,open,high,low,close,volume,amount,preclose,pctChg"
@@ -50,7 +48,9 @@ def _ensure_login():
     with _suppress_stdout():
         result = bs.login()
     if result.error_code != "0":
-        raise ConnectionError(f"BaoStock 登录失败: {result.error_code} {result.error_msg}")
+        raise ConnectionError(
+            f"BaoStock 登录失败: {result.error_code} {result.error_msg}"
+        )
 
 
 def cmd_login():
@@ -128,7 +128,9 @@ def cmd_query_history_batch(start, end, *bs_codes):
 
 
 # 扩展字段:含换手率/估值/ST/停牌,供小市值价值选股使用
-EXT_FIELDS = "date,open,high,low,close,volume,amount,turn,peTTM,pbMRQ,isST,tradestatus,pctChg"
+EXT_FIELDS = (
+    "date,open,high,low,close,volume,amount,turn,peTTM,pbMRQ,isST,tradestatus,pctChg"
+)
 
 
 def cmd_query_history_ext(bs_code, start, end):
@@ -149,6 +151,40 @@ def cmd_query_history_ext(bs_code, start, end):
     return {"error_code": rs.error_code, "rows": rows, "fields": EXT_FIELDS}
 
 
+def cmd_query_history_ext_batch(start, end, *bs_codes):
+    """一次登录连续查询一批扩展历史，避免逐股启动进程。"""
+    if not bs_codes:
+        return {"results": {}}
+    _ensure_login()
+    results = {}
+    for bs_code in bs_codes:
+        try:
+            with _suppress_stdout():
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    EXT_FIELDS,
+                    start_date=start,
+                    end_date=end,
+                    frequency="d",
+                    adjustflag="2",
+                )
+                rows = []
+                while rs.error_code == "0" and rs.next():
+                    rows.append(rs.get_row_data())
+            results[bs_code] = {
+                "error_code": rs.error_code,
+                "error_msg": getattr(rs, "error_msg", ""),
+                "rows": rows,
+            }
+        except Exception as exc:
+            results[bs_code] = {
+                "error_code": "WORKER_ERROR",
+                "error_msg": str(exc),
+                "rows": [],
+            }
+    return {"results": results}
+
+
 def cmd_logout():
     """登出 BaoStock（子进程内执行，避免污染主进程日志）。"""
     with _suppress_stdout():
@@ -164,12 +200,18 @@ COMMANDS = {
     "query_history": cmd_query_history,
     "query_history_batch": cmd_query_history_batch,
     "query_history_ext": cmd_query_history_ext,
+    "query_history_ext_batch": cmd_query_history_ext_batch,
 }
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        print(json.dumps({"ok": False, "error": f"unknown command: {sys.argv[1:]}"}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"ok": False, "error": f"unknown command: {sys.argv[1:]}"},
+                ensure_ascii=False,
+            )
+        )
         sys.exit(1)
 
     cmd_name = sys.argv[1]

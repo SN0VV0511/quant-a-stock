@@ -313,16 +313,15 @@ def _build_ledger_review(
     end_date: str,
     run_id: str | None,
 ) -> ReviewSummary:
-    """从同一 SQLite 账户和运行批次生成显式日期复盘。"""
+    """从连续 SQLite 账户生成显式日期复盘，run_id 仅用于可选审计筛选。"""
     ledger = PaperLedger(ledger_path, account_id=account_id)
     try:
         ledger.connect()
         review = ledger.build_review(start_date, end_date, run_id=run_id)
         rows = list(review.snapshots)
-        run_ids = {str(row.get("run_id") or "") for row in rows}
-        if run_id is None and len(run_ids) > 1:
-            raise ValueError("月报区间包含多个 run_id，请显式传入 --run-id")
-        effective_run_id = run_id or (next(iter(run_ids)) if run_ids else None)
+        effective_run_id = run_id or (
+            str(rows[-1].get("run_id") or "") if rows else None
+        )
         points = [
             (str(row["snapshot_date"]), float(row["total_value"])) for row in rows
         ]

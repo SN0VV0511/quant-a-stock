@@ -17,11 +17,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from scripts.monthly_review import build_review
-from scripts.paper_acceptance import run_acceptance
-from scripts.paper_healthcheck import run_healthcheck
-from scripts.paper_service import get_status
-from config.time_utils import format_local
+from scripts.monthly_review import build_review  # noqa: E402
+from scripts.paper_acceptance import run_acceptance  # noqa: E402
+from scripts.paper_healthcheck import run_healthcheck  # noqa: E402
+from scripts.paper_service import get_status  # noqa: E402
+from scripts.paper_v2_acceptance import run_acceptance as run_v2_acceptance  # noqa: E402
+from scripts.paper_v2_healthcheck import run_v2_healthcheck  # noqa: E402
+from config.time_utils import format_local  # noqa: E402
 
 T = TypeVar("T")
 
@@ -50,7 +52,9 @@ def _tail_lines(path: Path, max_lines: int) -> list[str]:
         return [f"读取日志失败: {path} - {exc}"]
 
 
-def _safe_section(name: str, errors: list[str], callback: Callable[[], T], fallback: T) -> T:
+def _safe_section(
+    name: str, errors: list[str], callback: Callable[[], T], fallback: T
+) -> T:
     """执行状态片段，失败时保留错误信息并返回兜底值。"""
     try:
         return callback()
@@ -81,49 +85,124 @@ def build_status(
     root_dir = root_dir.resolve()
     errors: list[str] = []
 
-    service: dict[str, Any] = _safe_section(
+    ledger_path = root_dir / "data" / "paper_v2.db"
+    if ledger_path.exists():
+        health_result = _safe_section(
+            "paper_v2 健康检查",
+            errors,
+            lambda: run_v2_healthcheck(ledger_path),
+            None,
+        )
+        health = asdict(health_result) if health_result is not None else {}
+        review = _safe_section(
+            "paper_v2 观察期复盘",
+            errors,
+            lambda: asdict(
+                build_review(
+                    root_dir,
+                    days=days,
+                    ledger_path=ledger_path,
+                )
+            ),
+            dict[str, Any](),
+        )
+        start_date = str(review.get("start_date") or format_local("%Y%m%d"))
+        end_date = str(review.get("end_date") or format_local("%Y%m%d"))
+        acceptance_result = _safe_section(
+            "paper_v2 观察期验收",
+            errors,
+            lambda: run_v2_acceptance(
+                ledger_path,
+                start_date=start_date,
+                end_date=end_date,
+                min_observed_days=min_snapshot_days,
+                max_drawdown=max_drawdown,
+            ),
+            None,
+        )
+        if acceptance_result is None:
+            acceptance: dict[str, Any] = {}
+        else:
+            acceptance = {
+                **asdict(acceptance_result),
+                "ready_for_qmt_dry_run": acceptance_result.ok,
+                "snapshot_days": acceptance_result.observed_days,
+                "required_snapshot_days": min_snapshot_days,
+            }
+        metrics = health.get("metrics", {}) if isinstance(health, dict) else {}
+        service = {
+            "running": bool(
+                metrics.get("active_writer_runs") == 1
+                and metrics.get("lease_active") is True
+            ),
+            "source": "paper_v2_lease",
+            "heartbeat_at": metrics.get("lease_heartbeat_at", ""),
+            "message": "robust_v2 SQLite 租约",
+        }
+        logs = {
+            "robust_v2": _tail_lines(
+                root_dir / "logs" / "robust_v2.log",
+                log_lines,
+            )
+        }
+        return ObservationStatus(
+            generated_at=format_local(),
+            root_dir=str(root_dir),
+            service=service,
+            health=health,
+            review=review,
+            acceptance=acceptance,
+            logs=logs,
+            errors=errors,
+        )
+
+    legacy_service: dict[str, Any] = _safe_section(
         "服务状态",
         errors,
         lambda: asdict(get_status(root_dir)),
         dict[str, Any](),
     )
-    health: dict[str, Any] = _safe_section(
+    legacy_health: dict[str, Any] = _safe_section(
         "健康检查",
         errors,
         lambda: asdict(run_healthcheck(root_dir)),
         dict[str, Any](),
     )
-    review: dict[str, Any] = _safe_section(
+    legacy_review: dict[str, Any] = _safe_section(
         "观察期复盘",
         errors,
         lambda: asdict(build_review(root_dir, days=days)),
         dict[str, Any](),
     )
-    acceptance: dict[str, Any] = _safe_section(
+    legacy_acceptance: dict[str, Any] = _safe_section(
         "观察期验收",
         errors,
-        lambda: asdict(run_acceptance(
-            root_dir,
-            days=days,
-            min_snapshot_days=min_snapshot_days,
-            max_drawdown=max_drawdown,
-        )),
+        lambda: asdict(
+            run_acceptance(
+                root_dir,
+                days=days,
+                min_snapshot_days=min_snapshot_days,
+                max_drawdown=max_drawdown,
+            )
+        ),
         dict[str, Any](),
     )
 
     logs = {
         "live_today": _tail_lines(root_dir / "logs" / "live_today.log", log_lines),
         "live": _tail_lines(root_dir / "logs" / "live.log", log_lines),
-        "service": _tail_lines(root_dir / "logs" / "paper_daemon_service.log", log_lines),
+        "service": _tail_lines(
+            root_dir / "logs" / "paper_daemon_service.log", log_lines
+        ),
     }
 
     return ObservationStatus(
         generated_at=format_local(),
         root_dir=str(root_dir),
-        service=service,
-        health=health,
-        review=review,
-        acceptance=acceptance,
+        service=legacy_service,
+        health=legacy_health,
+        review=legacy_review,
+        acceptance=legacy_acceptance,
         logs=logs,
         errors=errors,
     )
@@ -134,9 +213,15 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="汇总 A 股虚拟盘观察期状态")
     parser.add_argument("--root", default=str(ROOT_DIR), help="项目根目录")
     parser.add_argument("--days", type=int, default=30, help="复盘最近 N 天")
-    parser.add_argument("--min-snapshot-days", type=int, default=20, help="QMT dry-run 前置最少快照天数")
-    parser.add_argument("--max-drawdown", type=float, default=0.06, help="QMT dry-run 前置最大允许回撤")
-    parser.add_argument("--log-lines", type=int, default=80, help="每个日志文件返回的最大行数")
+    parser.add_argument(
+        "--min-snapshot-days", type=int, default=20, help="QMT dry-run 前置最少快照天数"
+    )
+    parser.add_argument(
+        "--max-drawdown", type=float, default=0.06, help="QMT dry-run 前置最大允许回撤"
+    )
+    parser.add_argument(
+        "--log-lines", type=int, default=80, help="每个日志文件返回的最大行数"
+    )
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     return parser.parse_args()
 
@@ -153,7 +238,9 @@ def main() -> int:
     )
     payload = asdict(status)
     if args.json:
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n")
+        sys.stdout.write(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
+        )
     else:
         service = status.service
         acceptance = status.acceptance

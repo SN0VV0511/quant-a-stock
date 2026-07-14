@@ -5,7 +5,6 @@ from __future__ import annotations
 import itertools
 import statistics
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from typing import Any, Mapping
 
 import pandas as pd
@@ -19,6 +18,7 @@ from strategies.robust_v2 import (
 )
 from trading.allocator import PortfolioAllocator
 from trading.models import MarketSnapshot, TargetPortfolio
+from trading.schedule import backtest_rebalance_due
 
 
 @dataclass(frozen=True)
@@ -257,7 +257,7 @@ class RobustPortfolioBacktester:
         cash = self.initial_capital
         positions: dict[str, dict[str, Any]] = {}
         pending: TargetPortfolio | None = None
-        last_signal_index: int | None = None
+        last_signal_date: str | None = None
         daily_values: list[dict[str, Any]] = []
         trades: list[dict[str, Any]] = []
 
@@ -474,9 +474,11 @@ class RobustPortfolioBacktester:
                 }
             )
 
-            should_signal = index < len(dates) - 1 and (
-                last_signal_index is None
-                or index - last_signal_index >= config.rebalance_days
+            should_signal = index < len(dates) - 1 and backtest_rebalance_due(
+                dates,
+                index,
+                last_signal_date,
+                config.rebalance_days,
             )
             if not should_signal:
                 continue
@@ -502,7 +504,7 @@ class RobustPortfolioBacktester:
                 total_value,
                 self.name_map,
             )
-            last_signal_index = index
+            last_signal_date = date
 
         metrics = compute_performance_metrics(
             daily_values, trades, [], self.initial_capital

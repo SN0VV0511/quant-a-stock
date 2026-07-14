@@ -14,6 +14,7 @@ import time
 import socket
 import signal
 import subprocess
+import tempfile
 import threading
 import logging
 import urllib.request
@@ -29,6 +30,7 @@ from config.settings import (
     BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
     BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
     BAOSTOCK_HISTORY_TIMEOUT_PER_STOCK_SECONDS,
+    ROBUST_V2_UNIVERSE_CACHE_MAX_AGE_SECONDS,
     is_a_share_stock,
     is_etf,
     normalize_a_share_code,
@@ -150,19 +152,23 @@ def _run_bs_with_subprocess(
 def _require_baostock():
     """确保 BaoStock 依赖已安装。"""
     if bs is None:
-        raise ImportError("缺少 baostock 依赖，请先执行: pip install -r requirements.txt")
+        raise ImportError(
+            "缺少 baostock 依赖，请先执行: pip install -r requirements.txt"
+        )
 
 
 def _require_akshare():
     """确保 AKShare 依赖已安装。"""
     if ak is None:
-        raise ImportError("缺少 akshare 依赖，请先执行: pip install -r requirements.txt")
+        raise ImportError(
+            "缺少 akshare 依赖，请先执行: pip install -r requirements.txt"
+        )
 
 
 def _fetch_tencent_quote_batch(
     tencent_codes: list[str],
     timeout: float = _TENCENT_REQUEST_TIMEOUT_SECONDS,
-) -> dict[str, dict[str, float | str]]:
+) -> dict[str, dict[str, object]]:
     """请求并解析一批腾讯实时行情。
 
     Args:
@@ -187,7 +193,8 @@ def _fetch_tencent_quote_batch(
         if callable(close):
             close()
 
-    quotes: dict[str, dict[str, float | str]] = {}
+    quotes: dict[str, dict[str, object]] = {}
+    captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for line in data.strip().split(";"):
         line = line.strip()
         if not line or "=" not in line:
@@ -201,15 +208,13 @@ def _fetch_tencent_quote_batch(
             code = parts[2]
             name = parts[1] if len(parts) > 1 else ""
             price = float(parts[3]) if parts[3] else 0
-            if price <= 0:
-                continue
-
             prev_close = float(parts[4]) if parts[4] else price
             open_price = float(parts[5]) if parts[5] else price
             volume = float(parts[6]) if parts[6] else 0
             high = float(parts[33]) if parts[33] else price
             low = float(parts[34]) if parts[34] else price
             change_pct = float(parts[32]) if parts[32] else 0
+            quote_time = parts[30].strip() if len(parts) > 30 else ""
 
             quotes[code] = {
                 "name": name,
@@ -220,6 +225,11 @@ def _fetch_tencent_quote_batch(
                 "prev_close": prev_close,
                 "volume": volume * 100,
                 "pct_change": change_pct,
+                "quote_time": quote_time,
+                "captured_at": captured_at,
+                "source": "tencent",
+                "is_suspended": price <= 0,
+                "trade_status": 0 if price <= 0 else 1,
             }
         except (IndexError, ValueError):
             logger.debug("腾讯行情响应行解析失败: %r", line[:200])
@@ -326,7 +336,10 @@ def _normalize_market_history(
         "amount": ("成交额", "amount", "成交额(元)"),
         "pctChg": ("涨跌幅", "pctChg", "涨幅"),
     }
-    picked = {target: _pick_column(raw_df, candidates) for target, candidates in columns.items()}
+    picked = {
+        target: _pick_column(raw_df, candidates)
+        for target, candidates in columns.items()
+    }
     if picked["date"] is None or picked["close"] is None:
         raise ValueError(f"行情数据缺少必要字段: columns={list(raw_df.columns)}")
 
@@ -344,13 +357,53 @@ def _normalize_market_history(
     df = df.dropna(subset=["date", "close"])
     df = df[df["date"].astype(str).str.len() == 8]
     df = df[df["close"] > 0]
-    df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    df = (
+        df.sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
     return df
+
+
+def _history_ext_rows_to_dataframe(rows: list[list[str]]) -> pd.DataFrame | None:
+    """把 BaoStock 扩展历史字段转换为策略统一格式。"""
+    if not rows:
+        return None
+    columns = [
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "turn",
+        "peTTM",
+        "pbMRQ",
+        "isST",
+        "tradestatus",
+        "pctChg",
+    ]
+    frame = pd.DataFrame(rows, columns=columns)
+    for column in columns[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["date", "close"])
+    frame = frame[frame["close"] > 0]
+    if frame.empty:
+        return None
+    frame = frame.sort_values("date").drop_duplicates("date", keep="last")
+    frame["pb"] = frame["pbMRQ"]
+    frame["is_st"] = frame["isST"].fillna(0).astype(bool)
+    frame["is_suspended"] = frame["tradestatus"] == 0
+    turn = frame["turn"].where(frame["turn"] > 0)
+    frame["mktcap"] = frame["close"] * frame["volume"] / (turn / 100.0)
+    return frame.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
 # 新浪/腾讯 fallback – AKShare 失败时的备用数据源
 # ---------------------------------------------------------------------------
+
 
 def _sina_symbol_for_etf(code: str) -> str:
     """ETF 代码转换为新浪 symbol (sh510300 / sz159915)。"""
@@ -392,7 +445,11 @@ def _fetch_etf_history_sina(
             df["pctChg"] = np.nan
             df = df.dropna(subset=["date", "close"])
             df = df[df["close"] > 0]
-            df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+            df = (
+                df.sort_values("date")
+                .drop_duplicates("date", keep="last")
+                .reset_index(drop=True)
+            )
             return df
         except Exception as exc:
             if attempt < 1:
@@ -430,7 +487,9 @@ def _fetch_industry_history_tencent(
             rows = code_data.get("qfqday") or code_data.get("day") or []
             if not rows:
                 return None
-            df = pd.DataFrame(rows, columns=["date", "open", "close", "high", "low", "volume"])
+            df = pd.DataFrame(
+                rows, columns=["date", "open", "close", "high", "low", "volume"]
+            )
             for col in ("open", "high", "low", "close", "volume"):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             df["date"] = df["date"].map(_normalize_compact_date)
@@ -440,7 +499,11 @@ def _fetch_industry_history_tencent(
             df["pctChg"] = np.nan
             df = df.dropna(subset=["date", "close"])
             df = df[df["close"] > 0]
-            df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+            df = (
+                df.sort_values("date")
+                .drop_duplicates("date", keep="last")
+                .reset_index(drop=True)
+            )
             return df
         except Exception as exc:
             if attempt < 1:
@@ -462,6 +525,12 @@ class AKDataLoader:
         self.cache_ttl = cache_ttl
         self._stock_list_cache = None
         self._stock_list_cache_time = 0
+        self._stock_universe_info: dict[str, object] = {
+            "source": "uninitialized",
+            "count": 0,
+            "authoritative": False,
+            "stale": True,
+        }
         self._bs_logged_in = False
         self._bs_available = True
         self._bs_lock = threading.Lock()
@@ -494,7 +563,10 @@ class AKDataLoader:
             _require_baostock()
             # Skip re-verification if recently verified
             now = time.time()
-            if self._bs_logged_in and (now - self._bs_last_verified) < self._bs_verify_interval:
+            if (
+                self._bs_logged_in
+                and (now - self._bs_last_verified) < self._bs_verify_interval
+            ):
                 return
             for attempt in range(3):
                 if self._bs_logged_in:
@@ -511,12 +583,16 @@ class AKDataLoader:
                     self._bs_last_verified = time.time()
                     return
                 wait = 2 * (attempt + 1)
-                logger.warning("BaoStock 登录失败 (第%d次), %ds 后重试", attempt + 1, wait)
+                logger.warning(
+                    "BaoStock 登录失败 (第%d次), %ds 后重试", attempt + 1, wait
+                )
                 self._bs_logged_in = False
                 if attempt < 2:
                     time.sleep(wait)
             self._bs_available = False
-            logger.error("BaoStock 登录重试 3 次均失败,标记为不可用,后续调用将跳过 BaoStock")
+            logger.error(
+                "BaoStock 登录重试 3 次均失败,标记为不可用,后续调用将跳过 BaoStock"
+            )
             raise ConnectionError("BaoStock 登录重试 3 次均失败")
 
     def _logout(self):
@@ -534,10 +610,14 @@ class AKDataLoader:
     def get_stock_name_map(self) -> dict[str, str]:
         """获取 A 股代码→名称映射，缓存 1 小时。"""
         now = time.time()
-        if self._stock_name_map_cache and (now - self._stock_name_map_cache_time) < 3600:
+        if (
+            self._stock_name_map_cache
+            and (now - self._stock_name_map_cache_time) < 3600
+        ):
             return self._stock_name_map_cache
         try:
             import akshare as ak
+
             df = ak.stock_info_a_code_name()
             name_map = dict(zip(df["code"].astype(str), df["name"].astype(str)))
             self._stock_name_map_cache = name_map
@@ -547,6 +627,115 @@ class AKDataLoader:
         except Exception as e:
             logger.warning("加载 A 股名称映射失败: %s", e)
             return {}
+
+    @property
+    def _stock_universe_cache_path(self) -> str:
+        """返回独立股票主数据缓存路径。
+
+        历史行情文件只能证明某只股票曾被下载，不能证明文件集合等于完整市场，
+        因此股票池必须使用单独的版本化主数据文件。
+        """
+        return os.path.join(self.cache_dir, "stock_universe_v1.json")
+
+    def get_stock_universe_info(self) -> dict[str, object]:
+        """返回最近一次股票池加载的来源与完整性元数据。"""
+        return dict(self._stock_universe_info)
+
+    @staticmethod
+    def _stocks_from_name_map(name_map: dict[str, str]) -> list[dict[str, str]]:
+        """把 AKShare 全市场代码名称表转换为统一股票主数据。"""
+        stocks: list[dict[str, str]] = []
+        for raw_code, name in name_map.items():
+            if not is_a_share_stock(raw_code):
+                continue
+            code = normalize_a_share_code(raw_code)
+            stocks.append(
+                {
+                    "code": code,
+                    "bs_code": to_baostock_code(code),
+                    "name": str(name or code),
+                }
+            )
+        return sorted(stocks, key=lambda stock: stock["code"])
+
+    def _write_stock_universe_cache(
+        self,
+        stocks: list[dict[str, str]],
+        *,
+        source: str,
+    ) -> None:
+        """原子保存经远端主数据接口验证的完整股票池。"""
+        payload = {
+            "schema_version": 1,
+            "source": source,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "generated_at_epoch": time.time(),
+            "stocks": stocks,
+        }
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.cache_dir,
+                delete=False,
+            ) as stream:
+                json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+                temporary_path = stream.name
+            os.replace(temporary_path, self._stock_universe_cache_path)
+        except OSError:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            raise
+
+    def _read_stock_universe_cache(
+        self,
+    ) -> tuple[list[dict[str, str]], dict[str, object]] | None:
+        """读取独立股票主数据缓存并标记是否超过允许年龄。"""
+        path = self._stock_universe_cache_path
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+            raw_stocks = payload.get("stocks", [])
+            if not isinstance(raw_stocks, list):
+                raise ValueError("stocks 必须是数组")
+            by_code: dict[str, dict[str, str]] = {}
+            for raw in raw_stocks:
+                if not isinstance(raw, dict) or not is_a_share_stock(
+                    str(raw.get("code", ""))
+                ):
+                    continue
+                code = normalize_a_share_code(str(raw["code"]))
+                by_code[code] = {
+                    "code": code,
+                    "bs_code": to_baostock_code(code),
+                    "name": str(raw.get("name") or code),
+                }
+            stocks = sorted(by_code.values(), key=lambda stock: stock["code"])
+            generated_at_epoch = float(payload.get("generated_at_epoch", 0) or 0)
+            age_seconds = max(0.0, time.time() - generated_at_epoch)
+            stale = age_seconds > ROBUST_V2_UNIVERSE_CACHE_MAX_AGE_SECONDS
+            return stocks, {
+                "source": f"cached:{payload.get('source', 'unknown')}",
+                "count": len(stocks),
+                "authoritative": not stale,
+                "stale": stale,
+                "age_seconds": int(age_seconds),
+            }
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logger.error("股票主数据缓存损坏: %s", exc)
+            return None
 
     def _get_stocks_from_cache(self) -> list[dict[str, str]]:
         """从历史行情缓存文件名中提取并去重股票代码。"""
@@ -592,81 +781,127 @@ class AKDataLoader:
         return stocks
 
     def get_all_stocks(self) -> list[dict[str, str]]:
-        """获取沪深 A 股股票列表，优先使用本地历史缓存。
+        """获取可证明来源的沪深 A 股完整股票列表。
 
-        扫描链路不能依赖 BaoStock 的可用性：只要磁盘上存在历史缓存，就直接
-        构建股票池。仅在本地完全无缓存时才尝试远端查询。
+        优先级为 AKShare 全市场主数据、BaoStock 当日股票表、独立主数据缓存；
+        历史行情文件名只作为最后的诊断性回退，并明确标记为不完整，禁止
+        robust_v2 用它生成正式信号。
         """
         now = time.time()
         if self._stock_list_cache and (now - self._stock_list_cache_time) < 3600:
             return self._stock_list_cache
 
-        cached_stocks = self._get_stocks_from_cache()
-        if cached_stocks:
-            self._stock_list_cache = cached_stocks
+        name_map = self.get_stock_name_map()
+        stocks = self._stocks_from_name_map(name_map)
+        if stocks:
+            self._stock_list_cache = stocks
             self._stock_list_cache_time = now
-            return cached_stocks
-
-        if not self._bs_available:
-            return []
+            self._stock_universe_info = {
+                "source": "AKShare.stock_info_a_code_name",
+                "count": len(stocks),
+                "authoritative": True,
+                "stale": False,
+            }
+            try:
+                self._write_stock_universe_cache(
+                    stocks,
+                    source="AKShare.stock_info_a_code_name",
+                )
+            except OSError as exc:
+                logger.warning("股票主数据落盘失败，但本次内存数据仍可使用: %s", exc)
+            logger.info("AKShare 全市场股票主数据加载完成: %d 只", len(stocks))
+            return stocks
 
         # 尝试今天及前 5 天，BaoStock 盘中可能没数据
         rows: list[list[str]] = []
-        for offset in range(6):
-            day = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
-            result = _run_bs_with_subprocess(
-                "query_all_stock",
-                day,
-                timeout=_BS_UNIVERSE_TIMEOUT_SECONDS,
-            )
-            if result is None:
-                logger.error("BaoStock query_all_stock(%s) 超时或异常，立即熔断", day)
-                self._bs_available = False
-                break
-            if result.get("error_code") != "0":
-                logger.warning(
-                    "BaoStock query_all_stock(%s) 错误: %s",
+        if self._bs_available:
+            for offset in range(6):
+                day = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+                result = _run_bs_with_subprocess(
+                    "query_all_stock",
                     day,
-                    result.get("error_code"),
+                    timeout=_BS_UNIVERSE_TIMEOUT_SECONDS,
                 )
-                continue
-            raw_rows = result.get("rows", [])
-            rows = [row for row in raw_rows if isinstance(row, list)] if isinstance(raw_rows, list) else []
-            if rows:
-                logger.info("股票列表使用日期: %s (%d 条)", day, len(rows))
-                break
+                if result is None:
+                    logger.error(
+                        "BaoStock query_all_stock(%s) 超时或异常，立即熔断", day
+                    )
+                    self._bs_available = False
+                    break
+                if result.get("error_code") != "0":
+                    logger.warning(
+                        "BaoStock query_all_stock(%s) 错误: %s",
+                        day,
+                        result.get("error_code"),
+                    )
+                    continue
+                raw_rows = result.get("rows", [])
+                rows = (
+                    [row for row in raw_rows if isinstance(row, list)]
+                    if isinstance(raw_rows, list)
+                    else []
+                )
+                if rows:
+                    logger.info("股票列表使用日期: %s (%d 条)", day, len(rows))
+                    break
 
-        # BaoStock 返回 0 条，回退到缓存
-        if not rows:
-            logger.warning("BaoStock 返回 0 条记录，回退到缓存文件中的股票列表")
-            stocks = self._get_stocks_from_cache()
+        if rows:
+            stocks = []
+            for row in rows:
+                code = row[0]
+                stock_type = row[1] if len(row) > 1 else ""
+                name = row[2] if len(row) > 2 else ""
+                if stock_type != "1" or not is_a_share_stock(code):
+                    continue
+                normalized = normalize_a_share_code(code)
+                stocks.append(
+                    {
+                        "code": normalized,
+                        "bs_code": to_baostock_code(normalized),
+                        "name": name or normalized,
+                    }
+                )
+            stocks.sort(key=lambda stock: stock["code"])
             self._stock_list_cache = stocks
             self._stock_list_cache_time = now
+            self._stock_universe_info = {
+                "source": "BaoStock.query_all_stock",
+                "count": len(stocks),
+                "authoritative": True,
+                "stale": False,
+            }
+            try:
+                self._write_stock_universe_cache(
+                    stocks,
+                    source="BaoStock.query_all_stock",
+                )
+            except OSError as exc:
+                logger.warning("股票主数据落盘失败，但本次内存数据仍可使用: %s", exc)
+            logger.info("BaoStock 全市场股票主数据加载完成: %d 只", len(stocks))
             return stocks
 
-        stocks = []
-        for row in rows:
-            code = row[0]
-            stock_type = row[1] if len(row) > 1 else ""
-            name = row[2] if len(row) > 2 else ""
+        persisted = self._read_stock_universe_cache()
+        if persisted is not None and persisted[0]:
+            stocks, info = persisted
+            self._stock_list_cache = stocks
+            self._stock_list_cache_time = now
+            self._stock_universe_info = info
+            logger.warning("远端股票主数据不可用，回退独立缓存: %s", info)
+            return stocks
 
-            if stock_type != "1":
-                continue
-
-            if "ST" in name.upper() or "退" in name:
-                continue
-            if not is_a_share_stock(code):
-                continue
-
-            stocks.append({
-                "code": normalize_a_share_code(code),
-                "bs_code": to_baostock_code(code),
-                "name": name,
-            })
-
+        stocks = self._get_stocks_from_cache()
         self._stock_list_cache = stocks
         self._stock_list_cache_time = now
-        logger.info(f"获取沪深 A 股股票列表: {len(stocks)} 只")
+        self._stock_universe_info = {
+            "source": "history-file-names",
+            "count": len(stocks),
+            "authoritative": False,
+            "stale": True,
+        }
+        logger.error(
+            "只能从历史文件名恢复 %d 只股票；该集合不代表完整市场，正式扫描必须失败",
+            len(stocks),
+        )
         return stocks
 
     def get_realtime_quotes(self, codes=None):
@@ -722,7 +957,7 @@ class AKDataLoader:
             _TENCENT_REQUEST_TIMEOUT_SECONDS,
         )
 
-        quotes: dict[str, dict[str, float | str]] = {}
+        quotes: dict[str, dict[str, object]] = {}
         failures: list[str] = []
         with ThreadPoolExecutor(
             max_workers=worker_count,
@@ -811,7 +1046,9 @@ class AKDataLoader:
             result = _run_bs_with_subprocess("query_history", bs_code, start, end)
 
             if result is None:
-                logger.warning("get_stock_history(%s) 超时或异常 (第%d次)", code, attempt + 1)
+                logger.warning(
+                    "get_stock_history(%s) 超时或异常 (第%d次)", code, attempt + 1
+                )
                 with self._bs_lock:
                     self._bs_logged_in = False
                 if attempt < 2:
@@ -820,7 +1057,11 @@ class AKDataLoader:
                 return None
 
             if result.get("error_code") != "0":
-                logger.warning("get_stock_history(%s) BaoStock 错误: %s", code, result.get("error_code"))
+                logger.warning(
+                    "get_stock_history(%s) BaoStock 错误: %s",
+                    code,
+                    result.get("error_code"),
+                )
                 return None
 
             df = _history_rows_to_dataframe(result.get("rows", []))
@@ -989,7 +1230,9 @@ class AKDataLoader:
                     )
 
                 raw_batch_results = payload.get("results", {}) if payload else {}
-                batch_results = raw_batch_results if isinstance(raw_batch_results, dict) else {}
+                batch_results = (
+                    raw_batch_results if isinstance(raw_batch_results, dict) else {}
+                )
                 for code, bs_code in batch:
                     item = batch_results.get(bs_code)
                     if not isinstance(item, dict) or item.get("error_code") != "0":
@@ -1030,6 +1273,7 @@ class AKDataLoader:
     def get_stock_data(self, code, days=60):
         """获取个股/ETF 历史数据（兼容别名）。ETF 走 AKShare，个股走 BaoStock。"""
         from config.settings import is_etf as _is_etf
+
         if _is_etf(str(code)):
             return self.get_etf_history(str(code), days=days)
         return self.get_stock_history(code, days=days)
@@ -1069,50 +1313,144 @@ class AKDataLoader:
             if result.get("error_code") != "0":
                 return None
             rows = result.get("rows", [])
-            if not rows:
+            if not isinstance(rows, list):
                 return None
-
-            cols = ["date", "open", "high", "low", "close", "volume", "amount",
-                    "turn", "peTTM", "pbMRQ", "isST", "tradestatus", "pctChg"]
-            df = pd.DataFrame(rows, columns=cols)
-            for c in ["open", "high", "low", "close", "volume", "amount",
-                      "turn", "peTTM", "pbMRQ", "isST", "tradestatus", "pctChg"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            if len(df) == 0 or df["close"].iloc[-1] <= 0:
+            typed_rows = [row for row in rows if isinstance(row, list)]
+            df = _history_ext_rows_to_dataframe(typed_rows)
+            if df is None:
                 return None
-
-            df["pb"] = df["pbMRQ"]
-            df["is_st"] = df["isST"].fillna(0)
-            df["is_suspended"] = (df["tradestatus"] == 0)
-            turn = df["turn"].where(df["turn"] > 0)
-            df["mktcap"] = df["close"] * df["volume"] / (turn / 100.0)
 
             self._write_cache(cache_key, df)
             return df
         return None
 
-    def get_batch_history_ext(self, codes, days=40, max_batch=5000, timeout_per_stock=30):
-        """并发批量获取扩展字段历史。"""
-        result = {}
-        target = codes[:max_batch]
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            future_map = {executor.submit(self.get_stock_history_ext, c, days): c for c in target}
-            done = 0
+    def get_batch_history_ext(
+        self,
+        codes: list[str],
+        days: int = 40,
+        max_batch: int = 5000,
+        timeout_per_stock: int = BAOSTOCK_HISTORY_TIMEOUT_PER_STOCK_SECONDS,
+    ) -> dict[str, pd.DataFrame]:
+        """分批加载扩展历史，每个 worker 只登录一次 BaoStock。"""
+        started_at = time.monotonic()
+        target: list[str] = []
+        seen: set[str] = set()
+        for raw in codes[:max_batch]:
+            try:
+                code = normalize_a_share_code(str(raw))
+            except ValueError:
+                continue
+            if code not in seen:
+                seen.add(code)
+                target.append(code)
+
+        result: dict[str, pd.DataFrame] = {}
+        missing: list[tuple[str, str]] = []
+        for code in target:
+            cache_key = f"histext_{code}_{days}"
+            cached = self._read_cache(
+                cache_key,
+                max_age=BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
+            )
+            if cached is None:
+                cached = self._read_cache(
+                    cache_key,
+                    max_age=BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
+                )
+            if cached is not None and not cached.empty:
+                result[code] = cached
+            else:
+                missing.append((code, to_baostock_code(code)))
+
+        logger.info(
+            "扩展历史缓存检查完成: 总计 %d 只，命中 %d 只，待下载 %d 只",
+            len(target),
+            len(result),
+            len(missing),
+        )
+        if not missing or not self._bs_available:
+            return result
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=days + 40)).strftime("%Y-%m-%d")
+        batch_size = max(1, BAOSTOCK_HISTORY_BATCH_SIZE)
+        batches = [
+            missing[index : index + batch_size]
+            for index in range(0, len(missing), batch_size)
+        ]
+        worker_count = min(max(1, BAOSTOCK_HISTORY_BATCH_WORKERS), len(batches))
+        failures: list[str] = []
+        processed = 0
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="baostock-history-ext",
+        ) as executor:
+            future_map = {}
+            for batch_index, batch in enumerate(batches, start=1):
+                batch_timeout = max(30, len(batch) * max(1, timeout_per_stock))
+                future = executor.submit(
+                    _run_bs_with_subprocess,
+                    "query_history_ext_batch",
+                    start,
+                    end,
+                    *(bs_code for _code, bs_code in batch),
+                    timeout=batch_timeout,
+                )
+                future_map[future] = (batch_index, batch)
+
             for future in as_completed(future_map):
-                code = future_map[future]
-                done += 1
+                batch_index, batch = future_map[future]
+                processed += len(batch)
                 try:
-                    df = future.result(timeout=timeout_per_stock)
-                    if df is not None and not df.empty:
-                        result[code] = df
+                    payload = future.result()
                 except Exception as exc:
-                    logger.warning("扩展历史加载失败 %s: %s", code, exc)
-                if done % 200 == 0:
-                    logger.info("扩展历史进度: %d/%d", done, len(target))
-        logger.info("扩展历史完成: %d/%d 只", len(result), len(target))
+                    payload = None
+                    logger.warning(
+                        "扩展历史第 %d/%d 批异常: %s",
+                        batch_index,
+                        len(batches),
+                        exc,
+                        exc_info=True,
+                    )
+                raw_results = payload.get("results", {}) if payload else {}
+                batch_results = raw_results if isinstance(raw_results, dict) else {}
+                for code, bs_code in batch:
+                    item = batch_results.get(bs_code)
+                    if not isinstance(item, dict) or item.get("error_code") != "0":
+                        failures.append(code)
+                        continue
+                    raw_rows = item.get("rows", [])
+                    rows = (
+                        [row for row in raw_rows if isinstance(row, list)]
+                        if isinstance(raw_rows, list)
+                        else []
+                    )
+                    frame = _history_ext_rows_to_dataframe(rows)
+                    if frame is None:
+                        failures.append(code)
+                        continue
+                    result[code] = frame
+                    self._write_cache(f"histext_{code}_{days}", frame)
+                logger.info(
+                    "扩展历史进度: %d/%d 只，成功 %d，失败 %d，耗时 %.1fs",
+                    processed,
+                    len(missing),
+                    len(result),
+                    len(failures),
+                    time.monotonic() - started_at,
+                )
+        logger.info(
+            "扩展历史完成: %d/%d 只成功，远端失败 %d 只，总耗时 %.2fs",
+            len(result),
+            len(target),
+            len(failures),
+            time.monotonic() - started_at,
+        )
         return result
 
-    def get_index_history(self, index_code="sh000300", days=120, start_date=None, end_date=None):
+    def get_index_history(
+        self, index_code="sh000300", days=120, start_date=None, end_date=None
+    ):
         """获取指数历史日线(用于大盘择时)。
 
         指数代码(如 ``sh000300``)不是 A 股个股,不能走个股归一化路径,
@@ -1164,8 +1502,30 @@ class AKDataLoader:
         if not rows:
             return None
 
-        df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"])
-        for col in ["open", "high", "low", "close", "volume", "amount", "preclose", "pctChg"]:
+        df = pd.DataFrame(
+            rows,
+            columns=[
+                "date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "amount",
+                "preclose",
+                "pctChg",
+            ],
+        )
+        for col in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "preclose",
+            "pctChg",
+        ]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         if len(df) == 0 or df["close"].iloc[-1] <= 0:
             return None
@@ -1223,7 +1583,10 @@ class AKDataLoader:
                     delay = (attempt + 1) * 2
                     logger.warning(
                         "AKShare ETF %s 网络错误，%ds后重试(%d/3): %s",
-                        code, delay, attempt + 2, exc,
+                        code,
+                        delay,
+                        attempt + 2,
+                        exc,
                     )
                     time.sleep(delay)
                     continue
@@ -1266,7 +1629,9 @@ class AKDataLoader:
         workers = min(4, max(1, len(target_codes)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
-                executor.submit(self.get_etf_history, code, days, None, None, adjust): code
+                executor.submit(
+                    self.get_etf_history, code, days, None, None, adjust
+                ): code
                 for code in target_codes
             }
             for future in as_completed(future_map):
@@ -1338,16 +1703,23 @@ class AKDataLoader:
                     delay = (attempt + 1) * 2
                     logger.warning(
                         "AKShare 行业指数 %s 网络错误，%ds后重试(%d/3): %s",
-                        name, delay, attempt + 2, exc,
+                        name,
+                        delay,
+                        attempt + 2,
+                        exc,
                     )
                     time.sleep(delay)
                     continue
-                logger.warning("AKShare 行业指数历史行情获取失败 %s(%s): %s", name, provider, exc)
+                logger.warning(
+                    "AKShare 行业指数历史行情获取失败 %s(%s): %s", name, provider, exc
+                )
                 # AKShare 失败，fallback 到腾讯
                 logger.info("行业指数 %s 尝试腾讯 fallback", name)
                 df = _fetch_industry_history_tencent(name, datalen=days)
                 if df is not None and not df.empty:
-                    logger.info("行业指数 %s 腾讯 fallback 成功，%d 条数据", name, len(df))
+                    logger.info(
+                        "行业指数 %s 腾讯 fallback 成功，%d 条数据", name, len(df)
+                    )
                     self._write_cache(cache_key, df)
                     return df
                 return None
@@ -1439,26 +1811,23 @@ class AKDataLoader:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                klines = (
-                    data.get("data", {})
-                    .get(tencent_code, {})
-                    .get("day", [])
-                    or data.get("data", {})
-                    .get(tencent_code, {})
-                    .get("qfqday", [])
-                )
+                klines = data.get("data", {}).get(tencent_code, {}).get(
+                    "day", []
+                ) or data.get("data", {}).get(tencent_code, {}).get("qfqday", [])
                 if not klines:
                     continue
                 rows = []
                 for k in klines:
-                    rows.append({
-                        "date": str(k[0]),
-                        "open": float(k[1]),
-                        "close": float(k[2]),
-                        "high": float(k[3]),
-                        "low": float(k[4]),
-                        "volume": float(k[5]) if len(k) > 5 else 0,
-                    })
+                    rows.append(
+                        {
+                            "date": str(k[0]),
+                            "open": float(k[1]),
+                            "close": float(k[2]),
+                            "high": float(k[3]),
+                            "low": float(k[4]),
+                            "volume": float(k[5]) if len(k) > 5 else 0,
+                        }
+                    )
                 df = pd.DataFrame(rows)
                 if not df.empty:
                     result[name] = df

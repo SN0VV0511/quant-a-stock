@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Mapping, cast
 
@@ -25,7 +25,7 @@ from config.settings import (
 )
 from config.time_utils import format_local, now_local, today_yyyymmdd
 from rules.engine import TradingRules
-from trading.instruments import get_instrument_profile
+from trading.instruments import get_instrument_profile, normalized_security_code
 from trading.models import (
     ExecutionReport,
     OrderIntent,
@@ -35,7 +35,7 @@ from trading.models import (
     TargetPosition,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class LeaseUnavailableError(RuntimeError):
@@ -65,6 +65,15 @@ class LedgerReview:
     end_date: str
     snapshots: tuple[dict[str, Any], ...]
     trades: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ClaimedSignal:
+    """一次已原子领取的目标执行尝试。"""
+
+    signal_id: str
+    target: TargetPortfolio
+    attempt_count: int
 
 
 class PaperLedger:
@@ -120,6 +129,7 @@ class PaperLedger:
             connection.execute("PRAGMA busy_timeout = 10000")
             self._connection = connection
             self._initialize_schema()
+            self.require_integrity()
 
     def close(self) -> None:
         """关闭数据库连接。"""
@@ -133,6 +143,39 @@ class PaperLedger:
         if self._connection is None:
             raise RuntimeError("paper_v2 账本尚未连接")
         return self._connection
+
+    def require_integrity(self) -> None:
+        """执行 SQLite 快速一致性检查，损坏账本拒绝继续交易。"""
+        connection = self._require_connection()
+        rows = connection.execute("PRAGMA quick_check").fetchall()
+        messages = [str(row[0]) for row in rows]
+        if messages != ["ok"]:
+            raise RuntimeError(f"paper_v2 账本一致性检查失败: {messages}")
+
+    def backup_to(self, destination: str | Path) -> Path:
+        """使用 SQLite 在线备份 API 原子生成可恢复账本副本。"""
+        target = Path(destination).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with self._lock:
+                source = self._require_connection()
+                backup = sqlite3.connect(temporary)
+                try:
+                    source.backup(backup)
+                    check = [
+                        str(row[0]) for row in backup.execute("PRAGMA quick_check")
+                    ]
+                    if check != ["ok"]:
+                        raise RuntimeError(f"账本备份一致性检查失败: {check}")
+                    backup.commit()
+                finally:
+                    backup.close()
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        temporary.replace(target)
+        return target
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -196,6 +239,12 @@ class PaperLedger:
                 target_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 executed_at TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                next_retry_at TEXT,
+                execution_date TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
                 UNIQUE(account_id, strategy_version, signal_date)
             );
 
@@ -304,7 +353,20 @@ class PaperLedger:
             );
             CREATE INDEX IF NOT EXISTS idx_nav_account_date
                 ON nav_snapshots(account_id, snapshot_date);
+
+            CREATE TABLE IF NOT EXISTS daily_jobs (
+                account_id TEXT NOT NULL REFERENCES accounts(account_id),
+                job_name TEXT NOT NULL,
+                job_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                completed_at TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(account_id, job_name, job_date)
+            );
             """)
+        self._migrate_schema()
         now = format_local()
         with self._transaction() as transaction:
             transaction.execute(
@@ -318,6 +380,37 @@ class PaperLedger:
                 """,
                 (self.account_id, self.initial_cash, self.initial_cash, now, now),
             )
+
+    def _migrate_schema(self) -> None:
+        """以幂等方式升级旧账本，保留已有账户、持仓和成交。"""
+        connection = self._require_connection()
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(signals)").fetchall()
+        }
+        additions = {
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_attempt_at": "TEXT",
+            "next_retry_at": "TEXT",
+            "execution_date": "TEXT",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE signals ADD COLUMN {name} {definition}"
+                )
+        connection.execute(
+            """
+            UPDATE signals
+            SET status = CASE WHEN executed_at IS NULL THEN 'pending' ELSE 'completed' END
+            WHERE status IS NULL OR status = ''
+            """
+        )
+        connection.execute(
+            "UPDATE signals SET status = 'completed' WHERE executed_at IS NOT NULL"
+        )
 
     def start_run(
         self,
@@ -341,6 +434,26 @@ class PaperLedger:
                 WHERE account_id = ? AND status = 'running'
                 """,
                 (started_at, self.account_id),
+            )
+            connection.execute(
+                """
+                UPDATE signals
+                SET status = 'retryable', next_retry_at = ?,
+                    last_error = CASE
+                        WHEN last_error = '' THEN '上次执行进程中断，已自动恢复重试'
+                        ELSE last_error
+                    END
+                WHERE account_id = ? AND status = 'executing' AND executed_at IS NULL
+                """,
+                (started_at, self.account_id),
+            )
+            connection.execute(
+                """
+                UPDATE daily_jobs
+                SET status = 'failed', last_error = '上次运行中断，允许重新执行'
+                WHERE account_id = ? AND status = 'running'
+                """,
+                (self.account_id,),
             )
             connection.execute(
                 """
@@ -473,6 +586,70 @@ class PaperLedger:
             )
             return cursor.rowcount == 1
 
+    def claim_daily_job(self, job_name: str, job_date: str) -> bool:
+        """原子领取每日幂等任务；已完成任务不会重复执行。"""
+        if not job_name.strip():
+            raise ValueError("每日任务名称不能为空")
+        if len(job_date) != 8 or not job_date.isdigit():
+            raise ValueError(f"每日任务日期无效: {job_date}")
+        started_at = format_local()
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT status FROM daily_jobs
+                WHERE account_id = ? AND job_name = ? AND job_date = ?
+                """,
+                (self.account_id, job_name, job_date),
+            ).fetchone()
+            if row is not None and row["status"] in {"running", "completed"}:
+                return False
+            connection.execute(
+                """
+                INSERT INTO daily_jobs(
+                    account_id, job_name, job_date, status, attempt_count,
+                    started_at, completed_at, last_error
+                ) VALUES (?, ?, ?, 'running', 1, ?, NULL, '')
+                ON CONFLICT(account_id, job_name, job_date) DO UPDATE SET
+                    status = 'running',
+                    attempt_count = daily_jobs.attempt_count + 1,
+                    started_at = excluded.started_at,
+                    completed_at = NULL,
+                    last_error = ''
+                """,
+                (self.account_id, job_name, job_date, started_at),
+            )
+            return True
+
+    def finish_daily_job(
+        self,
+        job_name: str,
+        job_date: str,
+        *,
+        error: str = "",
+    ) -> None:
+        """完成或释放每日任务；失败任务允许下一轮重试。"""
+        status = "failed" if error else "completed"
+        completed_at = None if error else format_local()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE daily_jobs
+                SET status = ?, completed_at = ?, last_error = ?
+                WHERE account_id = ? AND job_name = ? AND job_date = ?
+                  AND status = 'running'
+                """,
+                (
+                    status,
+                    completed_at,
+                    error,
+                    self.account_id,
+                    job_name,
+                    job_date,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"每日任务不在运行状态: {job_name}/{job_date}")
+
     def record_signal(self, target: TargetPortfolio, run_id: str | None = None) -> str:
         """幂等记录收盘目标组合；同日不同目标直接失败。"""
         if target.account_id != self.account_id:
@@ -551,7 +728,7 @@ class PaperLedger:
         row = connection.execute(
             f"""
             SELECT snapshot_hash FROM signals
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY signal_date DESC LIMIT 1
             """,
             params,
@@ -567,45 +744,184 @@ class PaperLedger:
         )
         return TargetPortfolio(positions=positions, **data)
 
-    def pending_target(self, execution_date: str) -> tuple[str, TargetPortfolio] | None:
-        """返回可在指定日期执行的最新未执行目标组合。"""
+    def pending_target(
+        self,
+        execution_date: str,
+        *,
+        signal_date: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[str, TargetPortfolio] | None:
+        """只读查询当前可领取的目标组合。"""
         connection = self._require_connection()
+        current_text = (now or now_local()).strftime("%Y-%m-%d %H:%M:%S")
+        clauses = [
+            "account_id = ?",
+            "signal_date < ?",
+            "executed_at IS NULL",
+            "status IN ('pending', 'retryable')",
+            "(next_retry_at IS NULL OR next_retry_at <= ?)",
+        ]
+        params: list[Any] = [self.account_id, execution_date, current_text]
+        if signal_date is not None:
+            clauses.append("signal_date = ?")
+            params.append(signal_date)
         row = connection.execute(
-            """
+            f"""
             SELECT signal_id, target_json FROM signals
-            WHERE account_id = ? AND signal_date < ? AND executed_at IS NULL
+            WHERE {" AND ".join(clauses)}
             ORDER BY signal_date DESC LIMIT 1
             """,
-            (self.account_id, execution_date),
+            params,
         ).fetchone()
         if row is None:
             return None
         return str(row["signal_id"]), self._target_from_json(str(row["target_json"]))
 
-    def mark_signal_executed(self, signal_id: str) -> None:
-        """标记目标组合及其更旧未执行目标均已处理，防止跨日追旧单。"""
+    def claim_pending_target(
+        self,
+        execution_date: str,
+        *,
+        signal_date: str,
+        now: datetime | None = None,
+    ) -> ClaimedSignal | None:
+        """原子领取严格指定信号日的目标，防止两个实例重复执行。"""
+        current = now or now_local()
+        current_text = current.strftime("%Y-%m-%d %H:%M:%S")
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT signal_id, target_json, attempt_count FROM signals
+                WHERE account_id = ? AND signal_date = ? AND signal_date < ?
+                  AND executed_at IS NULL
+                  AND status IN ('pending', 'retryable')
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                LIMIT 1
+                """,
+                (self.account_id, signal_date, execution_date, current_text),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                """
+                UPDATE signals
+                SET status = 'executing', attempt_count = attempt_count + 1,
+                    last_attempt_at = ?, execution_date = ?, last_error = ''
+                WHERE signal_id = ? AND status IN ('pending', 'retryable')
+                """,
+                (current_text, execution_date, row["signal_id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            attempt_count = int(row["attempt_count"] or 0) + 1
+            return ClaimedSignal(
+                signal_id=str(row["signal_id"]),
+                target=self._target_from_json(str(row["target_json"])),
+                attempt_count=attempt_count,
+            )
+
+    def expire_pending_targets_before(
+        self,
+        signal_date: str,
+        *,
+        strategy_version: str,
+    ) -> int:
+        """把错过下一交易日执行窗口的旧目标标记为过期。"""
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE signals
+                SET status = 'expired', executed_at = ?,
+                    last_error = '已错过下一交易日执行窗口'
+                WHERE account_id = ? AND strategy_version = ?
+                  AND signal_date < ? AND executed_at IS NULL
+                  AND status IN ('pending', 'retryable', 'executing')
+                """,
+                (format_local(), self.account_id, strategy_version, signal_date),
+            )
+            return max(cursor.rowcount, 0)
+
+    def mark_signal_retryable(
+        self,
+        signal_id: str,
+        reason: str,
+        *,
+        retry_after_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> None:
+        """记录可恢复失败并安排当前交易日下一次尝试。"""
+        if retry_after_seconds <= 0:
+            raise ValueError("重试间隔必须大于 0")
+        current = now or now_local()
+        retry_at = (current + timedelta(seconds=retry_after_seconds)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE signals
+                SET status = 'retryable', next_retry_at = ?, last_error = ?
+                WHERE signal_id = ? AND account_id = ? AND executed_at IS NULL
+                  AND status = 'executing'
+                """,
+                (retry_at, reason, signal_id, self.account_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"信号不在可重试执行状态: {signal_id}")
+
+    def mark_signal_completed(self, signal_id: str, reason: str = "") -> None:
+        """完成当前目标，并把同策略更旧的未处理目标标记为已取代。"""
         with self._transaction() as connection:
             signal = connection.execute(
-                "SELECT signal_date, strategy_version FROM signals WHERE signal_id = ? AND account_id = ?",
+                """
+                SELECT signal_date, strategy_version FROM signals
+                WHERE signal_id = ? AND account_id = ?
+                """,
                 (signal_id, self.account_id),
             ).fetchone()
             if signal is None:
                 raise ValueError(f"不存在信号: {signal_id}")
+            completed_at = format_local()
             cursor = connection.execute(
                 """
-                UPDATE signals SET executed_at = ?
+                UPDATE signals
+                SET executed_at = ?, status = 'completed', next_retry_at = NULL,
+                    last_error = ?
+                WHERE signal_id = ? AND account_id = ? AND executed_at IS NULL
+                """,
+                (completed_at, reason, signal_id, self.account_id),
+            )
+            if cursor.rowcount not in {0, 1}:
+                raise RuntimeError(f"信号状态更新异常: {signal_id}")
+            connection.execute(
+                """
+                UPDATE signals
+                SET executed_at = ?, status = 'superseded',
+                    last_error = '已被更新目标取代'
                 WHERE account_id = ? AND strategy_version = ?
-                  AND signal_date <= ? AND executed_at IS NULL
+                  AND signal_date < ? AND executed_at IS NULL
                 """,
                 (
-                    format_local(),
+                    completed_at,
                     self.account_id,
                     signal["strategy_version"],
                     signal["signal_date"],
                 ),
             )
-            if cursor.rowcount < 0:
-                raise RuntimeError(f"信号状态更新异常: {signal_id}")
+
+    def mark_signal_executed(self, signal_id: str) -> None:
+        """兼容旧调用：把目标标记为完成。"""
+        self.mark_signal_completed(signal_id)
+
+    def query_signal_state(self, signal_id: str) -> dict[str, Any]:
+        """读取单个信号的执行状态与重试审计字段。"""
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM signals WHERE signal_id = ? AND account_id = ?",
+            (signal_id, self.account_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"不存在信号: {signal_id}")
+        return dict(row)
 
     def query_cash(self) -> float:
         """查询可用现金。"""
@@ -811,6 +1127,14 @@ class PaperLedger:
                         order_id,
                         "灾难止损监控只能提交卖单",
                     )
+                market_error = self._validate_execution_context(order)
+                if market_error:
+                    return self._reject(
+                        connection,
+                        order,
+                        order_id,
+                        market_error,
+                    )
             if order.price <= 0 or order.shares <= 0:
                 return self._reject(
                     connection, order, order_id, "委托价格和数量必须大于 0"
@@ -837,6 +1161,33 @@ class PaperLedger:
                 return self._execute_buy(connection, order, order_id, trade_date)
             return self._execute_sell(connection, order, order_id, trade_date)
 
+    @staticmethod
+    def _validate_execution_context(order: OrderIntent) -> str:
+        """在账本边界复核运行器附带的实时行情证据。"""
+        if not bool(order.metadata.get("data_health_checked", False)):
+            return "robust_v2 订单缺少行情健康校验证据"
+        raw_context = order.metadata.get("execution_quote")
+        if not isinstance(raw_context, dict):
+            return "robust_v2 订单缺少结构化执行行情"
+        try:
+            current_price = float(raw_context.get("current_price", 0) or 0)
+            trade_date = str(raw_context.get("trade_date") or "")
+        except (TypeError, ValueError):
+            return "robust_v2 执行行情格式无效"
+        if current_price <= 0 or abs(current_price - order.price) > 1e-6:
+            return "委托价格与已校验实时行情不一致"
+        if trade_date != str(order.date or ""):
+            return "执行行情日期与委托日期不一致"
+        if bool(raw_context.get("is_suspended", False)):
+            return "标的当前停牌，不可成交"
+        if order.action == "buy" and not bool(raw_context.get("can_buy", False)):
+            return f"标的当前{raw_context.get('limit_type', '涨停')}，不可买入"
+        if order.action == "sell" and not bool(raw_context.get("can_sell", False)):
+            return f"标的当前{raw_context.get('limit_type', '跌停')}，不可卖出"
+        if not str(raw_context.get("quote_time") or "").strip():
+            return "执行行情缺少交易所时间戳"
+        return ""
+
     def _execute_buy(
         self,
         connection: sqlite3.Connection,
@@ -848,6 +1199,7 @@ class PaperLedger:
         amount = order.price * order.shares
         costs = self.rules.calc_total_cost(amount, "buy", code=order.code)
         debit = amount + float(costs["total"])
+        lot_cost_per_share = debit / order.shares
         account = connection.execute(
             "SELECT cash FROM accounts WHERE account_id = ?",
             (self.account_id,),
@@ -856,7 +1208,7 @@ class PaperLedger:
         if debit > cash + 1e-9:
             return self._reject(connection, order, order_id, "可用现金不足")
 
-        actual_price = debit / order.shares
+        actual_price = float(costs["actual_amount"]) / order.shares
         existing = connection.execute(
             "SELECT shares, avg_cost FROM positions WHERE account_id = ? AND code = ?",
             (self.account_id, order.code),
@@ -906,7 +1258,7 @@ class PaperLedger:
                 trade_date,
                 order.shares,
                 order.shares,
-                round(actual_price, 8),
+                round(lot_cost_per_share, 8),
                 now,
             ),
         )
@@ -988,7 +1340,7 @@ class PaperLedger:
         amount = order.price * shares
         costs = self.rules.calc_total_cost(amount, "sell", code=order.code)
         proceeds = amount - float(costs["total"])
-        actual_price = proceeds / shares
+        actual_price = float(costs["actual_amount"]) / shares
         gross_pnl = amount - cost_basis
         net_pnl = proceeds - cost_basis
         account = connection.execute(
@@ -1156,11 +1508,20 @@ class PaperLedger:
         """按最新价格计算账户快照，不修改账本。"""
         positions = self.query_positions()
         current_prices = prices or {}
+        normalized_prices: dict[str, float] = {}
+        for price_code, price_value in current_prices.items():
+            try:
+                normalized_prices[normalized_security_code(price_code)] = float(
+                    price_value
+                )
+            except (TypeError, ValueError):
+                continue
         items: list[dict[str, Any]] = []
         market_value = 0.0
         for code, position in positions.items():
+            raw_code = normalized_security_code(code)
             price = float(
-                current_prices.get(code, position["current_price"])
+                normalized_prices.get(raw_code, position["current_price"])
                 or position["current_price"]
             )
             value = price * int(position["shares"])
@@ -1209,6 +1570,20 @@ class PaperLedger:
             source="paper_v2",
         )
 
+    def latest_nav_before(self, snapshot_date: str) -> dict[str, Any] | None:
+        """查询目标日期之前最近一个账户净值点。"""
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT * FROM nav_snapshots
+            WHERE account_id = ? AND snapshot_date < ?
+            ORDER BY snapshot_date DESC, captured_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (self.account_id, snapshot_date),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def record_snapshot(
         self,
         prices: Mapping[str, float] | None,
@@ -1230,9 +1605,9 @@ class PaperLedger:
                    COALESCE(SUM(stamp_tax), 0) AS stamp_tax,
                    COALESCE(SUM(slippage), 0) AS slippage,
                    COALESCE(SUM(amount), 0) AS turnover
-            FROM trades WHERE account_id = ? AND (? = '' OR run_id = ?)
+            FROM trades WHERE account_id = ?
             """,
-            (self.account_id, effective_run_id, effective_run_id),
+            (self.account_id,),
         ).fetchone()
         total_cost = float(totals["costs"] if totals is not None else 0.0)
         net_pnl = snapshot.total_value - self.initial_cash
@@ -1240,6 +1615,12 @@ class PaperLedger:
         market_value = snapshot.total_value - snapshot.cash
         captured_at = format_local()
         with self._transaction() as transaction:
+            # 账户净值是一条连续时间序列，容器重启产生的新 run_id 不能让同一天
+            # 出现多个净值点；run_id 仅保留为该日最后写入者的审计字段。
+            transaction.execute(
+                "DELETE FROM nav_snapshots WHERE account_id = ? AND snapshot_date = ?",
+                (self.account_id, snapshot_date),
+            )
             transaction.execute(
                 """
                 INSERT INTO nav_snapshots(
@@ -1302,15 +1683,28 @@ class PaperLedger:
             params.append(run_id)
         connection = self._require_connection()
         rows = connection.execute(
-            f"SELECT * FROM nav_snapshots WHERE {' AND '.join(clauses)} ORDER BY snapshot_date",
+            f"""
+            SELECT * FROM nav_snapshots
+            WHERE {" AND ".join(clauses)}
+            ORDER BY snapshot_date, captured_at, rowid
+            """,
             params,
         ).fetchall()
+        snapshots: list[dict[str, Any]]
+        if run_id is None:
+            # 兼容迁移前按 run_id 写出的重复日期，仅保留当天最后一条。
+            latest_by_date: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                latest_by_date[str(row["snapshot_date"])] = dict(row)
+            snapshots = [latest_by_date[key] for key in sorted(latest_by_date)]
+        else:
+            snapshots = [dict(row) for row in rows]
         return LedgerReview(
             account_id=self.account_id,
             run_id=run_id,
             start_date=start_date,
             end_date=end_date,
-            snapshots=tuple(dict(row) for row in rows),
+            snapshots=tuple(snapshots),
             trades=tuple(self.query_trades(start_date, end_date, run_id)),
         )
 

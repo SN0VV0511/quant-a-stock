@@ -33,6 +33,16 @@ from trading.ledger import PaperLedger
 class BrokerAdapter(ABC):
     """交易通道抽象接口。"""
 
+    @property
+    @abstractmethod
+    def broker_name(self) -> str:
+        """返回稳定的交易通道名称。"""
+
+    @property
+    @abstractmethod
+    def is_live(self) -> bool:
+        """是否会向真实券商发送委托。"""
+
     @abstractmethod
     def connect(self) -> None:
         """连接交易通道。"""
@@ -44,6 +54,13 @@ class BrokerAdapter(ABC):
     @abstractmethod
     def query_positions(self) -> dict[str, dict[str, Any]]:
         """查询持仓。"""
+
+    @abstractmethod
+    def query_snapshot(
+        self,
+        current_prices: dict[str, float] | None = None,
+    ) -> PortfolioSnapshot:
+        """查询统一账户快照。"""
 
     @abstractmethod
     def place_order(self, order: OrderIntent) -> ExecutionReport:
@@ -84,6 +101,16 @@ class PaperBrokerAdapter(BrokerAdapter):
     def connect(self) -> None:
         """连接虚拟盘。"""
         self._connected = True
+
+    @property
+    def broker_name(self) -> str:
+        """返回旧 JSON 虚拟盘通道名称。"""
+        return "paper_json"
+
+    @property
+    def is_live(self) -> bool:
+        """JSON 虚拟盘不会发送真实委托。"""
+        return False
 
     def query_cash(self) -> float:
         """查询虚拟盘现金。"""
@@ -231,6 +258,16 @@ class SQLitePaperBrokerAdapter(BrokerAdapter):
         self.ledger.connect()
         self._connected = True
 
+    @property
+    def broker_name(self) -> str:
+        """返回生产虚拟盘通道名称。"""
+        return "paper_v2"
+
+    @property
+    def is_live(self) -> bool:
+        """SQLite 虚拟盘不会发送真实委托。"""
+        return False
+
     def _ensure_connected(self) -> None:
         """确保 Broker 已连接。"""
         if not self._connected:
@@ -305,6 +342,16 @@ class QmtBrokerAdapter(BrokerAdapter):
             )
         self._connected = True
 
+    @property
+    def broker_name(self) -> str:
+        """返回 QMT 通道名称。"""
+        return "qmt"
+
+    @property
+    def is_live(self) -> bool:
+        """返回当前实例是否配置为真实委托模式。"""
+        return self.live_enabled
+
     def query_cash(self) -> float:
         """dry-run 模式不读取真实资金。"""
         self._ensure_connected()
@@ -314,6 +361,22 @@ class QmtBrokerAdapter(BrokerAdapter):
         """dry-run 模式不读取真实持仓。"""
         self._ensure_connected()
         return {}
+
+    def query_snapshot(
+        self,
+        current_prices: dict[str, float] | None = None,
+    ) -> PortfolioSnapshot:
+        """dry-run 返回空账户；真实模式接入时由 QMT 查询结果填充。"""
+        del current_prices
+        self._ensure_connected()
+        return PortfolioSnapshot(
+            cash=0.0,
+            total_value=0.0,
+            position_ratio=0.0,
+            position_count=0,
+            positions=[],
+            source="qmt_dry_run",
+        )
 
     def place_order(self, order: OrderIntent) -> ExecutionReport:
         """记录 dry-run 委托，不发送真实订单。"""

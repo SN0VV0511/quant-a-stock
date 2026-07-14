@@ -48,7 +48,7 @@ AKShare 只是 Python 数据接口库，不是股票标的。本项目当前交�
 cd /Users/xueds/Python/quant-a-stock
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
@@ -66,7 +66,7 @@ OpenClaw 里常用的 Agent 指令可以直接写成：
 ```
 
 ```text
-读取 reports/2026-05-29_full.txt 和 logs/live_today.log，按时间线总结风控拒绝、成交和异常。
+读取 reports/daily_v2_YYYYMMDD.txt 和 logs/robust_v2.log，按时间线总结风控拒绝、成交和异常。
 ```
 
 ```text
@@ -77,7 +77,7 @@ OpenClaw 里常用的 Agent 指令可以直接写成：
 
 - 观察期默认使用 `BROKER_MODE=paper_v2`，不要在 OpenClaw 中直接开启真实交易。
 - `.env`、`logs/`、缓存和事件流水属于本地运行环境，不应提交。
-- `data/portfolio_state.json` 和 `data/trade_log.json` 当前是虚拟盘状态文件，拉取代码或切换分支前先执行 `git status`，避免覆盖正在观察的持仓状态。
+- `data/paper_v2.db` 是当前唯一虚拟盘账户；拉取代码或切换分支不会覆盖运行卷，但操作前仍应执行 `git status` 并确认守护进程状态。
 
 ## 快速回测
 
@@ -93,18 +93,21 @@ python main.py 000858 20230101 20240101
 - 图表文件：净值曲线、回撤图、K 线图。
 - CSV 结果：交易明细和回测序列。
 
-仪表盘的“策略回测对比”会读取 `reports/backtest_latest.json`。部署后如果该文件缺失或超过
-`BACKTEST_AUTO_MAX_AGE_HOURS`，Web 服务会自动在后台触发 `scripts.strategy_ab` 生成；观察期
-守护脚本收盘后也会同步刷新一次。需要手动强制刷新时再执行：
+仪表盘的“策略回测对比”只展示 `robust_v2` 的版本化历史股票池滚动样本外结果。
+部署后如果 `reports/backtest_latest.json` 缺失或过期，Web 会调用
+`scripts.robust_walk_forward`；历史股票池不足约三年时明确报错，不再展示旧策略或用
+当前股票池回填历史。手动刷新命令：
 
 ```bash
-python -m scripts.strategy_ab 120
+python -m scripts.robust_walk_forward \
+  --data-root data/robust_research \
+  --output reports/backtest_latest.json
 ```
 
 可通过环境变量调整自动回测：
 
 - `BACKTEST_AUTO_GENERATE=false`：关闭自动生成。
-- `BACKTEST_AUTO_UNIVERSE_SIZE=120`：自动回测抽样股票数。
+- `BACKTEST_AUTO_UNIVERSE_SIZE=120`：旧兼容参数，`robust_v2` 不做当前股票池抽样。
 - `BACKTEST_AUTO_MAX_AGE_HOURS=168`：回测结果最大缓存时间。
 
 ## robust_v2 虚拟盘运行
@@ -128,22 +131,42 @@ python robust_runner.py daemon
 第二个实例会直接拒绝启动，不再使用跨目录 `pkill`。Docker 入口已经切换为
 `robust_runner.py daemon`。
 
+也可以直接使用生产化容器编排；它会先初始化单账本，再启动守护进程和只读面板：
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose ps
+docker compose logs -f paper-live
+```
+
+容器以非 root 用户运行，代码目录只读，`data/logs/reports` 使用独立持久卷；面板默认
+只绑定 `127.0.0.1:8888`。如通过 HTTPS 反向代理公开访问，请设置
+`DASHBOARD_COOKIE_SECURE=true`。
+
 运行时序固定如下：
 
-1. 每周最后一个交易日收盘后，用 T 日复权数据生成 `TargetPortfolio`，不下单。
+1. 每个交易日 15:05 后更新一次只读个股候选观察；每周最后一个交易日才用 T 日复权数据生成正式 `TargetPortfolio`，不在收盘直接下单。
 2. T+1 日 09:35 后，统一分配器把目标权重转换为整手订单并保留目标现金。
 3. 盘中每 60 秒只检查行情健康和 7% 股票/10% ETF 灾难止损。
 4. 普通退出必须由收盘目标确认；旧 `COMBO_DEFENSIVE_EXIT`、追涨和盘中补仓不接入账户。
 5. 前收盘偏差超过 2%、缺少上一交易日或数据陈旧时，该标的停止交易。
+6. 暂时性行情、停牌、涨跌停或委托失败不会吃掉信号，当日按状态机继续重试；跨日旧
+   信号自动失效，避免追单。
 
 常用的单步诊断命令：
 
 ```bash
 python robust_runner.py status
+python robust_runner.py preview-scan
 python robust_runner.py signal --date 20260710 --force
 python robust_runner.py execute --date 20260713
 python robust_runner.py report --date 20260713
 ```
+
+`preview-scan` 自动使用最近一个已完成收盘的交易日，只更新 `data/scans/` 和
+`data/universe/` 审计文件，不写 `signals`、订单或持仓；它也是面板“安全预览扫描”
+按钮调用的命令。`signal --force` 会生成正式待执行信号，不能用于只读预览。
 
 旧入口默认拒绝写账户。只有复现研究基线时，才可临时设置
 `ENABLE_LEGACY_ACCOUNT_WRITERS=true`；不要与 `paper_v2` 守护实例同时部署。
@@ -179,9 +202,14 @@ python web/app.py 8888
 http://127.0.0.1:8888
 ```
 
+“候选股雷达”直接读取结构化扫描快照，展示主板总量、粗筛数量、完整历史数量、
+合格候选和主要淘汰原因；“系统状态”使用 `paper_v2` SQLite 写租约作为跨容器
+守护心跳，不再依赖旧扫描线程日志。
+
 仪表盘接口：
 
 - `/`：页面入口。
+- `/healthz`：无需登录的容器存活探针，不返回账户数据。
 - `/api/status`：账户、持仓、交易和日志摘要。
 - `/api/observation`：后台服务、健康检查、30 日复盘、QMT dry-run 验收和最新日志。
 
@@ -236,8 +264,8 @@ tail -n 120 logs/robust_v2.log
 收盘后执行严格检查：
 
 ```bash
-python scripts/monthly_review.py --start 20260710 --end 20260810 --run-id RUN_ID --json
-python scripts/paper_v2_acceptance.py --start 20260710 --end 20260810 --run-id RUN_ID
+python scripts/monthly_review.py --start 20260710 --end 20260810 --json
+python scripts/paper_v2_acceptance.py --start 20260710 --end 20260810
 ```
 
 健康检查关注点：
@@ -254,7 +282,7 @@ python scripts/paper_v2_acceptance.py --start 20260710 --end 20260810 --run-id R
 - 连续运行 20 个以上交易日。
 - `paper_v2_acceptance.py` 20 日运维门槛全部通过。
 - 再完成至少 60 个交易日绩效观察，并比较净收益、Calmar、换手和成本。
-- `monthly_review.py` 必须指定起止日期；区间包含多个批次时必须指定 `run_id`。
+- `monthly_review.py` 必须指定起止日期；容器重启产生的多个运行批次仍按同一账户连续复盘。
 - 未完成复盘前不切换真实资金。
 
 ## 配置说明
@@ -289,6 +317,7 @@ MIN_STOCK_ORDER_AMOUNT=8000
 MIN_ETF_ORDER_AMOUNT=5000
 QMT_ACCOUNT_ID=
 QMT_CLIENT_PATH=
+DASHBOARD_COOKIE_SECURE=false
 ```
 
 安全默认值：
@@ -311,6 +340,8 @@ data/ak_loader.py               AKShare / 腾讯 / BaoStock 数据加载
 data/bs_worker.py               BaoStock 子进程隔离
 risk/control.py                 风控模块
 trading/ledger.py               SQLite 单账本、T+1、幂等和租约
+trading/market.py               交易时段、行情时效、停牌与涨跌停执行校验
+trading/schedule.py             回测和实时共用调仓日程
 trading/allocator.py            唯一目标组合订单分配器
 rules/position.py               旧 JSON 持仓基线
 rules/engine.py                 A 股交易规则
@@ -327,7 +358,9 @@ tests/                          单元测试和集成测试
 ```text
 data/paper_v2.db                V2 唯一账户账本
 data/universe/                  每交易日股票池和财务字段版本
-data/backups/paper_v2_*/        旧 JSON/日志只读归档
+data/scans/                     个股扫描候选、过滤统计和最新快照
+data/backups/paper_v2/          每日 SQLite 在线备份
+data/backups/paper_v2_*/        首次启用时复制的旧 JSON/日志只读归档
 logs/robust_v2.log              V2 轮转运行日志
 reports/daily_v2_YYYYMMDD.txt   含毛/净收益、成本、换手和版本的日报
 ```
@@ -355,12 +388,20 @@ reports/daily_v2_YYYYMMDD.txt   含毛/净收益、成本、换手和版本的�
 
 ## QMT / miniQMT 接入状态
 
-当前版本只实现 QMT dry-run 适配器，不会发送真实委托。`QmtBrokerAdapter` 用于统一接口和字段映射验证，不用于实盘。
+策略、数据校验、调度、风控、`OrderIntent` 和账户审计已经与交易通道解耦；当前运行使用
+`SQLitePaperBrokerAdapter`，不会发送真实委托。`QmtBrokerAdapter` 目前只做 dry-run 接口
+边界验证，真实连接仍被硬阻断。
+
+虚拟盘已经模拟实盘能在本地可靠复现的约束：官方交易日、连续竞价时段、当日行情时间
+戳、停牌、涨跌停、整手、T+1、费用、滑点、资金/仓位、信号重试、幂等和每日对账。
+交易所排队、网络延迟、真实部分成交和券商拒单只能在 QMT 联调后由真实回报确认，不能
+用本地模型伪装成完全一致。
 
 接入真实 QMT 前必须完成：
 
 - 资金、持仓、委托、成交回报查询的 dry-run 对齐。
 - QMT 返回字段映射到 `OrderIntent`、`ExecutionReport`、`PortfolioSnapshot`。
+- 对 `submitted/partially_filled/cancelled` 回报进行异步对账，禁止未确认时重复委托。
 - 实盘开关、账户、资金规模、风控阈值和人工确认流程。
 - 至少一个月虚拟盘观察期验收通过。
 
@@ -425,7 +466,7 @@ git commit -m "fix: 降低虚拟盘重复拒单日志"
 git push origin main
 ```
 
-注意：如果虚拟盘正在观察期运行，不建议随意提交或覆盖 `data/portfolio_state.json`、`data/trade_log.json` 等运行态文件。
+注意：如果虚拟盘正在观察期运行，不要覆盖或删除 `data/paper_v2.db` 及其每日备份。
 
 ## 常见问题
 
@@ -446,8 +487,8 @@ A 股股票当日买入不能当日卖出。日志中出现 `T+1 限制（买入
 先看日志和缓存回退情况：
 
 ```bash
-tail -n 120 logs/live_today.log
-python scripts/paper_healthcheck.py --json
+tail -n 120 logs/robust_v2.log
+python scripts/paper_v2_healthcheck.py --ledger data/paper_v2.db --json
 ```
 
 如果是网络、数据源或子进程超时问题，优先保持虚拟盘不真实下单，再检查 `data/ak_loader.py` 和 `data/bs_worker.py` 的错误日志。

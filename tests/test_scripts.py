@@ -17,12 +17,23 @@ from datetime import datetime, timedelta, time as dt_time
 
 def _write_jsonl(path, rows) -> None:
     """写入测试用 JSONL。"""
-    path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
 
 
-def _trace_events(code: str, action: str, date: str, price: float) -> list[dict[str, object]]:
+def _trace_events(
+    code: str, action: str, date: str, price: float
+) -> list[dict[str, object]]:
     """构造可追溯的信号、风控、成交事件。"""
-    order = {"code": code, "action": action, "date": date, "shares": 100, "price": price}
+    order = {
+        "code": code,
+        "action": action,
+        "date": date,
+        "shares": 100,
+        "price": price,
+    }
     return [
         {"event_type": "signal", "timestamp": "2026-05-28 10:00:00", "payload": order},
         {
@@ -47,34 +58,52 @@ def test_paper_healthcheck_passes_valid_state(tmp_path) -> None:
     """健康检查应接受合法虚拟盘状态。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 9000.0,
-        "positions": {
-            "sh601988": {
-                "name": "中国银行",
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 9000.0,
+                "positions": {
+                    "sh601988": {
+                        "name": "中国银行",
+                        "shares": 100,
+                        "avg_cost": 5.0,
+                        "current_price": 5.2,
+                        "buy_date": "20260527",
+                        "strategy": "测试策略",
+                    }
+                },
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        data_dir / "trade_log.json",
+        [
+            {
+                "date": "20260527",
+                "action": "buy",
+                "code": "sh601988",
                 "shares": 100,
-                "avg_cost": 5.0,
-                "current_price": 5.2,
-                "buy_date": "20260527",
-                "strategy": "测试策略",
+                "price": 5.0,
             }
-        },
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    _write_jsonl(data_dir / "trade_log.json", [{
-        "date": "20260527",
-        "action": "buy",
-        "code": "sh601988",
-        "shares": 100,
-        "price": 5.0,
-    }])
-    _write_jsonl(data_dir / "portfolio_snapshots.jsonl", [{
-        "date": "20260528",
-        "timestamp": "2026-05-28 15:00:00",
-        "summary": {"cash": 9000.0, "total_value": 9520.0},
-    }])
+        ],
+    )
+    _write_jsonl(
+        data_dir / "portfolio_snapshots.jsonl",
+        [
+            {
+                "date": "20260528",
+                "timestamp": "2026-05-28 15:00:00",
+                "summary": {"cash": 9000.0, "total_value": 9520.0},
+            }
+        ],
+    )
 
-    result = run_healthcheck(tmp_path, max_snapshot_age_minutes=10_000_000, strict_snapshot=True)
+    result = run_healthcheck(
+        tmp_path, max_snapshot_age_minutes=10_000_000, strict_snapshot=True
+    )
 
     assert result.ok is True
     assert result.metrics["position_count"] == 1
@@ -85,27 +114,38 @@ def test_paper_healthcheck_accepts_etf_position_and_trade(tmp_path) -> None:
     """健康检查应接受观察期 ETF/RPS 持仓和交易流水。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 9000.0,
-        "positions": {
-            "510300": {
-                "name": "沪深300ETF",
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 9000.0,
+                "positions": {
+                    "510300": {
+                        "name": "沪深300ETF",
+                        "shares": 100,
+                        "avg_cost": 4.0,
+                        "current_price": 4.1,
+                        "buy_date": "20260527",
+                        "strategy": "ETF/行业RPS轮动",
+                    }
+                },
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        data_dir / "trade_log.json",
+        [
+            {
+                "date": "20260527",
+                "action": "buy",
+                "code": "510300",
                 "shares": 100,
-                "avg_cost": 4.0,
-                "current_price": 4.1,
-                "buy_date": "20260527",
-                "strategy": "ETF/行业RPS轮动",
+                "price": 4.0,
             }
-        },
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    _write_jsonl(data_dir / "trade_log.json", [{
-        "date": "20260527",
-        "action": "buy",
-        "code": "510300",
-        "shares": 100,
-        "price": 4.0,
-    }])
+        ],
+    )
 
     result = run_healthcheck(tmp_path)
 
@@ -118,11 +158,17 @@ def test_paper_healthcheck_fails_negative_cash(tmp_path) -> None:
     """健康检查应拒绝负现金。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": -1.0,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": -1.0,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     result = run_healthcheck(tmp_path)
 
@@ -134,13 +180,19 @@ def test_paper_healthcheck_rejects_invalid_position_scope(tmp_path) -> None:
     """健康检查应拒绝非 A 股持仓和非整手持仓。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 10000.0,
-        "positions": {
-            "hk00700": {"shares": 50, "avg_cost": 300.0, "current_price": 300.0}
-        },
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 10000.0,
+                "positions": {
+                    "hk00700": {"shares": 50, "avg_cost": 300.0, "current_price": 300.0}
+                },
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     result = run_healthcheck(tmp_path)
 
@@ -153,17 +205,23 @@ def test_paper_healthcheck_fails_total_position_limit(tmp_path) -> None:
     """健康检查应拒绝总仓位超限状态。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 500.0,
-        "positions": {
-            "sh601988": {
-                "shares": 2000,
-                "avg_cost": 5.0,
-                "current_price": 5.0,
-            }
-        },
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 500.0,
+                "positions": {
+                    "sh601988": {
+                        "shares": 2000,
+                        "avg_cost": 5.0,
+                        "current_price": 5.0,
+                    }
+                },
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     result = run_healthcheck(tmp_path)
 
@@ -175,39 +233,59 @@ def test_paper_healthcheck_requires_trace_events_when_strict(tmp_path) -> None:
     """严格事件模式应要求结构化事件流水存在。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 10000.0,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 10000.0,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     result = run_healthcheck(tmp_path, strict_events=True)
 
     assert result.ok is False
-    assert any("trade_events.jsonl" in item or "结构化事件流水为空" in item for item in result.failures)
+    assert any(
+        "trade_events.jsonl" in item or "结构化事件流水为空" in item
+        for item in result.failures
+    )
 
 
 def test_paper_healthcheck_requires_execution_trace(tmp_path) -> None:
     """严格事件模式应验证成交事件能追溯到信号和风控通过。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 10000.0,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    _write_jsonl(data_dir / "trade_events.jsonl", [{
-        "event_type": "execution",
-        "timestamp": "2026-05-28 10:00:00",
-        "payload": {
-            "status": "filled",
-            "code": "sh601988",
-            "action": "buy",
-            "date": "20260528",
-            "shares": 100,
-            "actual_price": 5.0,
-        },
-    }])
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 10000.0,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        data_dir / "trade_events.jsonl",
+        [
+            {
+                "event_type": "execution",
+                "timestamp": "2026-05-28 10:00:00",
+                "payload": {
+                    "status": "filled",
+                    "code": "sh601988",
+                    "action": "buy",
+                    "date": "20260528",
+                    "shares": 100,
+                    "actual_price": 5.0,
+                },
+            }
+        ],
+    )
 
     result = run_healthcheck(tmp_path, strict_events=True)
 
@@ -222,17 +300,30 @@ def test_paper_healthcheck_strict_report_matches_snapshot(tmp_path) -> None:
     report_dir = tmp_path / "reports"
     data_dir.mkdir()
     report_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 10000.0,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    _write_jsonl(data_dir / "portfolio_snapshots.jsonl", [{
-        "date": "20260528",
-        "timestamp": "2026-05-28 15:00:00",
-        "summary": {"cash": 10000.0, "total_value": 10000.0},
-    }])
-    (report_dir / "daily_20260528.txt").write_text("当前总值: ¥10,000.00\n", encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 10000.0,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        data_dir / "portfolio_snapshots.jsonl",
+        [
+            {
+                "date": "20260528",
+                "timestamp": "2026-05-28 15:00:00",
+                "summary": {"cash": 10000.0, "total_value": 10000.0},
+            }
+        ],
+    )
+    (report_dir / "daily_20260528.txt").write_text(
+        "当前总值: ¥10,000.00\n", encoding="utf-8"
+    )
 
     result = run_healthcheck(
         tmp_path,
@@ -248,20 +339,45 @@ def test_monthly_review_uses_snapshots_and_trades(tmp_path) -> None:
     """月度复盘应基于快照和卖出盈亏计算指标。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 11000.0,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    _write_jsonl(data_dir / "portfolio_snapshots.jsonl", [
-        {"date": "20260501", "summary": {"total_value": 10000.0}},
-        {"date": "20260515", "summary": {"total_value": 9600.0}},
-        {"date": "20260528", "summary": {"total_value": 11000.0}},
-    ])
-    _write_jsonl(data_dir / "trade_log.json", [
-        {"date": "20260502", "action": "buy", "code": "sh601988", "shares": 100, "price": 5.0},
-        {"date": "20260520", "action": "sell", "code": "sh601988", "shares": 100, "price": 5.5, "profit": 45.0},
-    ])
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 11000.0,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        data_dir / "portfolio_snapshots.jsonl",
+        [
+            {"date": "20260501", "summary": {"total_value": 10000.0}},
+            {"date": "20260515", "summary": {"total_value": 9600.0}},
+            {"date": "20260528", "summary": {"total_value": 11000.0}},
+        ],
+    )
+    _write_jsonl(
+        data_dir / "trade_log.json",
+        [
+            {
+                "date": "20260502",
+                "action": "buy",
+                "code": "sh601988",
+                "shares": 100,
+                "price": 5.0,
+            },
+            {
+                "date": "20260520",
+                "action": "sell",
+                "code": "sh601988",
+                "shares": 100,
+                "price": 5.5,
+                "profit": 45.0,
+            },
+        ],
+    )
 
     summary = build_review(tmp_path, days=60)
 
@@ -290,10 +406,18 @@ def test_paper_daemon_decides_session_states(tmp_path) -> None:
     pre_market = dt_time(9, 0)
     market_close = dt_time(15, 0)
 
-    before = decide_next_action(datetime(2026, 5, 28, 8, 30), True, pre_market, market_close, 300)
-    during = decide_next_action(datetime(2026, 5, 28, 10, 0), True, pre_market, market_close, 300)
-    after = decide_next_action(datetime(2026, 5, 28, 15, 1), True, pre_market, market_close, 300)
-    closed = decide_next_action(datetime(2026, 5, 30, 10, 0), False, pre_market, market_close, 300)
+    before = decide_next_action(
+        datetime(2026, 5, 28, 8, 30), True, pre_market, market_close, 300
+    )
+    during = decide_next_action(
+        datetime(2026, 5, 28, 10, 0), True, pre_market, market_close, 300
+    )
+    after = decide_next_action(
+        datetime(2026, 5, 28, 15, 1), True, pre_market, market_close, 300
+    )
+    closed = decide_next_action(
+        datetime(2026, 5, 30, 10, 0), False, pre_market, market_close, 300
+    )
 
     assert before.state == "before_session"
     assert before.should_run is False
@@ -326,25 +450,34 @@ def test_paper_daemon_builds_live_command(tmp_path) -> None:
 
 
 def test_backtest_cache_auto_generates_when_missing(monkeypatch, tmp_path) -> None:
-    """回测缓存缺失时应自动调用 strategy_ab 并生成仪表盘产物。"""
+    """回测缓存缺失时应自动调用 robust_v2 滚动样本外回测。"""
     calls = []
 
     def fake_run(command, cwd, check, capture_output, text, timeout):
-        calls.append({
-            "command": command,
-            "cwd": cwd,
-            "check": check,
-            "capture_output": capture_output,
-            "text": text,
-            "timeout": timeout,
-        })
+        calls.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "check": check,
+                "capture_output": capture_output,
+                "text": text,
+                "timeout": timeout,
+            }
+        )
         reports = Path(cwd) / "reports"
         reports.mkdir(parents=True, exist_ok=True)
-        (reports / "backtest_latest.json").write_text(json.dumps({
-            "generated_at": "2026-06-02 15:30:00",
-            "window": "测试窗口",
-            "series": [],
-        }, ensure_ascii=False), encoding="utf-8")
+        (reports / "backtest_latest.json").write_text(
+            json.dumps(
+                {
+                    "strategy_version": "robust_v2",
+                    "generated_at": "2026-06-02 15:30:00",
+                    "window": "测试窗口",
+                    "series": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
         class Result:
             """模拟 subprocess.CompletedProcess。"""
@@ -363,7 +496,8 @@ def test_backtest_cache_auto_generates_when_missing(monkeypatch, tmp_path) -> No
     assert status.available is True
     assert current.available is True
     assert calls
-    assert calls[0]["command"][-1] == "12"
+    assert "scripts.robust_walk_forward" in calls[0]["command"]
+    assert "scripts.strategy_ab" not in calls[0]["command"]
 
 
 def test_backtest_cache_records_generation_error(monkeypatch, tmp_path) -> None:
@@ -419,14 +553,17 @@ def test_paper_service_start_writes_pid_metadata(tmp_path) -> None:
         ignore_calendar=True,
     )
 
-    result = start_service(config, popen_factory=fake_popen, pid_checker=lambda _pid: False)
+    result = start_service(
+        config, popen_factory=fake_popen, pid_checker=lambda _pid: False
+    )
     status = get_status(tmp_path, pid_checker=lambda pid: pid == 12345)
 
     assert result.ok is True
     assert status.running is True
     assert status.pid == 12345
-    assert "--watch-interval" in status.command
-    assert "6" in status.command
+    assert str(tmp_path / "robust_runner.py") in status.command
+    assert "daemon" in status.command
+    assert "--ledger" in status.command
     assert "--ignore-calendar" in status.command
     assert calls
 
@@ -435,7 +572,9 @@ def test_paper_service_start_refuses_duplicate_running_process(tmp_path) -> None
     """已有运行中 PID 时不应重复启动。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "paper_daemon.pid").write_text(json.dumps({"pid": 12345}), encoding="utf-8")
+    (data_dir / "paper_daemon.pid").write_text(
+        json.dumps({"pid": 12345}), encoding="utf-8"
+    )
 
     result = start_service(
         ServiceConfig(root_dir=tmp_path),
@@ -467,11 +606,17 @@ def test_paper_status_combines_service_health_review_and_logs(tmp_path) -> None:
     logs_dir = tmp_path / "logs"
     data_dir.mkdir()
     logs_dir.mkdir()
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 10000.0,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 10000.0,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     (logs_dir / "live_today.log").write_text("line1\nline2\n", encoding="utf-8")
 
     status = build_status(tmp_path, log_lines=1)
@@ -495,32 +640,49 @@ def test_paper_acceptance_passes_after_enough_snapshots(tmp_path) -> None:
     snapshot_rows = []
     for i in range(20):
         day = (today - timedelta(days=19 - i)).strftime("%Y%m%d")
-        snapshot_rows.append({
-            "date": day,
-            "timestamp": f"{day[:4]}-{day[4:6]}-{day[6:]} 15:00:00",
-            "summary": {"cash": 10000.0 + i * 10, "total_value": 10000.0 + i * 10},
-        })
+        snapshot_rows.append(
+            {
+                "date": day,
+                "timestamp": f"{day[:4]}-{day[4:6]}-{day[6:]} 15:00:00",
+                "summary": {"cash": 10000.0 + i * 10, "total_value": 10000.0 + i * 10},
+            }
+        )
     latest = snapshot_rows[-1]
     latest_date = latest["date"]
     latest_total = latest["summary"]["total_value"]
 
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": latest_total,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": latest_total,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     _write_jsonl(data_dir / "portfolio_snapshots.jsonl", snapshot_rows)
-    _write_jsonl(data_dir / "trade_log.json", [
-        {"date": snapshot_rows[0]["date"], "action": "buy", "code": "sh601988", "shares": 100, "price": 5.0},
-        {
-            "date": latest_date,
-            "action": "sell",
-            "code": "sh601988",
-            "shares": 100,
-            "price": 5.5,
-            "profit": 45.0,
-        },
-    ])
+    _write_jsonl(
+        data_dir / "trade_log.json",
+        [
+            {
+                "date": snapshot_rows[0]["date"],
+                "action": "buy",
+                "code": "sh601988",
+                "shares": 100,
+                "price": 5.0,
+            },
+            {
+                "date": latest_date,
+                "action": "sell",
+                "code": "sh601988",
+                "shares": 100,
+                "price": 5.5,
+                "profit": 45.0,
+            },
+        ],
+    )
     _write_jsonl(
         data_dir / "trade_events.jsonl",
         _trace_events("sh601988", "buy", snapshot_rows[0]["date"], 5.0)
@@ -530,16 +692,22 @@ def test_paper_acceptance_passes_after_enough_snapshots(tmp_path) -> None:
         f"当前总值: ¥{latest_total:,.2f}\n",
         encoding="utf-8",
     )
-    (data_dir / "rps_state.json").write_text(json.dumps({
-        "date": latest_date,
-        "status": "ok",
-        "completed": True,
-        "etf_loaded": 3,
-        "industry_loaded": 2,
-        "etf_signals": [],
-        "industry_signals": [],
-        "orders": [],
-    }, ensure_ascii=False), encoding="utf-8")
+    (data_dir / "rps_state.json").write_text(
+        json.dumps(
+            {
+                "date": latest_date,
+                "status": "ok",
+                "completed": True,
+                "etf_loaded": 3,
+                "industry_loaded": 2,
+                "etf_signals": [],
+                "industry_signals": [],
+                "orders": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     result = run_acceptance(tmp_path, days=30, min_snapshot_days=20)
 
@@ -555,22 +723,40 @@ def test_paper_acceptance_fails_without_enough_snapshot_days(tmp_path) -> None:
     data_dir.mkdir()
     report_dir.mkdir()
     today = datetime.now().strftime("%Y%m%d")
-    (data_dir / "portfolio_state.json").write_text(json.dumps({
-        "cash": 10000.0,
-        "positions": {},
-        "trades": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    _write_jsonl(data_dir / "portfolio_snapshots.jsonl", [{
-        "date": today,
-        "timestamp": datetime.now().strftime("%Y-%m-%d 15:00:00"),
-        "summary": {"cash": 10000.0, "total_value": 10000.0},
-    }])
-    _write_jsonl(data_dir / "trade_events.jsonl", [{
-        "event_type": "heartbeat",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "payload": {"ok": True},
-    }])
-    (report_dir / f"daily_{today}.txt").write_text("当前总值: ¥10,000.00\n", encoding="utf-8")
+    (data_dir / "portfolio_state.json").write_text(
+        json.dumps(
+            {
+                "cash": 10000.0,
+                "positions": {},
+                "trades": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        data_dir / "portfolio_snapshots.jsonl",
+        [
+            {
+                "date": today,
+                "timestamp": datetime.now().strftime("%Y-%m-%d 15:00:00"),
+                "summary": {"cash": 10000.0, "total_value": 10000.0},
+            }
+        ],
+    )
+    _write_jsonl(
+        data_dir / "trade_events.jsonl",
+        [
+            {
+                "event_type": "heartbeat",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "payload": {"ok": True},
+            }
+        ],
+    )
+    (report_dir / f"daily_{today}.txt").write_text(
+        "当前总值: ¥10,000.00\n", encoding="utf-8"
+    )
 
     result = run_acceptance(tmp_path, days=30, min_snapshot_days=20)
 
@@ -583,7 +769,9 @@ def test_paper_reset_preview_does_not_modify_files(tmp_path) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     state_path = data_dir / "portfolio_state.json"
-    state_path.write_text(json.dumps({"cash": 1.0, "positions": {}}, ensure_ascii=False), encoding="utf-8")
+    state_path.write_text(
+        json.dumps({"cash": 1.0, "positions": {}}, ensure_ascii=False), encoding="utf-8"
+    )
 
     result = reset_paper_state(tmp_path, cash=10000.0, confirm=False)
 
@@ -599,7 +787,10 @@ def test_paper_reset_confirm_backs_up_and_initializes(tmp_path) -> None:
     data_dir.mkdir()
     logs_dir.mkdir()
     (data_dir / "portfolio_state.json").write_text(
-        json.dumps({"cash": 1.0, "positions": {"sh601988": {"shares": 100, "avg_cost": 5.0}}}, ensure_ascii=False),
+        json.dumps(
+            {"cash": 1.0, "positions": {"sh601988": {"shares": 100, "avg_cost": 5.0}}},
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     (data_dir / "trade_log.json").write_text("old\n", encoding="utf-8")

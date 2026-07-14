@@ -12,7 +12,14 @@ from typing import Any, Literal
 from config.time_utils import format_local, today_yyyymmdd
 
 Action = Literal["buy", "sell"]
-ExecutionStatus = Literal["filled", "rejected", "cancelled", "submitted", "failed"]
+ExecutionStatus = Literal[
+    "filled",
+    "partially_filled",
+    "rejected",
+    "cancelled",
+    "submitted",
+    "failed",
+]
 StrategyTag = Literal[
     "combo_trend",
     "momentum_breakout",

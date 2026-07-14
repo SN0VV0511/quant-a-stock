@@ -92,16 +92,21 @@ def _permission_bool(key: str, env_name: str, default: bool) -> bool:
         return _PERMISSION_FLAGS[key]
     return default
 
+
 # ==================== 资金配置 ====================
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "50000.0"))  # 初始资金（元）
 
 # ==================== 账户权限配置 ====================
 # 5 万资金账户通常不满足创业板(10 万/24 个月)和科创板(50 万/24 个月)
 # 股票权限门槛。默认只交易主板股票和 ETF；科技/创业方向通过 ETF 暴露。
-ALLOW_MAIN_BOARD_STOCKS = _permission_bool("main_board", "ALLOW_MAIN_BOARD_STOCKS", True)
+ALLOW_MAIN_BOARD_STOCKS = _permission_bool(
+    "main_board", "ALLOW_MAIN_BOARD_STOCKS", True
+)
 ALLOW_CHINEXT_STOCKS = _permission_bool("chinext", "ALLOW_CHINEXT_STOCKS", False)
 ALLOW_STAR_MARKET_STOCKS = _permission_bool("star", "ALLOW_STAR_MARKET_STOCKS", False)
-ALLOW_CONVERTIBLE_BONDS = _permission_bool("convertible", "ALLOW_CONVERTIBLE_BONDS", False)
+ALLOW_CONVERTIBLE_BONDS = _permission_bool(
+    "convertible", "ALLOW_CONVERTIBLE_BONDS", False
+)
 ALLOW_HK_CONNECT = _permission_bool("hk_connect", "ALLOW_HK_CONNECT", False)
 ALLOW_MARGIN_TRADING = _permission_bool("margin", "ALLOW_MARGIN_TRADING", False)
 
@@ -111,19 +116,21 @@ BACKTEST_START = "20240101"
 BACKTEST_END = "20250101"
 MA_SHORT = 5
 MA_LONG = 20
-BACKTEST_AUTO_GENERATE = os.getenv("BACKTEST_AUTO_GENERATE", "true").strip().lower() not in ("false", "0", "no", "off")
+BACKTEST_AUTO_GENERATE = os.getenv(
+    "BACKTEST_AUTO_GENERATE", "true"
+).strip().lower() not in ("false", "0", "no", "off")
 BACKTEST_AUTO_UNIVERSE_SIZE = int(os.getenv("BACKTEST_AUTO_UNIVERSE_SIZE", "120"))
 BACKTEST_AUTO_MAX_AGE_HOURS = int(os.getenv("BACKTEST_AUTO_MAX_AGE_HOURS", "168"))
 
 # ==================== 交易成本 ====================
-COMMISSION_RATE = 0.0003       # 佣金费率（万三）
-COMMISSION_MIN = 5.0           # 最低佣金（元）
-STAMP_TAX_RATE = 0.0005        # 印花税率（万分之五=0.05%，仅卖出，2023-08 减半后现行税率）
-TRANSFER_FEE_RATE = 0.00001    # 过户费率（万分之0.1，双向）
+COMMISSION_RATE = 0.0003  # 佣金费率（万三）
+COMMISSION_MIN = 5.0  # 最低佣金（元）
+STAMP_TAX_RATE = 0.0005  # 印花税率（万分之五=0.05%，仅卖出，2023-08 减半后现行税率）
+TRANSFER_FEE_RATE = 0.00001  # 过户费率（万分之0.1，双向）
 
 # ==================== 滑点 ====================
-SLIPPAGE_STOCK = 0.0010   # 股票滑点 10bp
-SLIPPAGE_ETF = 0.0003     # ETF 滑点 3bp
+SLIPPAGE_STOCK = 0.0010  # 股票滑点 10bp
+SLIPPAGE_ETF = 0.0003  # ETF 滑点 3bp
 
 # ==================== 交易单位 ====================
 LOT_SIZE = 100  # 每手 100 股/份
@@ -133,25 +140,39 @@ MIN_ETF_ORDER_AMOUNT = float(os.getenv("MIN_ETF_ORDER_AMOUNT", "5000.0"))
 # ==================== T+1 交易限制 ====================
 # A 股买入次日才可卖出。默认强制(贴近真实成交、防止虚拟盘出现现实中不可能的
 # 日内反复买卖)。若需当日买卖联调虚拟盘,运行前设环境变量 ENFORCE_T1=false。
-ENFORCE_T1 = os.getenv("ENFORCE_T1", "true").strip().lower() not in ("false", "0", "no", "off")
+ENFORCE_T1 = os.getenv("ENFORCE_T1", "true").strip().lower() not in (
+    "false",
+    "0",
+    "no",
+    "off",
+)
 
 # ==================== 涨跌停规则 ====================
-LIMIT_MAINBOARD = 0.10    # 主板 ±10%
-LIMIT_ST = 0.05           # ST 板块 ±5%
-LIMIT_CHINEXT = 0.20      # 创业板 ±20%
+LIMIT_MAINBOARD = 0.10  # 主板 ±10%
+LIMIT_ST = 0.05  # ST 板块 ±5%
+LIMIT_CHINEXT = 0.20  # 创业板 ±20%
 
 # ==================== 持仓限制 ====================
-MAX_TOTAL_POSITION = 0.90   # 旧研究基线使用；robust_v2 使用下方独立的 80% 上限
-MAX_SINGLE_ETF = 0.30       # 单只 ETF 上限 30%,为个股留空间
-MAX_SINGLE_STOCK = 0.20     # 单只股票上限 20%,兼顾 8000 元最低成交额与集中度
+MAX_TOTAL_POSITION = 0.90  # 旧研究基线使用；robust_v2 使用下方独立的 80% 上限
+MAX_SINGLE_ETF = 0.30  # 单只 ETF 上限 30%,为个股留空间
+MAX_SINGLE_STOCK = 0.20  # 单只股票上限 20%,兼顾 8000 元最低成交额与集中度
 MAX_SINGLE_STOCK_PCT = MAX_SINGLE_STOCK  # 统一策略配置命名
-CASH_BUFFER = 0.10          # 现金缓冲 10%
+CASH_BUFFER = 0.10  # 现金缓冲 10%
 
 # ==================== robust_v2 稳健虚拟盘 ====================
 ROBUST_V2_ACCOUNT_ID = os.getenv("ROBUST_V2_ACCOUNT_ID", "paper_v2")
 ROBUST_V2_STRATEGY_VERSION = "robust_v2"
 ROBUST_V2_LEDGER_PATH = _project_path(
     os.getenv("ROBUST_V2_LEDGER_PATH", os.path.join(BASE_DIR, "data", "paper_v2.db"))
+)
+ROBUST_V2_BACKUP_DIR = _project_path(
+    os.getenv(
+        "ROBUST_V2_BACKUP_DIR",
+        os.path.join(BASE_DIR, "data", "backups", "paper_v2_daily"),
+    )
+)
+ROBUST_V2_BACKUP_RETENTION_DAYS = int(
+    os.getenv("ROBUST_V2_BACKUP_RETENTION_DAYS", "45")
 )
 ROBUST_V2_MAX_TOTAL_POSITION = float(os.getenv("ROBUST_V2_MAX_TOTAL_POSITION", "0.80"))
 ROBUST_V2_ETF_TARGET = float(os.getenv("ROBUST_V2_ETF_TARGET", "0.60"))
@@ -162,10 +183,35 @@ ROBUST_V2_MAX_SINGLE_STOCK = float(os.getenv("ROBUST_V2_MAX_SINGLE_STOCK", "0.20
 ROBUST_V2_REBALANCE_DAYS = int(os.getenv("ROBUST_V2_REBALANCE_DAYS", "5"))
 ROBUST_V2_STOCK_STOP_PCT = float(os.getenv("ROBUST_V2_STOCK_STOP_PCT", "0.07"))
 ROBUST_V2_ETF_STOP_PCT = float(os.getenv("ROBUST_V2_ETF_STOP_PCT", "0.10"))
-ROBUST_V2_MAX_DATA_AGE_SECONDS = int(os.getenv("ROBUST_V2_MAX_DATA_AGE_SECONDS", "86400"))
+ROBUST_V2_MAX_DATA_AGE_SECONDS = int(
+    os.getenv("ROBUST_V2_MAX_DATA_AGE_SECONDS", "86400")
+)
 ROBUST_V2_LEASE_TTL_SECONDS = int(os.getenv("ROBUST_V2_LEASE_TTL_SECONDS", "90"))
-ROBUST_V2_STOCK_CANDIDATE_LIMIT = int(os.getenv("ROBUST_V2_STOCK_CANDIDATE_LIMIT", "500"))
-ROBUST_V2_MONITOR_INTERVAL_SECONDS = int(os.getenv("ROBUST_V2_MONITOR_INTERVAL_SECONDS", "60"))
+ROBUST_V2_STOCK_CANDIDATE_LIMIT = int(
+    os.getenv("ROBUST_V2_STOCK_CANDIDATE_LIMIT", "500")
+)
+ROBUST_V2_MONITOR_INTERVAL_SECONDS = int(
+    os.getenv("ROBUST_V2_MONITOR_INTERVAL_SECONDS", "60")
+)
+ROBUST_V2_MIN_MAINBOARD_UNIVERSE = int(
+    os.getenv("ROBUST_V2_MIN_MAINBOARD_UNIVERSE", "1500")
+)
+ROBUST_V2_MIN_REALTIME_QUOTE_COVERAGE = float(
+    os.getenv("ROBUST_V2_MIN_REALTIME_QUOTE_COVERAGE", "0.90")
+)
+ROBUST_V2_MIN_HISTORY_COVERAGE = float(
+    os.getenv("ROBUST_V2_MIN_HISTORY_COVERAGE", "0.90")
+)
+ROBUST_V2_MIN_ETF_HISTORY_COVERAGE = float(
+    os.getenv("ROBUST_V2_MIN_ETF_HISTORY_COVERAGE", "0.80")
+)
+ROBUST_V2_MAX_EXECUTION_QUOTE_AGE_SECONDS = int(
+    os.getenv("ROBUST_V2_MAX_EXECUTION_QUOTE_AGE_SECONDS", "120")
+)
+ROBUST_V2_SIGNAL_RETRY_SECONDS = int(os.getenv("ROBUST_V2_SIGNAL_RETRY_SECONDS", "60"))
+ROBUST_V2_UNIVERSE_CACHE_MAX_AGE_SECONDS = int(
+    os.getenv("ROBUST_V2_UNIVERSE_CACHE_MAX_AGE_SECONDS", "604800")
+)
 ROBUST_V2_SELECTED_CONFIG_PATH = _project_path(
     os.getenv(
         "ROBUST_V2_SELECTED_CONFIG_PATH",
@@ -174,8 +220,8 @@ ROBUST_V2_SELECTED_CONFIG_PATH = _project_path(
 )
 
 # ==================== 风控参数 ====================
-DAILY_LOSS_THRESHOLD = 0.025    # 单日最大亏损 2.5% 触发降仓
-MAX_DRAWDOWN_THRESHOLD = 0.06   # 回撤暂停开仓阈值(正常模式)
+DAILY_LOSS_THRESHOLD = 0.025  # 单日最大亏损 2.5% 触发降仓
+MAX_DRAWDOWN_THRESHOLD = 0.06  # 回撤暂停开仓阈值(正常模式)
 DAILY_LOSS_CIRCUIT_BREAKER = -DAILY_LOSS_THRESHOLD
 MAX_DRAWDOWN_CIRCUIT_BREAKER = -MAX_DRAWDOWN_THRESHOLD
 DRAWDOWN_REDUCED_POSITION_LIMIT = 0.30
@@ -183,31 +229,37 @@ DRAWDOWN_RECOVERY_DAYS = 2
 
 # 卖出后再买冷却:同一标的被(策略/止损/止盈)卖出后,此秒数内不再开新仓。
 # 防止"卖出→信号又翻多→立刻买回"的日内刷单(每个来回都白白消耗佣金+滑点)。
-REBUY_COOLDOWN_SECONDS = 0      # 0=当天不再买回(收盘后自动重置)
-ENTRY_INTERVAL_SECONDS = int(os.getenv("ENTRY_INTERVAL_SECONDS", "300"))  # 买入间隔:每笔建仓至少间隔5分钟,避免一分钟打满仓位
+REBUY_COOLDOWN_SECONDS = 0  # 0=当天不再买回(收盘后自动重置)
+ENTRY_INTERVAL_SECONDS = int(
+    os.getenv("ENTRY_INTERVAL_SECONDS", "300")
+)  # 买入间隔:每笔建仓至少间隔5分钟,避免一分钟打满仓位
 
 # 卖出被跌停拒绝后的冷却时间(秒)。A 股跌停盘中可能打开,冷却结束后下一轮
 # 盯盘会重新检测跌停状态;一旦打开即可止损成交。旧实现锁到收盘会把"早晨
 # 瞬时跌停"当成全天跌停,导致下午开口子时仍被冷却跳过、错过止损。
-EXIT_LIMIT_DOWN_COOLDOWN_SECONDS = int(os.getenv("EXIT_LIMIT_DOWN_COOLDOWN_SECONDS", "300"))
+EXIT_LIMIT_DOWN_COOLDOWN_SECONDS = int(
+    os.getenv("EXIT_LIMIT_DOWN_COOLDOWN_SECONDS", "300")
+)
 
 # ==================== 策略参数(集中管理,便于回测调参) ====================
 # 择时:止损止盈(live_runner 持仓退出逻辑读取)
-STOP_LOSS_PCT = 0.07            # 固定止损线:亏损达 7% 离场
-TAKE_PROFIT_PCT = 0.10          # 止盈触发线:盈利达 10% 且跌破 MA20 离场
-ATR_PERIOD = 14                 # ATR 回看周期
-ENABLE_ATR_STOP = True          # 启用 ATR 动态止损,固定止损仅作为最大亏损保护
-ATR_STOP_MULTIPLIER = 1.2       # ATR 止损倍数,小资金默认取 1~1.5 中间偏稳健
+STOP_LOSS_PCT = 0.07  # 固定止损线:亏损达 7% 离场
+TAKE_PROFIT_PCT = 0.10  # 止盈触发线:盈利达 10% 且跌破 MA20 离场
+ATR_PERIOD = 14  # ATR 回看周期
+ENABLE_ATR_STOP = True  # 启用 ATR 动态止损,固定止损仅作为最大亏损保护
+ATR_STOP_MULTIPLIER = 1.2  # ATR 止损倍数,小资金默认取 1~1.5 中间偏稳健
 ATR_STOP_MAX_PCT = STOP_LOSS_PCT  # ATR 止损最宽不超过固定止损线
 # 移动止盈(回吐式):盈利达 TRAILING_ACTIVATE_PCT 后启用,自峰值回吐已实现盈利的
 # TRAILING_GIVE_BACK_RATIO 即离场,RSI 越高回吐比例越紧(实现见 strategies/exit_rules.py)。
 # 注:原 ENABLE_ATR_TAKE_PROFIT / ATR_TAKE_PROFIT_MULTIPLIER / TRAILING_STOP_PCT
 # 为从未接线的死参数,已移除,避免误以为"ATR 止盈"或"自峰值回撤 4%"在生效。
-TRAILING_GIVE_BACK_RATIO = 0.4   # 移动止盈:回吐盈利的 40% 即离场(例:赚10个点吐4个点)
-TRAILING_ACTIVATE_PCT = 0.05    # 移动止盈激活线:峰值相对成本盈利达 5% 后才启用,避免买入即被噪声扫出
-ENABLE_TRAILING_STOP = True     # 是否启用移动止盈(回吐式)
-TIME_STOP_DAYS = 0              # 时间止损:持有(自然日)达此值且仍不达预期则清仓;0=禁用
-TIME_STOP_MIN_PROFIT = 0.0      # 时间止损的"达标"盈亏阈值,低于此值才触发
+TRAILING_GIVE_BACK_RATIO = 0.4  # 移动止盈:回吐盈利的 40% 即离场(例:赚10个点吐4个点)
+TRAILING_ACTIVATE_PCT = (
+    0.05  # 移动止盈激活线:峰值相对成本盈利达 5% 后才启用,避免买入即被噪声扫出
+)
+ENABLE_TRAILING_STOP = True  # 是否启用移动止盈(回吐式)
+TIME_STOP_DAYS = 0  # 时间止损:持有(自然日)达此值且仍不达预期则清仓;0=禁用
+TIME_STOP_MIN_PROFIT = 0.0  # 时间止损的"达标"盈亏阈值,低于此值才触发
 COMBO_DEFENSIVE_PROFIT_THRESHOLD = 0.01
 TRAILING_PROFIT_ACTIVATE = TRAILING_ACTIVATE_PCT
 TRAILING_GIVEBACK_NORMAL = TRAILING_GIVE_BACK_RATIO
@@ -223,23 +275,23 @@ ETF_EXTREME_STOP_PCT = 0.12
 # 默认开启;如需复现旧基线,运行前设 ENABLE_MARKET_REGIME=false。
 ENABLE_MARKET_REGIME = _env_bool("ENABLE_MARKET_REGIME", True)  # 大盘择时(正常模式)
 MARKET_INDEX_CODE = "sh000300"  # 基准指数:沪深300
-MARKET_REGIME_MA = 20           # 大盘择时均线周期
+MARKET_REGIME_MA = 20  # 大盘择时均线周期
 
 # 择时:ComboSignal 动量追涨参数
-MOMENTUM_CHASE_GAP = 0.10       # MA 短长价差超过此值视为强势趋势,放宽 RSI 上限追涨
-RSI_MOMENTUM_MAX = 85           # 动量追涨模式下的 RSI 上限
-RSI_OVERBOUGHT = 70             # RSI 超买线
-RSI_OVERSOLD = 35               # RSI 超卖线(脱离超卖区下限)
-ENABLE_VOLUME_FILTER = True     # Combo 买入信号必须通过成交量确认
-VOLUME_FILTER_LOOKBACK = 20     # 成交量确认使用 20 日均量
-VOLUME_FILTER_MIN_RATIO = 1.0   # 当前量需不低于 20 日均量,过滤缩量假突破
+MOMENTUM_CHASE_GAP = 0.10  # MA 短长价差超过此值视为强势趋势,放宽 RSI 上限追涨
+RSI_MOMENTUM_MAX = 85  # 动量追涨模式下的 RSI 上限
+RSI_OVERBOUGHT = 70  # RSI 超买线
+RSI_OVERSOLD = 35  # RSI 超卖线(脱离超卖区下限)
+ENABLE_VOLUME_FILTER = True  # Combo 买入信号必须通过成交量确认
+VOLUME_FILTER_LOOKBACK = 20  # 成交量确认使用 20 日均量
+VOLUME_FILTER_MIN_RATIO = 1.0  # 当前量需不低于 20 日均量,过滤缩量假突破
 
 # 选股:全市场扫描粗筛阈值
-SCAN_MIN_PRICE = 5.0            # 最低股价(元),排除低价股
-SCAN_MIN_VOLUME = 1_000_000    # 实时成交量下限(股),排除僵尸股
+SCAN_MIN_PRICE = 5.0  # 最低股价(元),排除低价股
+SCAN_MIN_VOLUME = 1_000_000  # 实时成交量下限(股),排除僵尸股
 SCAN_MIN_AVG_VOLUME = 500_000  # 20 日均量下限(股)
 SCAN_MIN_AVG_AMOUNT = 30_000_000  # 20 日平均成交额下限(元),模拟盘默认 3000 万
-SCAN_LIMIT_PCT = 9.8           # 实时涨跌幅绝对值达此值视为涨跌停,剔除
+SCAN_LIMIT_PCT = 9.8  # 实时涨跌幅绝对值达此值视为涨跌停,剔除
 # 0 表示扫描实时粗筛后的全部股票；可通过环境变量设置正整数临时限流。
 SCAN_MAX_HIST_FETCH = int(os.getenv("SCAN_MAX_HIST_FETCH", "0"))
 # 全盘历史加载不能按股票反复启动并登录 BaoStock。以下参数控制“单进程一次登录、
@@ -265,93 +317,164 @@ MAX_60D_GAIN = 0.80
 MAX_YTD_GAIN = 1.20
 
 # 选股:基本面过滤
-SCAN_ENABLE_FUNDAMENTAL_FILTER = True   # 是否启用基本面过滤
+SCAN_ENABLE_FUNDAMENTAL_FILTER = True  # 是否启用基本面过滤
 SCAN_ALLOW_FUNDAMENTAL_FALLBACK = True  # akshare 失败时是否降级跳过
-SCAN_MIN_PE = 0                        # 最低市盈率(排除亏损股)
-SCAN_MAX_PE = 100                      # 最高市盈率(排除估值泡沫)
-SCAN_MIN_PB = 0.5                      # 最低市净率
-SCAN_MAX_PB = 20                       # 最高市净率
-SCAN_MIN_TOTAL_MARKET_CAP = 2_000_000_000   # 最低总市值(元),约 20 亿
+SCAN_MIN_PE = 0  # 最低市盈率(排除亏损股)
+SCAN_MAX_PE = 100  # 最高市盈率(排除估值泡沫)
+SCAN_MIN_PB = 0.5  # 最低市净率
+SCAN_MAX_PB = 20  # 最高市净率
+SCAN_MIN_TOTAL_MARKET_CAP = 2_000_000_000  # 最低总市值(元),约 20 亿
 SCAN_MAX_TOTAL_MARKET_CAP = 80_000_000_000  # 最高总市值(元),约 800 亿
-SCAN_MAX_MOMENTUM_60D = 120            # 60 日涨幅上限(%),避免追高
-SCAN_MAX_YTD_MOMENTUM = 200            # 年初至今涨幅上限(%)
-SCAN_ENABLE_REPORT_FILTER = True       # 是否启用财报过滤
-SCAN_REPORT_DATE = "20260331"           # 财报期(YYYYMMDD)
-SCAN_MIN_REVENUE = 100_000_000         # 最低营收(元),约 1 亿
-SCAN_MIN_REVENUE_YOY = -20             # 营收同比增长下限(%)
-SCAN_MIN_NET_PROFIT = 0                # 最低净利润(元),排除亏损
-SCAN_MIN_ROE = 0                       # 最低 ROE(%)
-SCAN_MIN_GROSS_MARGIN = 5              # 最低毛利率(%)
+SCAN_MAX_MOMENTUM_60D = 120  # 60 日涨幅上限(%),避免追高
+SCAN_MAX_YTD_MOMENTUM = 200  # 年初至今涨幅上限(%)
+SCAN_ENABLE_REPORT_FILTER = True  # 是否启用财报过滤
+SCAN_REPORT_DATE = "20260331"  # 财报期(YYYYMMDD)
+SCAN_MIN_REVENUE = 100_000_000  # 最低营收(元),约 1 亿
+SCAN_MIN_REVENUE_YOY = -20  # 营收同比增长下限(%)
+SCAN_MIN_NET_PROFIT = 0  # 最低净利润(元),排除亏损
+SCAN_MIN_ROE = 0  # 最低 ROE(%)
+SCAN_MIN_GROSS_MARGIN = 5  # 最低毛利率(%)
 SCAN_FUNDAMENTAL_CACHE_DIR = "cache/fundamentals"  # 基本面缓存目录
-SCAN_USE_FUNDAMENTAL_CACHE = True      # 是否缓存 akshare 数据
+SCAN_USE_FUNDAMENTAL_CACHE = True  # 是否缓存 akshare 数据
 
 # 选股:横截面动量打分权重(对 z-score 标准化后的因子加权)
 # 历史问题:旧版直接用 动量*0.5 + 短动量*0.3 - 年化波动率*0.2,三者量纲不一致,
 # 波动率项(年化 0.3~0.6)长期压制动量项(0.1~0.5),导致打分偏向低波动而非高动量。
 # 现改为先做横截面 z-score 标准化再加权,消除量纲差异。
-SCORE_WEIGHT_MOMENTUM = 0.5     # 60 日动量权重
+SCORE_WEIGHT_MOMENTUM = 0.5  # 60 日动量权重
 SCORE_WEIGHT_MOMENTUM_20 = 0.3  # 20 日动量权重
-SCORE_WEIGHT_VOLATILITY = 0.2   # 波动率惩罚权重(从得分中减去)
+SCORE_WEIGHT_VOLATILITY = 0.2  # 波动率惩罚权重(从得分中减去)
 
 # ==================== 小市值价值策略参数 ====================
 # 依据:A股价格动量长期负 IC(短期反转主导),真正有效的是小市值 + 低估值 + 短期反转。
 # 2024「国九条」退市新规后,必须叠加严格风控过滤,规避退市/ST/面值/财务风险。
 # 调仓:双周(每 10 个交易日)。仓位:等权,持有 SMALLCAP_TOP_N 只。
-SMALLCAP_TOP_N = 4               # 持仓数量(等权),5 万账户避免过度分散和最低佣金拖累
-SMALLCAP_REBALANCE_DAYS = 10     # 调仓周期(交易日),10≈双周,降低换手和交易成本
+SMALLCAP_TOP_N = 4  # 持仓数量(等权),5 万账户避免过度分散和最低佣金拖累
+SMALLCAP_REBALANCE_DAYS = 10  # 调仓周期(交易日),10≈双周,降低换手和交易成本
 # "折中:小市值为主"——设市值下限规避最小微盘(国九条退市/流动性高风险区),设上限保持小盘暴露
-SMALLCAP_MIN_MKTCAP = 20e8      # 流通市值下限(元),约 20 亿,排除最小微盘
-SMALLCAP_MAX_MKTCAP = 200e8     # 流通市值上限(元),约 200 亿,保持小盘风格
+SMALLCAP_MIN_MKTCAP = 20e8  # 流通市值下限(元),约 20 亿,排除最小微盘
+SMALLCAP_MAX_MKTCAP = 200e8  # 流通市值上限(元),约 200 亿,保持小盘风格
 # 因子权重(对横截面分位 rank 加权,小市值为主)
-SMALLCAP_W_SIZE = 0.5           # 小市值(市值越小越优)
-SMALLCAP_W_PB = 0.25            # 低估值(PB 越低越优)
-SMALLCAP_W_REVERSAL = 0.25      # 短期反转(过去 N 日跌得多者下期反弹)
-SMALLCAP_W_OBV = 0.10           # OBV 资金累积加分,只增强排序,不作为硬过滤
-SMALLCAP_REVERSAL_DAYS = 20     # 短期反转回看天数
+SMALLCAP_W_SIZE = 0.5  # 小市值(市值越小越优)
+SMALLCAP_W_PB = 0.25  # 低估值(PB 越低越优)
+SMALLCAP_W_REVERSAL = 0.25  # 短期反转(过去 N 日跌得多者下期反弹)
+SMALLCAP_W_OBV = 0.10  # OBV 资金累积加分,只增强排序,不作为硬过滤
+SMALLCAP_REVERSAL_DAYS = 20  # 短期反转回看天数
 # 国九条风控过滤阈值
-SMALLCAP_MIN_PRICE = 2.0        # 最低股价(元),缓冲 1 元面值退市风险
-SMALLCAP_MAX_PRICE = 60.0       # 最高股价(元),避免一手金额过度挤占 5 万账户
-SMALLCAP_MIN_PB = 0.5           # PB 下限,过滤净资产为负/极低的高退市风险标的
-SMALLCAP_MIN_TURNOVER = 1.0     # 换手率下限(%),过滤流动性枯竭标的
+SMALLCAP_MIN_PRICE = 2.0  # 最低股价(元),缓冲 1 元面值退市风险
+SMALLCAP_MAX_PRICE = 60.0  # 最高股价(元),避免一手金额过度挤占 5 万账户
+SMALLCAP_MIN_PB = 0.5  # PB 下限,过滤净资产为负/极低的高退市风险标的
+SMALLCAP_MIN_TURNOVER = 1.0  # 换手率下限(%),过滤流动性枯竭标的
 SMALLCAP_MIN_VOLUME_RATIO = 0.5  # 量比下限,过滤缩量僵尸股
-MIN_POSITION_RATIO = 0.3        # 最低仓位比例,低于此值视为空仓
+MIN_POSITION_RATIO = 0.3  # 最低仓位比例,低于此值视为空仓
 
 # ==================== ETF / 行业 RPS 轮动参数 ====================
-RPS_LOOKBACK_DAYS = 60          # RPS 回看周期(日频),更偏中期趋势
-RPS_MIN_SCORE = 0.0             # 入选分位下限:小池子(ETF/行业)横截面分位会被高阈值卡死,
-                                # 改由"趋势确认+绝对正动量"过滤(见 rps_rotation),此处设 0 不额外卡分位
-RPS_TOP_N = 2                   # 每日最多持有/买入数量,小资金优先集中 ETF 暴露
-RPS_MIN_AVG_VOLUME = 500_000    # 20 日均量下限
-RPS_HISTORY_DAYS = 120          # RPS 拉取历史行情天数
-ETF_REBALANCE_WEEKDAY = 0       # ETF/RPS 默认周一调仓
-ENABLE_RPS_ROTATION = os.getenv("ENABLE_RPS_ROTATION", "true").strip().lower() not in ("false", "0", "no", "off")
+RPS_LOOKBACK_DAYS = 60  # RPS 回看周期(日频),更偏中期趋势
+RPS_MIN_SCORE = 0.0  # 入选分位下限:小池子(ETF/行业)横截面分位会被高阈值卡死,
+# 改由"趋势确认+绝对正动量"过滤(见 rps_rotation),此处设 0 不额外卡分位
+RPS_TOP_N = 2  # 每日最多持有/买入数量,小资金优先集中 ETF 暴露
+RPS_MIN_AVG_VOLUME = 500_000  # 20 日均量下限
+RPS_HISTORY_DAYS = 120  # RPS 拉取历史行情天数
+ETF_REBALANCE_WEEKDAY = 0  # ETF/RPS 默认周一调仓
+ENABLE_RPS_ROTATION = os.getenv("ENABLE_RPS_ROTATION", "true").strip().lower() not in (
+    "false",
+    "0",
+    "no",
+    "off",
+)
 
 
 # ==================== 默认标的池 ====================
 # 真实 ETF 池(AKShare 数据源)。RPS 日频轮动优先使用该池；保持数量克制,
 # 适配 4 核 4G 服务器,也避免小资金在过多行业上过度分散。
 DEFAULT_RPS_ETF_POOL = {
-    "510300": {"name": "沪深300ETF", "code": "510300", "raw_code": "510300", "asset_type": "etf"},
-    "510500": {"name": "中证500ETF", "code": "510500", "raw_code": "510500", "asset_type": "etf"},
-    "159915": {"name": "创业板ETF", "code": "159915", "raw_code": "159915", "asset_type": "etf"},
-    "588000": {"name": "科创50ETF", "code": "588000", "raw_code": "588000", "asset_type": "etf"},
-    "512100": {"name": "中证1000ETF", "code": "512100", "raw_code": "512100", "asset_type": "etf"},
-    "512880": {"name": "证券ETF", "code": "512880", "raw_code": "512880", "asset_type": "etf"},
-    "512760": {"name": "半导体ETF", "code": "512760", "raw_code": "512760", "asset_type": "etf"},
-    "512170": {"name": "医疗ETF", "code": "512170", "raw_code": "512170", "asset_type": "etf"},
-    "515790": {"name": "光伏ETF", "code": "515790", "raw_code": "515790", "asset_type": "etf"},
-    "516160": {"name": "新能源ETF", "code": "516160", "raw_code": "516160", "asset_type": "etf"},
+    "510300": {
+        "name": "沪深300ETF",
+        "code": "510300",
+        "raw_code": "510300",
+        "asset_type": "etf",
+    },
+    "510500": {
+        "name": "中证500ETF",
+        "code": "510500",
+        "raw_code": "510500",
+        "asset_type": "etf",
+    },
+    "159915": {
+        "name": "创业板ETF",
+        "code": "159915",
+        "raw_code": "159915",
+        "asset_type": "etf",
+    },
+    "588000": {
+        "name": "科创50ETF",
+        "code": "588000",
+        "raw_code": "588000",
+        "asset_type": "etf",
+    },
+    "512100": {
+        "name": "中证1000ETF",
+        "code": "512100",
+        "raw_code": "512100",
+        "asset_type": "etf",
+    },
+    "512880": {
+        "name": "证券ETF",
+        "code": "512880",
+        "raw_code": "512880",
+        "asset_type": "etf",
+    },
+    "512760": {
+        "name": "半导体ETF",
+        "code": "512760",
+        "raw_code": "512760",
+        "asset_type": "etf",
+    },
+    "512170": {
+        "name": "医疗ETF",
+        "code": "512170",
+        "raw_code": "512170",
+        "asset_type": "etf",
+    },
+    "515790": {
+        "name": "光伏ETF",
+        "code": "515790",
+        "raw_code": "515790",
+        "asset_type": "etf",
+    },
+    "516160": {
+        "name": "新能源ETF",
+        "code": "516160",
+        "raw_code": "516160",
+        "asset_type": "etf",
+    },
 }
 
 # 行业指数池仅用于 RPS 观察/过滤,不作为可交易标的直接下单。
 DEFAULT_INDUSTRY_INDEX_POOL = {
     "证券": {"name": "证券", "code": "证券", "asset_type": "industry_index"},
     "半导体": {"name": "半导体", "code": "半导体", "asset_type": "industry_index"},
-    "光伏设备": {"name": "光伏设备", "code": "光伏设备", "asset_type": "industry_index"},
+    "光伏设备": {
+        "name": "光伏设备",
+        "code": "光伏设备",
+        "asset_type": "industry_index",
+    },
     "电池": {"name": "电池", "code": "电池", "asset_type": "industry_index"},
-    "软件开发": {"name": "软件开发", "code": "软件开发", "asset_type": "industry_index"},
-    "通信设备": {"name": "通信设备", "code": "通信设备", "asset_type": "industry_index"},
-    "医疗服务": {"name": "医疗服务", "code": "医疗服务", "asset_type": "industry_index"},
+    "软件开发": {
+        "name": "软件开发",
+        "code": "软件开发",
+        "asset_type": "industry_index",
+    },
+    "通信设备": {
+        "name": "通信设备",
+        "code": "通信设备",
+        "asset_type": "industry_index",
+    },
+    "医疗服务": {
+        "name": "医疗服务",
+        "code": "医疗服务",
+        "asset_type": "industry_index",
+    },
     "白酒": {"name": "白酒", "code": "白酒", "asset_type": "industry_index"},
 }
 
@@ -373,7 +496,7 @@ INDUSTRY_TENCENT_MAP: dict[str, str] = {
 DEFAULT_ETF_PROXY_POOL = {
     "sh601988": {"name": "中国银行(ETF代替)", "code": "sh601988", "raw_code": "601988"},
     "sh600519": {"name": "贵州茅台(ETF代替)", "code": "sh600519", "raw_code": "600519"},
-    "sz000858": {"name": "五粮液(ETF代替)",   "code": "sz000858", "raw_code": "000858"},
+    "sz000858": {"name": "五粮液(ETF代替)", "code": "sz000858", "raw_code": "000858"},
     "sh601318": {"name": "中国平安(ETF代替)", "code": "sh601318", "raw_code": "601318"},
 }
 
@@ -383,7 +506,7 @@ DEFAULT_ETF_POOL = DEFAULT_ETF_PROXY_POOL
 DEFAULT_STOCK_POOL = {
     "sh601988": {"name": "中国银行", "code": "sh601988", "raw_code": "601988"},
     "sz000651": {"name": "格力电器", "code": "sz000651", "raw_code": "000651"},
-    "sz000725": {"name": "京东方A",  "code": "sz000725", "raw_code": "000725"},
+    "sz000725": {"name": "京东方A", "code": "sz000725", "raw_code": "000725"},
     "sz002415": {"name": "海康威视", "code": "sz002415", "raw_code": "002415"},
     "sz002594": {"name": "比亚迪", "code": "sz002594", "raw_code": "002594"},
 }
@@ -414,7 +537,9 @@ OPENING_TAKEPROFIT_MINUTES = int(os.getenv("OPENING_TAKEPROFIT_MINUTES", "15"))
 OPENING_TAKEPROFIT_PCT = float(os.getenv("OPENING_TAKEPROFIT_PCT", "5.0"))  # %
 OPEN_FAST_TAKE_PROFIT_MINUTES = OPENING_TAKEPROFIT_MINUTES
 OPEN_FAST_TAKE_PROFIT_PCT = OPENING_TAKEPROFIT_PCT / 100
-OPENING_STOP_PROTECT_MINUTES = int(os.getenv("OPENING_STOP_PROTECT_MINUTES", "5"))  # 开盘保护:开盘后N分钟内不执行止损(防跳空误杀)
+OPENING_STOP_PROTECT_MINUTES = int(
+    os.getenv("OPENING_STOP_PROTECT_MINUTES", "5")
+)  # 开盘保护:开盘后N分钟内不执行止损(防跳空误杀)
 
 # ==================== Broker / QMT 配置 ====================
 BROKER_MODE = os.getenv("BROKER_MODE", "paper").lower()

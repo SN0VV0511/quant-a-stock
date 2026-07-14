@@ -8,8 +8,14 @@ export interface LoginResponse {
 export interface StatusResponse {
   live_runner: boolean;
   web_server: boolean;
-  watch_thread: boolean;
-  scan_thread: boolean;
+  strategy_mode: "weekly_close_target" | string;
+  scan_running: boolean;
+  scan_status: "never_run" | "completed" | "failed" | string;
+  latest_scan_at: string;
+  latest_scan_trade_date: string;
+  next_scan_at: string;
+  scan_schedule: string;
+  daemon_heartbeat_at: string;
   last_log_time: string;
   now: string;
 }
@@ -77,14 +83,44 @@ export interface Candidate {
   rank: number;
   name: string;
   code: string;
-  momentum: number;
   score: number;
+  price: number;
   current_price: number;
+  pb: number;
+  market_cap: number;
+  reversal: number;
+  gain_5d: number;
+  selected: boolean;
 }
 
 export interface CandidatesResponse {
   candidates: Candidate[];
   updated_at: string;
+  trade_date: string;
+  status: "never_run" | "completed" | "failed" | string;
+  mode: "scheduled" | "daily_observation" | "manual_preview" | string;
+  scan_running: boolean;
+  input_count: number;
+  eligible_count: number;
+  universe: {
+    mainboard_count?: number;
+    realtime_quote_count?: number;
+    rough_candidate_count?: number;
+    history_loaded_count?: number;
+  };
+  prefilter_counts: Record<string, number>;
+  prefilter_labels: Record<string, string>;
+  filter_counts: Record<string, number>;
+  filter_labels: Record<string, string>;
+  selected_codes: string[];
+  next_scheduled_scan_at: string;
+  error: string;
+  schedule: string;
+}
+
+export interface ScanTriggerResponse {
+  status: "started" | "running" | "error" | string;
+  message: string;
 }
 
 export interface RpsSignal {

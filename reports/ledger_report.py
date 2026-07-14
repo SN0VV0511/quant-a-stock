@@ -38,8 +38,8 @@ def build_daily_ledger_report(
     *,
     run_id: str | None = None,
 ) -> DailyLedgerReport:
-    """从同一账户和运行批次计算单日毛/净收益及交易成本。"""
-    review = ledger.build_review("00000000", date, run_id=run_id)
+    """按连续账户口径计算日报，容器重启不会切断收益序列。"""
+    review = ledger.build_review("00000000", date)
     snapshots = list(review.snapshots)
     if not snapshots:
         raise ValueError(f"账本中没有 {date} 的净值快照")
@@ -49,7 +49,7 @@ def build_daily_ledger_report(
     previous = snapshots[-2] if len(snapshots) > 1 else None
     start_gross = float(previous["gross_pnl"]) if previous else 0.0
     start_net = float(previous["net_pnl"]) if previous else 0.0
-    trades = ledger.query_trades(date, date, run_id)
+    trades = ledger.query_trades(date, date)
     commission = sum(float(trade["commission"] or 0) for trade in trades)
     stamp_tax = sum(float(trade["stamp_tax"] or 0) for trade in trades)
     slippage = sum(float(trade["slippage"] or 0) for trade in trades)

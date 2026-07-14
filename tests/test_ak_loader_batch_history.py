@@ -18,23 +18,46 @@ def _rows(close: str) -> list[list[str]]:
     return [["2026-06-12", "10", "11", "9", close, "1000", "10000", "9.8", "1.2"]]
 
 
+def _ext_rows(close: str) -> list[list[str]]:
+    """构造 BaoStock 扩展历史行情返回行。"""
+    return [
+        [
+            "2026-06-12",
+            "10",
+            "11",
+            "9",
+            close,
+            "1000000",
+            "10000000",
+            "1.5",
+            "10",
+            "1.2",
+            "0",
+            "1",
+            "1.2",
+        ]
+    ]
+
+
 def test_batch_history_reuses_worker_login_and_skips_cached_codes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """缓存缺失项应合并到一个批量 worker，不应逐股启动子进程。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
-    cached = pd.DataFrame({
-        "date": ["2026-06-12"],
-        "open": [10.0],
-        "high": [11.0],
-        "low": [9.0],
-        "close": [10.5],
-        "volume": [1000.0],
-        "amount": [10000.0],
-        "preclose": [9.8],
-        "pctChg": [1.2],
-    })
+    cached = pd.DataFrame(
+        {
+            "date": ["2026-06-12"],
+            "open": [10.0],
+            "high": [11.0],
+            "low": [9.0],
+            "close": [10.5],
+            "volume": [1000.0],
+            "amount": [10000.0],
+            "preclose": [9.8],
+            "pctChg": [1.2],
+        }
+    )
     loader._write_cache("hist_600000_260", cached)
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
@@ -65,6 +88,35 @@ def test_batch_history_reuses_worker_login_and_skips_cached_codes(
     assert calls[0][1]["timeout"] == 30
 
 
+def test_batch_extended_history_reuses_one_worker_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """估值与停牌字段也必须批量拉取，不能为每只股票启动进程。"""
+    loader = AKDataLoader(cache_dir=str(tmp_path))
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def _run(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append((args, kwargs))
+        return {
+            "results": {
+                "sh.600001": {"error_code": "0", "rows": _ext_rows("12")},
+                "sh.600002": {"error_code": "0", "rows": _ext_rows("13")},
+            }
+        }
+
+    monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _run)
+    monkeypatch.setattr("data.ak_loader.BAOSTOCK_HISTORY_BATCH_SIZE", 25)
+
+    result = loader.get_batch_history_ext(["600001", "600002"], days=260)
+
+    assert set(result) == {"600001", "600002"}
+    assert len(calls) == 1
+    assert calls[0][0][0] == "query_history_ext_batch"
+    assert calls[0][0][3:] == ("sh.600001", "sh.600002")
+    assert result["600001"]["pb"].iloc[-1] == pytest.approx(1.2)
+
+
 def test_batch_history_splits_work_and_keeps_partial_success(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -78,8 +130,7 @@ def test_batch_history_splits_work_and_keeps_partial_success(
             return None
         return {
             "results": {
-                code: {"error_code": "0", "rows": _rows("10")}
-                for code in bs_codes
+                code: {"error_code": "0", "rows": _rows("10")} for code in bs_codes
             }
         }
 
@@ -155,17 +206,19 @@ def test_batch_history_uses_recent_stale_cache_without_network(
 ) -> None:
     """盘中全盘扫描应复用 7 天内旧缓存，避免同步刷新数千只股票。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
-    cached = pd.DataFrame({
-        "date": ["2026-06-12"],
-        "open": [10.0],
-        "high": [11.0],
-        "low": [9.0],
-        "close": [10.5],
-        "volume": [1000.0],
-        "amount": [10000.0],
-        "preclose": [9.8],
-        "pctChg": [1.2],
-    })
+    cached = pd.DataFrame(
+        {
+            "date": ["2026-06-12"],
+            "open": [10.0],
+            "high": [11.0],
+            "low": [9.0],
+            "close": [10.5],
+            "volume": [1000.0],
+            "amount": [10000.0],
+            "preclose": [9.8],
+            "pctChg": [1.2],
+        }
+    )
     loader._write_cache("hist_600000_260", cached)
     meta_path = tmp_path / "hist_600000_260.pkl.meta"
     meta_path.write_text(
@@ -189,17 +242,19 @@ def test_batch_history_reuses_longer_compatible_cache(
 ) -> None:
     """请求 260 天时应直接复用同代码 300 天缓存。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
-    cached = pd.DataFrame({
-        "date": ["2026-06-12"],
-        "open": [10.0],
-        "high": [11.0],
-        "low": [9.0],
-        "close": [10.5],
-        "volume": [1000.0],
-        "amount": [10000.0],
-        "preclose": [9.8],
-        "pctChg": [1.2],
-    })
+    cached = pd.DataFrame(
+        {
+            "date": ["2026-06-12"],
+            "open": [10.0],
+            "high": [11.0],
+            "low": [9.0],
+            "close": [10.5],
+            "volume": [1000.0],
+            "amount": [10000.0],
+            "preclose": [9.8],
+            "pctChg": [1.2],
+        }
+    )
     loader._write_cache("hist_600000_300", cached)
 
     def _fail_remote(*_args: object, **_kwargs: object) -> None:
