@@ -6,7 +6,12 @@ import pandas as pd
 import pytest
 
 from rules.engine import TradingRules
-from strategies.robust_v2 import RobustV2Config, RobustV2Strategy
+from strategies.robust_v2 import (
+    RobustV2Config,
+    RobustV2Strategy,
+    build_market_data_hash,
+    validate_realtime_alignment,
+)
 from trading.allocator import PortfolioAllocator
 from trading.models import MarketSnapshot, TargetPortfolio, TargetPosition
 
@@ -66,6 +71,34 @@ def test_instrument_rules_apply_etf_specific_limits_and_fees() -> None:
     assert etf_cost["transfer_fee"] == 0
     assert stock_cost["stamp_tax"] > 0
     assert stock_cost["transfer_fee"] > 0
+
+
+def test_market_data_hash_changes_when_factor_input_changes() -> None:
+    """PB 等因子字段变化必须改变审计哈希，不能只记录最新收盘价。"""
+    original = _history("600000", pb=1.2)
+    changed = original.copy()
+    changed.loc[changed.index[-1], "pb"] = 2.4
+    trade_date = str(original["date"].iloc[-1])
+
+    assert build_market_data_hash({"600000": original}, trade_date) != (
+        build_market_data_hash({"600000": changed}, trade_date)
+    )
+
+
+def test_realtime_alignment_matches_prefixed_history_and_raw_quote_code() -> None:
+    """实时前收盘对齐应按六位代码匹配，不能被市场前缀差异误拒绝。"""
+    history = _history("600000")
+    snapshot = _snapshot(history)
+    latest_close = float(history["close"].iloc[-1])
+
+    result = validate_realtime_alignment(
+        snapshot,
+        {"sh600000": history},
+        {"600000": {"prev_close": latest_close}},
+    )
+
+    assert result.valid_codes == frozenset({"600000"})
+    assert result.rejected == {}
 
 
 def test_strategy_builds_two_etfs_one_mainboard_and_keeps_cash() -> None:
@@ -133,6 +166,33 @@ def test_strategy_ignores_rows_after_signal_date() -> None:
     assert original[0]["price"] == with_future[0]["price"]
 
 
+def test_stock_scan_reports_first_rejection_reason_for_every_input() -> None:
+    """扫描结果应同时给出候选排序和可核对的首个淘汰原因。"""
+    frame = _history("base")
+    snapshot = _snapshot(frame)
+    short_history = _history("short").tail(80).reset_index(drop=True)
+    strategy = RobustV2Strategy(RobustV2Config(stock_min_avg_amount=0))
+
+    result = strategy.scan_stocks(
+        {
+            "sh600001": _history("sh600001", pb=0.9),
+            "sh600002": _history("sh600002", pb=12.0),
+            "sz300001": _history("sz300001", pb=0.8),
+            "sh600003": short_history,
+        },
+        snapshot,
+        account_value=50_000,
+    )
+
+    assert [candidate["code"] for candidate in result.candidates] == ["sh600001"]
+    assert result.filter_counts["pb_out_of_range"] == 1
+    assert result.filter_counts["non_mainboard"] == 1
+    assert result.filter_counts["insufficient_history"] == 1
+    assert (
+        result.eligible_count + sum(result.filter_counts.values()) == result.input_count
+    )
+
+
 def test_allocator_requires_next_day_and_respects_t1_sellable_quantity() -> None:
     """分配器不得在信号日成交，也不能卖出当日锁定批次。"""
     target = TargetPortfolio(
@@ -175,3 +235,25 @@ def test_allocator_requires_next_day_and_respects_t1_sellable_quantity() -> None
     assert all(order.action != "sell" for order in result.orders)
     assert "T+1" in result.skipped["sh600000"]
     assert result.projected_cash >= result.account_value * target.cash_weight
+
+
+def test_catastrophic_stop_matches_prefixed_position_and_raw_quote_code() -> None:
+    """灾难止损不能因腾讯行情省略市场前缀而漏掉持仓。"""
+    strategy = RobustV2Strategy(RobustV2Config(stock_stop_pct=0.07))
+
+    orders = strategy.catastrophic_stop_orders(
+        {
+            "sh600000": {
+                "name": "浦发银行",
+                "shares": 100,
+                "sellable_qty": 100,
+                "avg_cost": 10.0,
+            }
+        },
+        {"600000": 9.2},
+        "20260710",
+    )
+
+    assert len(orders) == 1
+    assert orders[0].code == "sh600000"
+    assert orders[0].reason == "CATASTROPHIC_STOP_LOSS"

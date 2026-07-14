@@ -2,13 +2,24 @@ FROM python:3.11-slim
 
 ENV TZ=Asia/Shanghai \
     APP_TIMEZONE=Asia/Shanghai \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r requirements.txt
 
-COPY . .
+RUN groupadd --gid 10001 quant \
+    && useradd --uid 10001 --gid quant --create-home --shell /usr/sbin/nologin quant
+
+COPY --chown=quant:quant . .
+RUN mkdir -p /app/data /app/logs /app/reports \
+    && chown -R quant:quant /app/data /app/logs /app/reports
+
+USER quant
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=3 \
+    CMD ["python3", "scripts/paper_v2_healthcheck.py", "--ledger", "data/paper_v2.db", "--require-running", "--json"]
 
 CMD ["python3", "robust_runner.py", "daemon"]

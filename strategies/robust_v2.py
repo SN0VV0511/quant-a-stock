@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -31,7 +32,27 @@ from config.settings import (
     get_stock_board,
     is_etf,
 )
+from trading.instruments import normalized_security_code
 from trading.models import MarketSnapshot, OrderIntent, TargetPortfolio, TargetPosition
+
+STOCK_FILTER_LABELS: dict[str, str] = {
+    "non_mainboard": "非沪深主板",
+    "invalid_market_data": "行情格式无效",
+    "insufficient_history": "历史行情不足",
+    "missing_signal_date": "缺少信号日行情",
+    "missing_previous_trade_date": "缺少上一交易日行情",
+    "price_out_of_range": "股价超出范围",
+    "lot_too_expensive": "一手金额超过个股预算",
+    "st_or_delisting": "ST 或退市风险",
+    "suspended": "停牌或不可交易",
+    "pb_out_of_range": "PB 不在价值区间",
+    "market_cap_out_of_range": "市值不在目标区间",
+    "unprofitable": "盈利质量不合格",
+    "insufficient_liquidity": "近 20 日成交额不足",
+    "below_ma120": "股价低于年线",
+    "overextended_ma20": "偏离 MA20 过高",
+    "excessive_5d_gain": "近 5 日涨幅过高",
+}
 
 
 @dataclass(frozen=True)
@@ -94,6 +115,29 @@ class AlignmentResult:
 
     valid_codes: frozenset[str]
     rejected: dict[str, str]
+
+
+@dataclass(frozen=True)
+class StockScanResult:
+    """一次主板个股因子扫描的结构化结果。"""
+
+    input_count: int
+    candidates: tuple[dict[str, Any], ...]
+    filter_counts: dict[str, int]
+
+    @property
+    def eligible_count(self) -> int:
+        """返回通过全部过滤条件的个股数量。"""
+        return len(self.candidates)
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可持久化字典。"""
+        return {
+            "input_count": self.input_count,
+            "eligible_count": self.eligible_count,
+            "candidates": [dict(candidate) for candidate in self.candidates],
+            "filter_counts": dict(self.filter_counts),
+        }
 
 
 def _norm_date(value: Any) -> str:
@@ -165,8 +209,33 @@ def build_market_data_hash(
     history_map: Mapping[str, pd.DataFrame],
     trade_date: str,
 ) -> str:
-    """按代码、最新日期、收盘价和行数生成稳定数据哈希。"""
+    """对所有会影响策略决策的历史字段生成稳定数据哈希。"""
     payload: list[dict[str, Any]] = []
+    decision_columns = (
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "turn",
+        "peTTM",
+        "pe_ttm",
+        "pbMRQ",
+        "pb",
+        "isST",
+        "is_st",
+        "tradestatus",
+        "is_suspended",
+        "pctChg",
+        "mktcap",
+        "market_cap",
+        "total_market_cap",
+        "net_profit",
+        "roe",
+        "roe_avg",
+    )
     for code in sorted(history_map):
         frame = _slice_as_of(history_map[code], trade_date)
         close = _numeric_series(frame, "close")
@@ -177,12 +246,26 @@ def build_market_data_hash(
             if "date" in frame.columns
             else str(frame.index[-1])
         )
+        selected_columns = [
+            column for column in decision_columns if column in frame.columns
+        ]
+        decision_frame = frame.loc[:, selected_columns].copy()
+        if "date" in decision_frame.columns:
+            decision_frame["date"] = decision_frame["date"].map(_norm_date)
+        row_hashes = pd.util.hash_pandas_object(
+            decision_frame,
+            index=False,
+            categorize=True,
+        )
+        frame_digest = hashlib.sha256(row_hashes.values.tobytes()).hexdigest()
         payload.append(
             {
                 "code": code,
                 "date": latest_date,
                 "close": round(float(close.iloc[-1]), 6),
                 "rows": len(frame),
+                "columns": selected_columns,
+                "frame_hash": frame_digest,
             }
         )
     serialized = json.dumps(
@@ -204,10 +287,21 @@ def validate_realtime_alignment(
     if tolerance <= 0:
         raise ValueError("行情对齐容差必须大于 0")
     snapshot.require_fresh()
+    normalized_history: dict[str, pd.DataFrame] = {}
+    for history_code, frame in history_map.items():
+        try:
+            normalized_history[normalized_security_code(history_code)] = frame
+        except ValueError:
+            continue
     valid: set[str] = set()
     rejected: dict[str, str] = {}
     for code, quote in realtime_quotes.items():
-        frame = history_map.get(code)
+        try:
+            raw_code = normalized_security_code(code)
+        except ValueError:
+            rejected[code] = "证券代码格式无效"
+            continue
+        frame = normalized_history.get(raw_code)
         if frame is None or frame.empty:
             rejected[code] = "缺少历史行情"
             continue
@@ -311,34 +405,51 @@ class RobustV2Strategy:
         rows.sort(key=lambda row: (float(row["score"]), str(row["code"])), reverse=True)
         return rows
 
-    def score_stocks(
+    def scan_stocks(
         self,
         history_map: Mapping[str, pd.DataFrame],
         snapshot: MarketSnapshot,
         account_value: float,
         name_map: Mapping[str, str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """筛选沪深主板并计算价值、规模、反转和盈利质量分数。"""
+    ) -> StockScanResult:
+        """筛选沪深主板并返回候选及每层过滤原因统计。"""
         snapshot.require_fresh()
         names = name_map or {}
         candidates: list[dict[str, Any]] = []
+        filter_counts: Counter[str] = Counter()
+
+        def reject(reason: str) -> None:
+            """记录首个淘汰原因，确保统计总量可核对。"""
+            filter_counts[reason] += 1
+
         for code, original in history_map.items():
             if get_stock_board(code) != "mainboard":
+                reject("non_mainboard")
                 continue
-            frame = _slice_as_of(original, snapshot.trade_date)
+            try:
+                frame = _slice_as_of(original, snapshot.trade_date)
+            except (TypeError, ValueError):
+                reject("invalid_market_data")
+                continue
             if len(frame) < self.config.stock_min_history_days:
+                reject("insufficient_history")
                 continue
             if not _contains_trade_date(frame, snapshot.trade_date):
+                reject("missing_signal_date")
                 continue
             if not _contains_trade_date(frame, snapshot.previous_trade_date):
+                reject("missing_previous_trade_date")
                 continue
             close = _numeric_series(frame, "close")
             if len(close) < self.config.stock_min_history_days:
+                reject("insufficient_history")
                 continue
             price = float(close.iloc[-1])
             if not self.config.stock_min_price <= price <= self.config.stock_max_price:
+                reject("price_out_of_range")
                 continue
             if price * 100 > account_value * self.config.max_single_stock:
+                reject("lot_too_expensive")
                 continue
 
             last = frame.iloc[-1]
@@ -350,14 +461,17 @@ class RobustV2Strategy:
                 bool(last.get("is_st", False)) if hasattr(last, "get") else False
             )
             if is_st_value or "ST" in name.upper():
+                reject("st_or_delisting")
                 continue
             trade_status = _latest_number(frame, "tradestatus")
             if trade_status is not None and trade_status == 0:
+                reject("suspended")
                 continue
             suspended = (
                 bool(last.get("is_suspended", False)) if hasattr(last, "get") else False
             )
             if suspended:
+                reject("suspended")
                 continue
 
             pb = _latest_number(frame, "pb", "pbMRQ")
@@ -370,6 +484,7 @@ class RobustV2Strategy:
                 pb is None
                 or not self.config.stock_min_pb <= pb <= self.config.stock_max_pb
             ):
+                reject("pb_out_of_range")
                 continue
             if (
                 market_cap is None
@@ -377,14 +492,18 @@ class RobustV2Strategy:
                 <= market_cap
                 <= self.config.stock_max_market_cap
             ):
+                reject("market_cap_out_of_range")
                 continue
             # BaoStock 日线稳定提供 peTTM；财报列存在时允许用净利润作更直接判断。
             if net_profit is not None:
                 if net_profit <= 0:
+                    reject("unprofitable")
                     continue
             elif pe is None or pe <= 0:
+                reject("unprofitable")
                 continue
             if _average_amount(frame) < self.config.stock_min_avg_amount:
+                reject("insufficient_liquidity")
                 continue
 
             ma20 = float(close.tail(20).mean())
@@ -393,9 +512,14 @@ class RobustV2Strategy:
             reversal = float(
                 close.iloc[-1] / close.iloc[-(self.config.stock_reversal_days + 1)] - 1
             )
-            if price < ma120 or price / ma20 > self.config.stock_max_price_ma20:
+            if price < ma120:
+                reject("below_ma120")
+                continue
+            if price / ma20 > self.config.stock_max_price_ma20:
+                reject("overextended_ma20")
                 continue
             if gain_5d > self.config.stock_max_5d_gain:
+                reject("excessive_5d_gain")
                 continue
             roe = _latest_number(frame, "roe", "roe_avg")
             quality = roe if roe is not None else (1 / pe if pe and pe > 0 else 0.0)
@@ -412,34 +536,54 @@ class RobustV2Strategy:
                 }
             )
 
-        if not candidates:
-            return []
-        pb_scores = _percentile(
-            [float(row["pb"]) for row in candidates], lower_is_better=True
-        )
-        size_scores = _percentile(
-            [float(row["market_cap"]) for row in candidates],
-            lower_is_better=True,
-        )
-        reversal_scores = _percentile(
-            [float(row["reversal"]) for row in candidates],
-            lower_is_better=True,
-        )
-        quality_scores = _percentile(
-            [float(row["quality"]) for row in candidates],
-            lower_is_better=False,
-        )
-        for index, row in enumerate(candidates):
-            row["score"] = (
-                0.30 * pb_scores[index]
-                + 0.25 * size_scores[index]
-                + 0.25 * reversal_scores[index]
-                + 0.20 * quality_scores[index]
+        if candidates:
+            pb_scores = _percentile(
+                [float(row["pb"]) for row in candidates], lower_is_better=True
             )
-        candidates.sort(
-            key=lambda row: (float(row["score"]), str(row["code"])), reverse=True
+            size_scores = _percentile(
+                [float(row["market_cap"]) for row in candidates],
+                lower_is_better=True,
+            )
+            reversal_scores = _percentile(
+                [float(row["reversal"]) for row in candidates],
+                lower_is_better=True,
+            )
+            quality_scores = _percentile(
+                [float(row["quality"]) for row in candidates],
+                lower_is_better=False,
+            )
+            for index, row in enumerate(candidates):
+                row["score"] = (
+                    0.30 * pb_scores[index]
+                    + 0.25 * size_scores[index]
+                    + 0.25 * reversal_scores[index]
+                    + 0.20 * quality_scores[index]
+                )
+            candidates.sort(
+                key=lambda row: (float(row["score"]), str(row["code"])),
+                reverse=True,
+            )
+        ordered_counts = {
+            reason: filter_counts[reason]
+            for reason in STOCK_FILTER_LABELS
+            if filter_counts[reason] > 0
+        }
+        return StockScanResult(
+            input_count=len(history_map),
+            candidates=tuple(candidates),
+            filter_counts=ordered_counts,
         )
-        return candidates
+
+    def score_stocks(
+        self,
+        history_map: Mapping[str, pd.DataFrame],
+        snapshot: MarketSnapshot,
+        account_value: float,
+        name_map: Mapping[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """兼容原调用方，仅返回通过过滤后的个股排序。"""
+        result = self.scan_stocks(history_map, snapshot, account_value, name_map)
+        return [dict(candidate) for candidate in result.candidates]
 
     def generate_target(
         self,
@@ -448,6 +592,8 @@ class RobustV2Strategy:
         stock_history: Mapping[str, pd.DataFrame],
         account_value: float,
         name_map: Mapping[str, str] | None = None,
+        *,
+        stock_scan_result: StockScanResult | None = None,
     ) -> TargetPortfolio:
         """从 T 日收盘数据生成目标仓位，成交必须留给 T+1 执行层。"""
         if account_value <= 0:
@@ -483,7 +629,10 @@ class RobustV2Strategy:
         stock_budget = min(
             self.config.stock_target, self.config.max_single_stock, remaining_total
         )
-        stock_rows = self.score_stocks(stock_history, snapshot, account_value, name_map)
+        stock_scan = stock_scan_result or self.scan_stocks(
+            stock_history, snapshot, account_value, name_map
+        )
+        stock_rows = stock_scan.candidates
         if self.config.enable_stock_enhancement and stock_budget > 0 and stock_rows:
             row = stock_rows[0]
             if float(row["price"]) * 100 <= account_value * stock_budget:
@@ -525,9 +674,17 @@ class RobustV2Strategy:
         trade_date: str,
     ) -> list[OrderIntent]:
         """生成盘中唯一允许的灾难止损订单，不处理普通技术退出。"""
+        normalized_prices: dict[str, float] = {}
+        for price_code, price in current_prices.items():
+            try:
+                normalized_prices[normalized_security_code(price_code)] = float(price)
+            except (TypeError, ValueError):
+                continue
         orders: list[OrderIntent] = []
         for code, position in positions.items():
-            current = float(current_prices.get(code, 0) or 0)
+            current = float(
+                normalized_prices.get(normalized_security_code(code), 0) or 0
+            )
             average_cost = float(position.get("avg_cost", 0) or 0)
             if current <= 0 or average_cost <= 0:
                 continue

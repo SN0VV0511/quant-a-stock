@@ -11,6 +11,7 @@ import json
 import logging
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,25 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from backtest.robust_v2 import (  # noqa: E402
+    BacktestResult,
     RobustPortfolioBacktester,
     RobustWalkForwardSelector,
     selection_to_dict,
 )
 
 LOGGER = logging.getLogger("robust_walk_forward")
+
+
+def _dashboard_series(name: str, result: BacktestResult) -> dict[str, Any]:
+    """把统一回测结果转换为仪表盘曲线协议。"""
+    return {
+        "name": name,
+        "metrics": result.metrics,
+        "equity": [
+            {"date": row["date"], "value": row["total_value"]}
+            for row in result.daily_values
+        ],
+    }
 
 
 def _load_frame(path: Path) -> pd.DataFrame:
@@ -138,6 +152,19 @@ def run_selection(
     payload = selection_to_dict(selection)
     start = selection.locked_test.start_date
     end = selection.locked_test.end_date
+    payload.update(
+        {
+            "strategy_version": "robust_v2",
+            "status": "locked_out_of_sample",
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "window": f"{start} - {end} 锁定样本外区间",
+            "series": [
+                _dashboard_series("robust_v2", selection.locked_test),
+                _dashboard_series("robust_v2 双倍滑点", selection.stress_test),
+                _dashboard_series("纯 ETF 基线", selection.pure_etf_test),
+            ],
+        }
+    )
     payload["comparisons"] = {
         "legacy": _legacy_metrics(legacy_baseline),
         "pure_etf": selection.pure_etf_test.metrics,

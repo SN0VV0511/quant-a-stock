@@ -5,8 +5,8 @@ A 股交易规则引擎
 
 from __future__ import annotations
 
-import math
-from datetime import datetime, timedelta
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 from config.settings import (
     COMMISSION_RATE,
@@ -16,12 +16,7 @@ from config.settings import (
     SLIPPAGE_STOCK,
     SLIPPAGE_ETF,
     LOT_SIZE,
-    LIMIT_MAINBOARD,
     LIMIT_ST,
-    LIMIT_CHINEXT,
-    is_etf,
-    is_chinext,
-    is_star_market,
     CASH_BUFFER,
 )
 from trading.instruments import get_instrument_profile
@@ -75,8 +70,21 @@ class TradingRules:
         else:
             limit_pct = self.get_price_limit_pct(code, name=name)
 
-        upper_limit = round(prev_close * (1 + limit_pct), 2)
-        lower_limit = round(prev_close * (1 - limit_pct), 2)
+        previous = Decimal(str(prev_close))
+        percentage = Decimal(str(limit_pct))
+        tick = Decimal("0.01")
+        upper_limit = float(
+            (previous * (Decimal("1") + percentage)).quantize(
+                tick,
+                rounding=ROUND_HALF_UP,
+            )
+        )
+        lower_limit = float(
+            (previous * (Decimal("1") - percentage)).quantize(
+                tick,
+                rounding=ROUND_HALF_UP,
+            )
+        )
 
         if current_price >= upper_limit:
             return False, True, "涨停"

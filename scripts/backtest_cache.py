@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 import sys
 import threading
@@ -85,7 +84,7 @@ def _is_generating(root_dir: Path) -> bool:
         started = float(path.read_text(encoding="utf-8").strip() or "0")
     except (OSError, ValueError):
         return False
-    # strategy_ab 正常不应跑超过 2 小时;超过视为过期锁,允许新任务覆盖。
+    # robust_v2 滚动样本外选择正常不应跑超过 2 小时；超过视为过期锁。
     return time.time() - started < 7200
 
 
@@ -112,6 +111,15 @@ def get_backtest_cache_status(
     age_hours = (time.time() - path.stat().st_mtime) / 3600
     stale = age_hours > max_age_hours
     payload = _read_json(path)
+    if payload.get("strategy_version") != "robust_v2":
+        return BacktestCacheStatus(
+            available=False,
+            generating=generating,
+            stale=False,
+            path=str(path),
+            error=str(error_data.get("error", "")),
+            message="现有回测不是 robust_v2，已停止展示旧策略结果",
+        )
     return BacktestCacheStatus(
         available=True,
         generating=generating,
@@ -125,15 +133,28 @@ def get_backtest_cache_status(
 
 
 def _run_generation(root_dir: Path, universe_size: int) -> None:
-    """同步执行一次策略 A/B 回测并维护锁/错误文件。"""
+    """同步执行 robust_v2 滚动样本外回测并维护锁/错误文件。"""
     root_dir = root_dir.resolve()
     lock = _lock_path(root_dir)
     err = _error_path(root_dir)
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.write_text(str(time.time()), encoding="utf-8")
     try:
-        command = [sys.executable, "-m", "scripts.strategy_ab", str(universe_size)]
-        LOGGER.info("自动生成回测对比: %s", " ".join(command))
+        # 保留 universe_size 参数只为兼容旧调用；robust_v2 必须读取完整历史股票池，
+        # 不允许通过当前股票池抽样回填历史。
+        del universe_size
+        command = [
+            sys.executable,
+            "-m",
+            "scripts.robust_walk_forward",
+            "--data-root",
+            str(root_dir / "data" / "robust_research"),
+            "--output",
+            str(_artifact_path(root_dir)),
+            "--selected-config",
+            str(root_dir / "data" / "robust_v2_selected.json"),
+        ]
+        LOGGER.info("自动生成 robust_v2 回测: %s", " ".join(command))
         completed = subprocess.run(
             command,
             cwd=str(root_dir),
@@ -144,18 +165,25 @@ def _run_generation(root_dir: Path, universe_size: int) -> None:
         )
         if completed.returncode != 0:
             raise RuntimeError(
-                f"strategy_ab 退出码 {completed.returncode}: "
+                f"robust_walk_forward 退出码 {completed.returncode}: "
                 f"{(completed.stderr or completed.stdout)[-1000:]}"
             )
+        payload = _read_json(_artifact_path(root_dir))
+        if payload.get("strategy_version") != "robust_v2":
+            raise RuntimeError("robust_v2 回测未生成有效仪表盘产物")
         if err.exists():
             err.unlink()
     except Exception as exc:  # noqa: BLE001 - 需要记录后台任务失败原因
         LOGGER.warning("自动生成回测失败: %s", exc)
         err.write_text(
-            json.dumps({
-                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "error": str(exc),
-            }, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     finally:
@@ -179,7 +207,7 @@ def ensure_backtest_cache(
         root_dir: 项目根目录。
         async_run: True 时后台生成,False 时当前进程同步生成。
         force: 是否忽略缓存强制刷新。
-        universe_size: ``strategy_ab`` 抽样股票数量。
+        universe_size: 兼容旧接口，robust_v2 不使用当前股票池抽样。
         max_age_hours: 缓存最大可接受年龄。
 
     Returns:

@@ -5,8 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
-import pytest
-
 from reports.ledger_report import build_daily_ledger_report, format_daily_ledger_report
 from scripts.monthly_review import build_review
 from scripts.paper_v2_init import initialize_paper_v2
@@ -110,8 +108,8 @@ def test_ledger_daily_and_explicit_monthly_report_include_cost_versions(
     ledger.close()
 
 
-def test_monthly_report_rejects_mixed_run_ids(tmp_path: Path) -> None:
-    """未指定 run_id 时不得把两次部署会话拼成一份月报。"""
+def test_monthly_report_keeps_continuous_account_across_run_ids(tmp_path: Path) -> None:
+    """容器重启只改变审计批次，不应切断虚拟账户月度净值。"""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     ledger = PaperLedger(data_dir / "paper_v2.db", initial_cash=50_000)
@@ -138,8 +136,11 @@ def test_monthly_report_rejects_mixed_run_ids(tmp_path: Path) -> None:
     ledger.finish_run(second.run_id)
     ledger.close()
 
-    with pytest.raises(ValueError, match="多个 run_id"):
-        build_review(tmp_path, start_date="20260708", end_date="20260709")
+    review = build_review(tmp_path, start_date="20260708", end_date="20260709")
+
+    assert review.start_date == "20260708"
+    assert review.end_date == "20260709"
+    assert review.run_id == second.run_id
 
 
 def test_acceptance_requires_twenty_observed_days_and_passes_clean_ledger(

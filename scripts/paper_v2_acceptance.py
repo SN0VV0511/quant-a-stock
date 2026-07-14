@@ -8,6 +8,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,36 @@ def _t1_violations(trades: list[dict[str, Any]]) -> int:
             lot["shares"] -= take
             remaining -= take
     return violations
+
+
+def _has_valid_quote_evidence(
+    raw: dict[str, Any], *, action: str, trade_date: str
+) -> bool:
+    """复核成交订单是否保存了当日、可交易且未停牌的行情证据。"""
+    metadata = raw.get("order_metadata", {})
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("data_health_checked") is not True
+    ):
+        return False
+    quote = metadata.get("execution_quote", {})
+    if not isinstance(quote, dict) or str(quote.get("trade_date", "")) != trade_date:
+        return False
+    try:
+        quote_time = datetime.strptime(
+            str(quote.get("quote_time", "")), "%Y-%m-%d %H:%M:%S"
+        )
+    except ValueError:
+        return False
+    if quote_time.strftime("%Y%m%d") != trade_date:
+        return False
+    if bool(quote.get("is_suspended", True)):
+        return False
+    if action == "buy" and quote.get("can_buy") is not True:
+        return False
+    if action == "sell" and quote.get("can_sell") is not True:
+        return False
+    return float(quote.get("current_price", 0) or 0) > 0
 
 
 def run_acceptance(
@@ -158,11 +189,13 @@ def run_acceptance(
     connection = sqlite3.connect(ledger_path)
     connection.row_factory = sqlite3.Row
     try:
-        duplicate_keys = int(connection.execute("""
+        duplicate_keys = int(
+            connection.execute("""
             SELECT COUNT(*) FROM (
                 SELECT idempotency_key FROM orders GROUP BY idempotency_key HAVING COUNT(*) > 1
             )
-            """).fetchone()[0])
+            """).fetchone()[0]
+        )
         active_runs = int(
             connection.execute(
                 "SELECT COUNT(*) FROM runs WHERE account_id = ? AND status = 'running'",
@@ -180,7 +213,8 @@ def run_acceptance(
             clauses.append("run_id = ?")
             params.append(run_id)
         rows = connection.execute(
-            f"SELECT source, reason, raw_json FROM orders WHERE {' AND '.join(clauses)}",
+            f"SELECT source, reason, action, trade_date, raw_json "
+            f"FROM orders WHERE {' AND '.join(clauses)}",
             params,
         ).fetchall()
     finally:
@@ -196,10 +230,10 @@ def run_acceptance(
             raw = json.loads(str(row["raw_json"] or "{}"))
         except json.JSONDecodeError:
             raw = {}
-        metadata = raw.get("order_metadata", {})
-        if (
-            not isinstance(metadata, dict)
-            or metadata.get("data_health_checked") is not True
+        if not _has_valid_quote_evidence(
+            raw,
+            action=str(row["action"]),
+            trade_date=str(row["trade_date"]),
         ):
             stale_orders += 1
     defensive_count = sum(row["reason"] == "COMBO_DEFENSIVE_EXIT" for row in rows)
