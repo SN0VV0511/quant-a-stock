@@ -644,6 +644,7 @@ def run_daemon(
         container_id=socket.gethostname(),
     )
     stopping = False
+    reported_dates: set[str] = set()
 
     def _stop(_signum: int, _frame: Any) -> None:
         nonlocal stopping
@@ -662,17 +663,23 @@ def run_daemon(
                 runner.execute_pending_target(trade_date)
                 runner.monitor_catastrophic_stops(trade_date)
             elif now.time() >= dt_time(15, 5):
-                target = runner.generate_close_target(trade_date)
-                data_version = (
-                    target.source_snapshot_hash
-                    if target is not None
-                    else (
-                        runner.ledger.latest_signal_hash(runner.config.strategy_version)
-                        or "no-signal"
+                # 收盘处理每天只在首次进入收盘窗口时执行一次，
+                # 避免每分钟重复生成日报 / 重复打印“跳过目标生成”。
+                if trade_date not in reported_dates:
+                    target = runner.generate_close_target(trade_date)
+                    data_version = (
+                        target.source_snapshot_hash
+                        if target is not None
+                        else (
+                            runner.ledger.latest_signal_hash(runner.config.strategy_version)
+                            or "no-signal"
+                        )
                     )
-                )
-                path = runner.record_close_and_report(trade_date, data_version)
-                LOGGER.info("收盘日报: %s", path)
+                    path = runner.record_close_and_report(trade_date, data_version)
+                    LOGGER.info("收盘日报: %s", path)
+                    reported_dates.add(trade_date)
+                else:
+                    LOGGER.debug("%s 收盘处理今日已执行，跳过重复日报", trade_date)
             else:
                 LOGGER.info("当前不在 09:35-15:00 执行窗口或 15:05 后收盘窗口")
 

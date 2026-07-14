@@ -96,6 +96,62 @@ def _load_v2_state():
         connection.close()
 
 
+def _parse_momentum_from_reason(reason: str):
+    """从信号 reason 里解析 r20 动量（小数形式）。
+
+    reason 形如：'ETF_RISK_ADJUSTED r20=+29.06% r60=+70.55% r120=+63.62%'。
+    解析失败返回 None。
+    """
+    import re
+    if not reason:
+        return None
+    m = re.search(r"r20=([+\-]?[\d.]+)%", reason)
+    if m:
+        try:
+            return float(m.group(1)) / 100
+        except ValueError:
+            return None
+    return None
+
+
+def _load_latest_v2_signal():
+    """读取 paper_v2 最新一条信号的 target_json（robust_v2 ETF 目标调仓结果）。
+
+    返回 dict：{signal_date, created_at, executed_at, positions:[...], cash_weight,
+    fallback_reason}，无信号时返回 None。positions 每项含 asset_type/code/name/
+    target_weight/reason。
+    """
+    connection = _v2_connection()
+    if connection is None:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT signal_date, created_at, executed_at, target_json "
+            "FROM signals WHERE account_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (ROBUST_V2_ACCOUNT_ID,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            target = json.loads(row["target_json"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return {
+            "signal_date": str(row["signal_date"]),
+            "created_at": str(row["created_at"]),
+            "executed_at": str(row["executed_at"] or ""),
+            "positions": target.get("positions", []) or [],
+            "cash_weight": target.get("cash_weight"),
+            "fallback_reason": target.get("fallback_reason", ""),
+        }
+    except sqlite3.Error as exc:
+        logger.warning("读取 paper_v2 最新信号失败: %s", exc)
+        return None
+    finally:
+        connection.close()
+
+
 def _load_v2_orders():
     """从幂等订单表读取成交和拒单，供交易页展示。"""
     connection = _v2_connection()
@@ -225,13 +281,46 @@ def load_trade_log():
 def load_rps_state():
     """读取 ETF/RPS 日频轮动状态。"""
     if _load_v2_state() is not None:
+        # robust_v2 不再跑旧版 ETF/RPS 日内轮动策略，但会产出 ETF 目标信号。
+        # 把最新信号里的 ETF 持仓映射为“ETF 入选”展示，使面板反映真实策略。
+        signal = _load_latest_v2_signal()
+        if signal is None:
+            return {
+                "available": False,
+                "status": "research_only",
+                "message": "robust_v2 策略：暂无信号（RPS 日内轮动已随旧策略下线）",
+                "etf_signals": [],
+                "industry_signals": [],
+                "orders": [],
+            }
+        etf_signals = []
+        rank = 1
+        for p in signal.get("positions", []):
+            if str(p.get("asset_type", "")).lower() != "etf":
+                continue
+            etf_signals.append({
+                "rank": rank,
+                "name": p.get("name", str(p.get("code", ""))),
+                "code": str(p.get("code", "")),
+                "rps": round(float(p.get("target_weight", 0)) * 100, 1),
+                "momentum": _parse_momentum_from_reason(p.get("reason", "")) or 0,
+            })
+            rank += 1
+        fallback = signal.get("fallback_reason", "")
+        cash_weight = signal.get("cash_weight")
+        msg = "robust_v2 ETF 目标调仓信号"
+        if cash_weight is not None:
+            msg += f"（现金权重 {round(float(cash_weight) * 100)}%）"
         return {
-            "available": False,
-            "status": "research_only",
-            "message": "paper_v2 不运行旧 ETF/RPS 日内账户策略",
-            "etf_signals": [],
+            "available": True,
+            "status": "ok",
+            "message": msg,
+            "date": signal.get("signal_date", ""),
+            "etf_signals": etf_signals,
+            "etf_loaded": len(etf_signals),
             "industry_signals": [],
             "orders": [],
+            "errors": [fallback] if fallback else [],
         }
     if not os.path.exists(RPS_STATE_FILE):
         return {
@@ -321,6 +410,34 @@ def is_process_running(name):
         result = subprocess.run(["pgrep", "-f", name], capture_output=True, text=True)
         return result.returncode == 0
     except Exception:
+        return False
+
+
+def is_robust_alive_via_ledger() -> bool:
+    """通过 paper_v2 账本的活跃租约判断 robust_runner 是否存活。
+
+    robust_runner 以 daemon 模式运行，每轮主循环都会续租 SQLite 账本租约
+    (heartbeat_lease)，租约 TTL 默认 90 秒。该进程与 web 面板分处不同容器，
+    跨容器 pgrep 不可见；且它在交易时段仅在发生调仓/止损时才写日志，日志
+    mtime 不能反映存活。因此直接读取共享卷上的 paper_v2.db 租约最可靠。
+    """
+    import time
+    db_path = os.path.join(DATA_DIR, "paper_v2.db")
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            cur = connection.cursor()
+            cur.execute(
+                "SELECT expires_at FROM leases WHERE account_id='paper_v2'"
+            )
+            row = cur.fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return False
+        return float(row[0]) > time.time()
+    except Exception as exc:
+        logger.warning("读取 paper_v2 租约失败: %s", exc)
         return False
 
 
@@ -778,15 +895,44 @@ class QuantHandler(SimpleHTTPRequestHandler):
         return result
 
     def _api_candidates(self):
-        """候选股实时价格"""
+        """候选标的实时价格。
+
+        robust_v2 不再产出旧版 live_runner 的“扫描完成，候选股”日志格式，
+        而是将目标组合写入 paper_v2.db 的 signals 表。因此直接读最新信号
+        的 target_json positions 作为候选雷达数据。旧日志解析作为 fallback。
+        """
+        signal = _load_latest_v2_signal()
+        if signal is not None:
+            positions = signal.get("positions", [])
+            codes = [str(p.get("code")) for p in positions if p.get("code")]
+            prices = get_realtime_prices(codes) if codes else {}
+            candidates = []
+            for idx, p in enumerate(positions, start=1):
+                code = str(p.get("code", ""))
+                price = prices.get(code, 0)
+                candidates.append({
+                    "rank": idx,
+                    "name": p.get("name", code),
+                    "code": code,
+                    "asset_type": p.get("asset_type", ""),
+                    "momentum": _parse_momentum_from_reason(p.get("reason", "")) or 0,
+                    "score": round(float(p.get("target_weight", 0)) * 100, 1),
+                    "reason": p.get("reason", ""),
+                    "current_price": round(price, 2) if price else 0,
+                })
+            return {
+                "candidates": candidates,
+                "updated_at": signal.get("executed_at") or signal.get("created_at", ""),
+                "fallback_reason": signal.get("fallback_reason", ""),
+            }
+
+        # fallback：旧版 live_runner 日志解析
         scan = self._api_scan()
         stocks = scan.get("stocks", [])
         if not stocks:
             return {"candidates": [], "updated_at": ""}
-
         codes = [s["code"] for s in stocks]
         prices = get_realtime_prices(codes)
-
         candidates = []
         for s in stocks:
             code = s["code"]
@@ -795,7 +941,6 @@ class QuantHandler(SimpleHTTPRequestHandler):
                 **s,
                 "current_price": round(price, 2) if price else 0,
             })
-
         return {"candidates": candidates, "updated_at": scan.get("updated_at", "")}
 
     def _api_logs(self, params):
@@ -829,7 +974,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
     def _api_status(self):
         """系统状态"""
-        live_running = is_process_running("robust_runner.py")
+        live_running = is_robust_alive_via_ledger() or is_process_running("robust_runner.py")
         web_running = True  # 自己在跑
 
         # 读取最新日志时间
@@ -846,17 +991,11 @@ class QuantHandler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
-        # 检查线程状态
-        watch_active = False
-        scan_active = False
-        if os.path.exists(LIVE_TODAY_LOG):
-            try:
-                with open(LIVE_TODAY_LOG, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                watch_active = "盯盘线启动" in content and "盯盘线退出" not in content.split("盯盘线启动")[-1]
-                scan_active = "扫描线启动" in content and "扫描线退出" not in content.split("扫描线启动")[-1]
-            except Exception:
-                pass
+        # robust_runner 以单进程 daemon 运行，主循环同时负责目标执行与暴跌监控，
+        # 并每轮续租 paper_v2 账本租约。用账本活跃租约统一代表盯盘/扫描状态，
+        # 避免旧版 live_runner 的日志/线程字符串检测对 robust_runner 全部失效。
+        watch_active = live_running
+        scan_active = live_running
 
         return {
             "live_runner": live_running,
@@ -868,8 +1007,23 @@ class QuantHandler(SimpleHTTPRequestHandler):
         }
 
     def _api_observation(self):
-        """虚拟盘观察期统一状态。"""
-        return asdict(build_status(ROOT_DIR, log_lines=30))
+        """虚拟盘观察期统一状态。
+
+        build_status 的 service 检测针对旧版 paper_daemon.pid，对跨容器运行的
+        robust_runner 失效。用 paper_v2 账本活跃租约修正 service.running。
+        """
+        status = asdict(build_status(ROOT_DIR, log_lines=30))
+        try:
+            alive = is_robust_alive_via_ledger()
+            service = status.get("service") or {}
+            if alive:
+                service["running"] = True
+                if not service.get("message") or service.get("message") == "stopped":
+                    service["message"] = "robust_runner 运行中（账本租约活跃）"
+                status["service"] = service
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("修正 observation service 状态失败: %s", exc)
+        return status
 
     def _api_rps(self):
         """ETF/RPS 日频轮动状态。"""
