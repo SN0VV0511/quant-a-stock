@@ -120,6 +120,55 @@ def test_single_writer_lease_expires_and_can_be_reacquired(tmp_path) -> None:
     assert second.release_lease("instance-b") is True
 
 
+def test_stale_writer_is_fenced_after_another_instance_takes_lease(tmp_path) -> None:
+    """过期实例即使仍在运行，也不能在新持有者接管后继续写账本。"""
+    first = _ledger(tmp_path)
+    second = PaperLedger(tmp_path / "paper_v2.db", initial_cash=50_000)
+    second.connect()
+    now = datetime.now()
+    first.acquire_lease("instance-a", 1, now=now)
+    second.acquire_lease("instance-b", 30, now=now + timedelta(seconds=2))
+
+    with pytest.raises(LeaseUnavailableError, match="写租约已失效"):
+        first.record_snapshot(
+            {},
+            snapshot_date="20260710",
+            data_version="stale-writer",
+            strategy_version="robust_v2",
+        )
+
+    assert first.release_lease("instance-a") is False
+    assert second.release_lease("instance-b") is True
+
+
+def test_failed_daily_job_respects_retry_backoff(tmp_path) -> None:
+    """收盘数据故障不得在每个 60 秒轮询中立即重打上游。"""
+    ledger = _ledger(tmp_path)
+    now = datetime(2026, 7, 10, 15, 5)
+
+    assert ledger.claim_daily_job("close_cycle", "20260710", now=now) is True
+    ledger.finish_daily_job(
+        "close_cycle",
+        "20260710",
+        error="upstream unavailable",
+        retry_after_seconds=900,
+        now=now,
+    )
+
+    assert (
+        ledger.claim_daily_job(
+            "close_cycle",
+            "20260710",
+            now=now + timedelta(seconds=899),
+        )
+        is False
+    )
+    retry_at = now + timedelta(seconds=900)
+    assert ledger.claim_daily_job("close_cycle", "20260710", now=retry_at) is True
+    ledger.finish_daily_job("close_cycle", "20260710", now=retry_at)
+    assert ledger.daily_job_completed("close_cycle", "20260710") is True
+
+
 def test_production_ledger_rejects_orders_bypassing_allocator(tmp_path) -> None:
     """默认账本不允许旧策略或手工意图绕过唯一组合分配器。"""
     ledger = PaperLedger(tmp_path / "strict.db", initial_cash=50_000)

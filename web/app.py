@@ -1267,6 +1267,8 @@ class QuantHandler(SimpleHTTPRequestHandler):
     def _api_backtest(self):
         """读取最近一次回测结果；缺失或过期时自动后台生成。"""
         status = ensure_backtest_cache(ROOT_DIR, async_run=True)
+        if not status.available:
+            return {**status.to_dict(), "series": []}
         path = os.path.join(REPORT_DIR, "backtest_latest.json")
         if not os.path.exists(path):
             return {**status.to_dict(), "series": []}
@@ -1274,7 +1276,6 @@ class QuantHandler(SimpleHTTPRequestHandler):
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
             data.update(status.to_dict())
-            data["available"] = True
             return data
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("读取回测结果失败: %s", exc)

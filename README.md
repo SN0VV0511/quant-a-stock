@@ -1,7 +1,8 @@
 # A 股量化回测与虚拟盘观察系统
 
 这是一个面向学习、验证和观察期演练的 A 股量化项目。默认账户策略为低频
-`robust_v2`：ETF 为主、沪深主板因子增强、现金不低于 20%，使用 SQLite 单账本。
+`robust_v2`：宽基 ETF 中期趋势、沪深主板盈利收益率/适度规模/低波增强、现金不低于
+20%，使用 SQLite 单账本。
 旧 Combo、RPS 和小市值策略只保留为研究基线，不再默认写虚拟盘账户。
 
 本项目默认只运行虚拟盘，不会发送真实委托。任何实盘接入都必须先经过一个月以上观察期、健康检查和人工确认。
@@ -17,7 +18,7 @@
 
 - 免费数据源：BaoStock 股票历史行情、腾讯股票实时行情、AKShare 交易日历/ETF/行业指数。
 - 回测能力：双均线策略、手续费、印花税、滑点、夏普比率、最大回撤。
-- 策略能力：组合信号、RSI、ETF 动量代理、ETF / 行业 RPS 轮动、全市场扫描候选池。
+- 策略能力：宽基 ETF 绝对趋势、主板多因子增强、ETF / 行业 RPS 研究基线、全市场扫描候选池。
 - 虚拟盘：SQLite 单账本、分批 T+1、幂等订单、单实例写租约、整手和分证券费用。
 - 风控：标的范围、白名单买入、ST / 停牌过滤、资金检查、回撤和单日亏损控制。
 - 观测：`trade_events.jsonl` 记录信号、风控、成交和账户快照。
@@ -31,13 +32,16 @@ AKShare 只是 Python 数据接口库，不是股票标的。本项目当前交�
 - 沪市股票：`600`、`601`、`603`、`605`、`688`、`689` 开头。
 - 深市股票：`000`、`001`、`002`、`003`、`300`、`301` 开头。
 - 沪市 ETF：`51`、`56`、`58` 开头；深市 ETF：`15` 开头。
-- 默认 5 万资金账户配置只直接买入沪深主板股票和场内 ETF，不直接买入创业板
+- 默认 5 万资金 `robust_v2` 账户只直接买入沪深主板股票和宽基 ETF，不直接买入创业板
   `300/301`、科创板 `688/689`、可转债、港股通或融资融券标的。
 - 如账户已确认开通额外权限，可复制 `config/permissions.example.yaml` 为
   `config/permissions.yaml`，或设置 `ALLOW_CHINEXT_STOCKS=true`、
-  `ALLOW_STAR_MARKET_STOCKS=true` 等环境变量。未开通时，创业板/科创板方向通过
-  ETF（如创业板 ETF、科创 50 ETF、半导体 ETF）参与。
-- 实时全市场扫描仍只扫描沪深 A 股股票；ETF 走日频 RPS/动量模块；行业指数只做强弱观察，不直接下单。
+  `ALLOW_STAR_MARKET_STOCKS=true` 等环境变量；`robust_v2` 仍不会直接买入这些板块股票。
+- `robust_v2` 的 ETF 执行池只含沪深 300、中证 500、中证 1000、创业板和科创 50
+  等宽基品种；半导体等行业 ETF、行业指数和 RPS 结果只做研究观察，不接入该账户。
+- 实时全市场扫描只扫描沪深 A 股股票。腾讯批量行情用于全市场当日价格、成交量和
+  停牌状态预筛，BaoStock 用于候选历史行情和估值字段；扫描审计会记录
+  `tencent_quote_count`，不再出现“配置了腾讯行情但无法证明实际使用”的情况。
 - 实时虚拟盘会过滤指数、基金、港股、美股、B 股、北交所和市场前缀不一致的代码。
 
 ## OpenClaw 快速使用
@@ -125,11 +129,23 @@ python scripts/paper_v2_init.py --confirm --json
 ./start_live.sh
 # 或
 python robust_runner.py daemon
+# 固定一个月观察期；结束日次日会正常退出
+python robust_runner.py daemon --observation-end-date 20260823
 ```
 
 部署应由 Docker、systemd、supervisor 或 tmux 托管。进程必须先获得 SQLite 写租约；
 第二个实例会直接拒绝启动，不再使用跨目录 `pkill`。Docker 入口已经切换为
 `robust_runner.py daemon`。
+
+macOS 可使用仓库内的一月观察期 LaunchAgent；模板固定使用 50,000 元虚拟盘，并在
+`2026-08-23` 结束日之后正常退出：
+
+```bash
+cp deploy/launchd/com.xueds.quant-a-stock.paper-v2.plist \
+  ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" \
+  ~/Library/LaunchAgents/com.xueds.quant-a-stock.paper-v2.plist
+```
 
 也可以直接使用生产化容器编排；它会先初始化单账本，再启动守护进程和只读面板：
 
@@ -146,7 +162,8 @@ docker compose logs -f paper-live
 
 运行时序固定如下：
 
-1. 每个交易日 15:05 后更新一次只读个股候选观察；每周最后一个交易日才用 T 日复权数据生成正式 `TargetPortfolio`，不在收盘直接下单。
+1. 每个交易日 15:05 后更新一次只读个股候选观察；默认只在每月最后一个交易日用
+   T 日复权数据生成正式 `TargetPortfolio`，不在收盘直接下单。
 2. T+1 日 09:35 后，统一分配器把目标权重转换为整手订单并保留目标现金。
 3. 盘中每 60 秒只检查行情健康和 7% 股票/10% ETF 灾难止损。
 4. 普通退出必须由收盘目标确认；旧 `COMBO_DEFENSIVE_EXIT`、追涨和盘中补仓不接入账户。
@@ -184,9 +201,20 @@ python scripts/robust_walk_forward.py \
 ```
 
 脚本固定评估 32 组参数，使用 24 个月训练后接 6 个月滚动验证，最后 12 个月
-完全锁定；门槛不通过或双倍滑点下落后于基准时，自动降级为最多 60% ETF + 现金。
+完全锁定；门槛不通过或双倍滑点下落后于基准时，自动降级为最多 48% 宽基 ETF +
+现金。
 通过后会写入 `data/robust_v2_selected.json`，下次启动时由 `robust_runner` 自动加载；
 文件缺失时使用本计划的推荐默认参数。
+
+策略取舍依据：
+
+- 中国 A 股因子研究显示，盈利收益率比账面市值比更能解释本地价值效应，并建议排除
+  最小 30% 公司：[Size and value in China](https://www.sciencedirect.com/science/article/pii/S0304405X19300625)。
+- 纳入交易成本后，市场、规模和按月更新的盈利收益率是更简洁的组合：
+  [Factor models for Chinese A-shares](https://www.sciencedirect.com/science/article/pii/S105752192300491X)。
+- 中国市场周/月价格动量并不稳定，较明显的是短周期日内延续，因此本项目不把个股
+  中期价格动量或深度反转作为主排序因子：
+  [Daily Momentum and New Investors in an Emerging Stock Market](https://www.nber.org/papers/w31839)。
 
 ## Web 仪表盘
 
@@ -291,10 +319,16 @@ python scripts/paper_v2_acceptance.py --start 20260710 --end 20260810
 
 - `INITIAL_CAPITAL`：回测和虚拟盘初始资金。
 - `ROBUST_V2_MAX_TOTAL_POSITION`：V2 总仓位上限，默认 80%。
-- `ROBUST_V2_ETF_TARGET` / `ROBUST_V2_STOCK_TARGET`：默认 60% / 20%。
+- `ROBUST_V2_ETF_TARGET` / `ROBUST_V2_STOCK_TARGET`：默认 48% / 32%。
+- `ROBUST_V2_MAX_SINGLE_ETF` / `ROBUST_V2_MAX_SINGLE_STOCK`：默认 24% / 16%。
+- `ROBUST_V2_MIN_STOCK_ORDER_AMOUNT`：V2 个股最低订单，默认 4000 元，确保
+  5 万账户的 16% 目标经整手取整后仍可执行。
+- `ROBUST_V2_REBALANCE_DAYS`：低频调仓档位，默认 `20`（月末）。
+- `ROBUST_V2_DAILY_JOB_RETRY_SECONDS`：收盘数据任务失败后的重试退避，默认
+  900 秒，避免每分钟重复请求上游。
 - `ROBUST_V2_MIN_CASH`：现金下限，默认 20%。
 - `ROBUST_V2_LEDGER_PATH`：唯一 SQLite 账本。
-- `MIN_STOCK_ORDER_AMOUNT`：股票最低建议买入成交额，默认 8000 元。
+- `MIN_STOCK_ORDER_AMOUNT`：旧策略股票最低建议买入成交额，默认 8000 元。
 - `MIN_ETF_ORDER_AMOUNT`：ETF 最低建议买入成交额，默认 5000 元。
 - `PERMISSIONS_FILE`：可选账户权限配置文件，默认读取 `config/permissions.yaml`。
 - `CASH_BUFFER`：现金缓冲。
@@ -310,6 +344,11 @@ ROBUST_V2_LEDGER_PATH=data/paper_v2.db
 ENFORCE_T1=true
 LIVE_TRADING_ENABLED=false
 ROBUST_V2_MONITOR_INTERVAL_SECONDS=60
+ROBUST_V2_ETF_TARGET=0.48
+ROBUST_V2_STOCK_TARGET=0.32
+ROBUST_V2_MIN_STOCK_ORDER_AMOUNT=4000
+ROBUST_V2_REBALANCE_DAYS=20
+ROBUST_V2_DAILY_JOB_RETRY_SECONDS=900
 PERMISSIONS_FILE=config/permissions.yaml
 ALLOW_CHINEXT_STOCKS=false
 ALLOW_STAR_MARKET_STOCKS=false
@@ -372,11 +411,15 @@ reports/daily_v2_YYYYMMDD.txt   含毛/净收益、成本、换手和版本的�
 - 金叉买入：短均线上穿长均线。
 - 死叉卖出：短均线下穿长均线。
 
-实时组合策略：
+`robust_v2` 组合策略：
 
-- 使用全市场扫描生成候选池。
-- 对候选股进行组合信号判断。
-- 对持仓执行止损、止盈和策略卖出检查。
+- 宽基 ETF 必须位于 MA200 之上、60 日收益为正且未出现 20 日急跌，再按
+  20/60/120 日风险调整收益排序。
+- 主板个股先校验盈利收益率、历史完整性、流动性、MA200、20 日急跌和 120 日波动，
+  再按盈利收益率、适度规模和低波动评分；不再用 PB 或“越跌越买”的短期反转因子。
+- 默认目标为 2 只宽基 ETF 各不超过 24%、2 只主板股各不超过 16%，至少保留 20%
+  现金；没有合格标的时自动持有更多现金。
+- 盘中只允许灾难止损，普通调仓由月末收盘目标在 T+1 执行。
 
 风控规则：
 
@@ -480,7 +523,8 @@ A 股股票当日买入不能当日卖出。日志中出现 `T+1 限制（买入
 
 ### 为什么总仓位限制拒绝买入？
 
-`MAX_TOTAL_POSITION` 默认是 90%。当持仓市值已经接近或超过该阈值时，新增买入会被拒绝。
+旧策略的 `MAX_TOTAL_POSITION` 默认是 90%；`robust_v2` 使用独立的
+`ROBUST_V2_MAX_TOTAL_POSITION=0.80`。当持仓市值已经接近或超过对应阈值时，新增买入会被拒绝。
 
 ### BaoStock 或行情获取失败怎么办？
 

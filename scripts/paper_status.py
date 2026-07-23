@@ -10,6 +10,7 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -63,6 +64,27 @@ def _safe_section(
         return fallback
 
 
+def _v2_observation_range(
+    days: int,
+    latest_snapshot_date: str | None,
+) -> tuple[str, str]:
+    """以最新有效快照为锚点，缺少快照时退回今天。"""
+    if days <= 0:
+        raise ValueError("观察天数必须大于 0")
+    today = datetime.strptime(format_local("%Y%m%d"), "%Y%m%d").date()
+    anchor = today
+    if latest_snapshot_date:
+        try:
+            snapshot_date = datetime.strptime(latest_snapshot_date, "%Y%m%d").date()
+        except ValueError as exc:
+            raise ValueError(
+                f"paper_v2 最新快照日期格式非法: {latest_snapshot_date}"
+            ) from exc
+        anchor = min(snapshot_date, today)
+    start = anchor - timedelta(days=days - 1)
+    return start.strftime("%Y%m%d"), anchor.strftime("%Y%m%d")
+
+
 def build_status(
     root_dir: Path,
     days: int = 30,
@@ -94,6 +116,55 @@ def build_status(
             None,
         )
         health = asdict(health_result) if health_result is not None else {}
+        if health_result is not None:
+            errors.extend(
+                f"paper_v2 健康检查失败: {failure}"
+                for failure in health_result.failures
+            )
+        metrics = health.get("metrics", {}) if isinstance(health, dict) else {}
+        service = {
+            "running": bool(
+                metrics.get("active_writer_runs") == 1
+                and metrics.get("lease_active") is True
+            ),
+            "source": "paper_v2_lease",
+            "heartbeat_at": metrics.get("lease_heartbeat_at", ""),
+            "message": "robust_v2 SQLite 租约",
+        }
+        logs = {
+            "robust_v2": _tail_lines(
+                root_dir / "logs" / "robust_v2.log",
+                log_lines,
+            )
+        }
+        if metrics.get("ledger_readable") is not True:
+            return ObservationStatus(
+                generated_at=format_local(),
+                root_dir=str(root_dir),
+                service=service,
+                health=health,
+                logs=logs,
+                errors=errors,
+            )
+
+        start_date, end_date = _safe_section(
+            "paper_v2 观察区间",
+            errors,
+            lambda: _v2_observation_range(
+                days,
+                str(metrics.get("latest_snapshot_date") or "") or None,
+            ),
+            ("", ""),
+        )
+        if not start_date or not end_date:
+            return ObservationStatus(
+                generated_at=format_local(),
+                root_dir=str(root_dir),
+                service=service,
+                health=health,
+                logs=logs,
+                errors=errors,
+            )
         review = _safe_section(
             "paper_v2 观察期复盘",
             errors,
@@ -101,13 +172,13 @@ def build_status(
                 build_review(
                     root_dir,
                     days=days,
+                    start_date=start_date,
+                    end_date=end_date,
                     ledger_path=ledger_path,
                 )
             ),
             dict[str, Any](),
         )
-        start_date = str(review.get("start_date") or format_local("%Y%m%d"))
-        end_date = str(review.get("end_date") or format_local("%Y%m%d"))
         acceptance_result = _safe_section(
             "paper_v2 观察期验收",
             errors,
@@ -129,22 +200,6 @@ def build_status(
                 "snapshot_days": acceptance_result.observed_days,
                 "required_snapshot_days": min_snapshot_days,
             }
-        metrics = health.get("metrics", {}) if isinstance(health, dict) else {}
-        service = {
-            "running": bool(
-                metrics.get("active_writer_runs") == 1
-                and metrics.get("lease_active") is True
-            ),
-            "source": "paper_v2_lease",
-            "heartbeat_at": metrics.get("lease_heartbeat_at", ""),
-            "message": "robust_v2 SQLite 租约",
-        }
-        logs = {
-            "robust_v2": _tail_lines(
-                root_dir / "logs" / "robust_v2.log",
-                log_lines,
-            )
-        }
         return ObservationStatus(
             generated_at=format_local(),
             root_dir=str(root_dir),

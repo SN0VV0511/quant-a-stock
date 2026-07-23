@@ -24,3 +24,22 @@ def test_double_week_interval_matches_live_calendar_rule() -> None:
     """双周策略必须跨满两个自然周才允许再次产生目标。"""
     assert rebalance_interval_elapsed("20260717", "20260710", 10) is False
     assert rebalance_interval_elapsed("20260724", "20260710", 10) is True
+
+
+def test_short_holiday_week_still_crosses_weekly_boundary() -> None:
+    """前周五到节前周四也属于新一周，不能因不足七个自然日漏信号。"""
+    assert rebalance_interval_elapsed("20261008", "20261002", 5) is True
+
+
+def test_monthly_schedule_only_signals_at_month_end() -> None:
+    """月度档只允许当月最后一个交易日生成正式目标。"""
+    dates = [
+        "20260729",
+        "20260730",
+        "20260731",
+        "20260803",
+    ]
+
+    assert backtest_rebalance_due(dates, 1, None, 20) is False
+    assert backtest_rebalance_due(dates, 2, None, 20) is True
+    assert rebalance_interval_elapsed("20260831", "20260731", 20) is True

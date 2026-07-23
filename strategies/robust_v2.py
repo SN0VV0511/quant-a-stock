@@ -1,7 +1,7 @@
 """5 万元 A 股虚拟盘稳健策略 V2。
 
-策略层只把收盘数据转换为目标权重，不直接操作账户。ETF 使用多周期风险调整收益，
-个股使用低 PB、中小市值、短期反转和盈利质量，所有成交由统一分配器负责。
+策略层只把收盘数据转换为目标权重，不直接操作账户。ETF 仅从宽基池选择中期趋势，
+个股使用盈利收益率、适度规模和低波动，所有成交由统一分配器负责。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import pandas as pd
 from config.settings import (
     DEFAULT_RPS_ETF_POOL,
     ROBUST_V2_ACCOUNT_ID,
+    ROBUST_V2_BROAD_ETF_CODES,
     ROBUST_V2_ETF_STOP_PCT,
     ROBUST_V2_ETF_TARGET,
     ROBUST_V2_MAX_DATA_AGE_SECONDS,
@@ -45,13 +46,16 @@ STOCK_FILTER_LABELS: dict[str, str] = {
     "lot_too_expensive": "一手金额超过个股预算",
     "st_or_delisting": "ST 或退市风险",
     "suspended": "停牌或不可交易",
-    "pb_out_of_range": "PB 不在价值区间",
     "market_cap_out_of_range": "市值不在目标区间",
     "unprofitable": "盈利质量不合格",
+    "earnings_yield_too_low": "盈利收益率无效或过低",
     "insufficient_liquidity": "近 20 日成交额不足",
-    "below_ma120": "股价低于年线",
+    "excessive_20d_drop": "近 20 日跌幅超过风险阈值",
+    "excessive_120d_volatility": "近 120 日年化波动率过高",
+    "below_ma200": "股价低于 MA200",
     "overextended_ma20": "偏离 MA20 过高",
     "excessive_5d_gain": "近 5 日涨幅过高",
+    "bottom_market_cap_30pct": "候选横截面市值最低 30%",
 }
 
 
@@ -68,19 +72,30 @@ class RobustV2Config:
     max_single_etf: float = ROBUST_V2_MAX_SINGLE_ETF
     max_single_stock: float = ROBUST_V2_MAX_SINGLE_STOCK
     max_etf_count: int = 2
-    max_stock_count: int = 1
+    max_stock_count: int = 2
     etf_lookbacks: tuple[int, int, int] = (20, 60, 120)
-    etf_score_weights: tuple[float, float, float] = (0.4, 0.4, 0.2)
+    etf_score_weights: tuple[float, float, float] = (0.10, 0.45, 0.45)
     etf_min_avg_amount: float = 50_000_000.0
+    etf_trend_ma_days: int = 200
+    etf_min_20d_return: float = -0.05
     enable_etf_trend_filter: bool = True
+    # 兼容旧回测参数；robust_v2 已不再把短期反转用于排序。
     stock_reversal_days: int = 20
     stock_min_history_days: int = 250
     stock_min_price: float = 3.0
     stock_max_price: float = 80.0
+    # 兼容旧配置；PB 仅作为扫描审计字段，不参与过滤或评分。
     stock_min_pb: float = 0.5
     stock_max_pb: float = 8.0
     stock_min_market_cap: float = 3_000_000_000.0
     stock_max_market_cap: float = 30_000_000_000.0
+    stock_market_cap_bottom_exclusion: float = 0.30
+    stock_min_earnings_yield: float = 0.02
+    stock_volatility_days: int = 120
+    stock_max_annual_volatility: float = 0.60
+    stock_min_20d_return: float = -0.15
+    stock_trend_ma_days: int = 200
+    stock_score_weights: tuple[float, float, float] = (0.45, 0.25, 0.30)
     stock_min_avg_amount: float = 100_000_000.0
     stock_max_5d_gain: float = 0.08
     stock_max_price_ma20: float = 1.08
@@ -97,14 +112,28 @@ class RobustV2Config:
             raise ValueError("robust_v2 现金下限不得低于 20%")
         if self.max_total_position + self.min_cash > 1 + 1e-9:
             raise ValueError("总仓位上限与现金下限之和不能超过 100%")
-        if self.etf_target > 0.6 or self.stock_target > 0.2:
-            raise ValueError("ETF/个股目标分别不得超过 60%/20%")
-        if self.max_single_etf > 0.3 or self.max_single_stock > 0.2:
-            raise ValueError("单只 ETF/股票上限分别不得超过 30%/20%")
+        if self.etf_target > 0.48 or self.stock_target > 0.32:
+            raise ValueError("ETF/个股目标分别不得超过 48%/32%")
+        if self.max_single_etf > 0.24 or self.max_single_stock > 0.16:
+            raise ValueError("单只 ETF/股票上限分别不得超过 24%/16%")
+        if not 1 <= self.max_etf_count <= 2 or not 1 <= self.max_stock_count <= 2:
+            raise ValueError("ETF/股票数量上限必须位于 [1, 2]")
+        if self.etf_lookbacks != (20, 60, 120):
+            raise ValueError("ETF 回看周期固定为 20/60/120 日")
+        if abs(sum(self.etf_score_weights) - 1) > 1e-9:
+            raise ValueError("ETF 评分权重之和必须为 1")
+        if abs(sum(self.stock_score_weights) - 1) > 1e-9:
+            raise ValueError("个股评分权重之和必须为 1")
+        if self.stock_min_earnings_yield <= 0:
+            raise ValueError("最低盈利收益率必须大于 0")
+        if not 0 <= self.stock_market_cap_bottom_exclusion < 0.5:
+            raise ValueError("微盘排除比例必须位于 [0, 0.5)")
+        if self.stock_max_annual_volatility <= 0:
+            raise ValueError("个股年化波动率上限必须大于 0")
         if self.stock_reversal_days not in {10, 20}:
-            raise ValueError("个股反转周期只允许 10 或 20 个交易日")
-        if self.rebalance_days not in {5, 10}:
-            raise ValueError("调仓周期只允许周度或双周")
+            raise ValueError("兼容回测的旧反转周期只允许 10 或 20 个交易日")
+        if self.rebalance_days not in {5, 10, 20}:
+            raise ValueError("调仓周期只允许周度、双周或约月度")
         if self.stock_stop_pct not in {0.07, 0.09}:
             raise ValueError("股票灾难止损只允许 7% 或 9%")
 
@@ -233,8 +262,6 @@ def build_market_data_hash(
         "market_cap",
         "total_market_cap",
         "net_profit",
-        "roe",
-        "roe_avg",
     )
     for code in sorted(history_map):
         frame = _slice_as_of(history_map[code], trade_date)
@@ -350,17 +377,22 @@ class RobustV2Strategy:
         snapshot: MarketSnapshot,
         name_map: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
-        """按 20/60/120 日风险调整收益对 ETF 排序。"""
+        """从宽基池按 20/60/120 日风险调整收益筛选和排序。"""
         snapshot.require_fresh()
         names = name_map or {}
         max_lookback = max(self.config.etf_lookbacks)
+        min_history = max(max_lookback + 1, self.config.etf_trend_ma_days)
         rows: list[dict[str, Any]] = []
         for code, original in history_map.items():
-            if not is_etf(code):
+            try:
+                raw_code = normalized_security_code(code)
+            except ValueError:
+                continue
+            if not is_etf(code) or raw_code not in ROBUST_V2_BROAD_ETF_CODES:
                 continue
             frame = _slice_as_of(original, snapshot.trade_date)
             close = _numeric_series(frame, "close")
-            if len(close) < max_lookback + 1:
+            if len(close) < min_history:
                 continue
             if not _contains_trade_date(frame, snapshot.trade_date):
                 continue
@@ -377,9 +409,13 @@ class RobustV2Strategy:
                 annual_vol = float(daily_returns.std(ddof=0) * np.sqrt(252))
                 returns.append(total_return)
                 adjusted.append(total_return / max(annual_vol, 0.05))
-            ma120 = float(close.tail(120).mean())
-            if self.config.enable_etf_trend_filter and not (
-                float(close.iloc[-1]) >= ma120 and returns[1] > 0
+            return_by_lookback = dict(zip(self.config.etf_lookbacks, returns))
+            ma200 = float(close.tail(self.config.etf_trend_ma_days).mean())
+            # 绝对趋势门槛始终生效；旧 enable_etf_trend_filter 参数仅保留配置兼容。
+            if not (
+                float(close.iloc[-1]) >= ma200
+                and return_by_lookback[20] >= self.config.etf_min_20d_return
+                and return_by_lookback[60] > 0
             ):
                 continue
             score = float(
@@ -395,11 +431,12 @@ class RobustV2Strategy:
                 {
                     "code": code,
                     "name": names.get(code)
-                    or DEFAULT_RPS_ETF_POOL.get(code, {}).get("name", code),
+                    or names.get(raw_code)
+                    or DEFAULT_RPS_ETF_POOL.get(raw_code, {}).get("name", code),
                     "price": float(close.iloc[-1]),
                     "score": score,
                     "returns": tuple(returns),
-                    "ma120": ma120,
+                    "ma200": ma200,
                 }
             )
         rows.sort(key=lambda row: (float(row["score"]), str(row["code"])), reverse=True)
@@ -481,12 +518,6 @@ class RobustV2Strategy:
             pe = _latest_number(frame, "peTTM", "pe_ttm", "pe")
             net_profit = _latest_number(frame, "net_profit")
             if (
-                pb is None
-                or not self.config.stock_min_pb <= pb <= self.config.stock_max_pb
-            ):
-                reject("pb_out_of_range")
-                continue
-            if (
                 market_cap is None
                 or not self.config.stock_min_market_cap
                 <= market_cap
@@ -494,26 +525,37 @@ class RobustV2Strategy:
             ):
                 reject("market_cap_out_of_range")
                 continue
-            # BaoStock 日线稳定提供 peTTM；财报列存在时允许用净利润作更直接判断。
-            if net_profit is not None:
-                if net_profit <= 0:
-                    reject("unprofitable")
-                    continue
-            elif pe is None or pe <= 0:
+            # 财报净利润存在时只把它作为盈利为正门槛，不用缺失的 ROE/现金流做代理。
+            if net_profit is not None and net_profit <= 0:
                 reject("unprofitable")
+                continue
+            if pe is None or pe <= 0:
+                reject("earnings_yield_too_low")
+                continue
+            earnings_yield = 1 / pe
+            if earnings_yield < self.config.stock_min_earnings_yield:
+                reject("earnings_yield_too_low")
                 continue
             if _average_amount(frame) < self.config.stock_min_avg_amount:
                 reject("insufficient_liquidity")
                 continue
 
             ma20 = float(close.tail(20).mean())
-            ma120 = float(close.tail(120).mean())
+            ma200 = float(close.tail(self.config.stock_trend_ma_days).mean())
             gain_5d = float(close.iloc[-1] / close.iloc[-6] - 1)
-            reversal = float(
-                close.iloc[-1] / close.iloc[-(self.config.stock_reversal_days + 1)] - 1
+            return_20d = float(close.iloc[-1] / close.iloc[-21] - 1)
+            daily_returns = (
+                close.pct_change().tail(self.config.stock_volatility_days).dropna()
             )
-            if price < ma120:
-                reject("below_ma120")
+            annual_volatility = float(daily_returns.std(ddof=0) * np.sqrt(252))
+            if return_20d < self.config.stock_min_20d_return:
+                reject("excessive_20d_drop")
+                continue
+            if annual_volatility > self.config.stock_max_annual_volatility:
+                reject("excessive_120d_volatility")
+                continue
+            if price < ma200:
+                reject("below_ma200")
                 continue
             if price / ma20 > self.config.stock_max_price_ma20:
                 reject("overextended_ma20")
@@ -521,8 +563,6 @@ class RobustV2Strategy:
             if gain_5d > self.config.stock_max_5d_gain:
                 reject("excessive_5d_gain")
                 continue
-            roe = _latest_number(frame, "roe", "roe_avg")
-            quality = roe if roe is not None else (1 / pe if pe and pe > 0 else 0.0)
             candidates.append(
                 {
                     "code": code,
@@ -530,34 +570,55 @@ class RobustV2Strategy:
                     "price": price,
                     "pb": pb,
                     "market_cap": market_cap,
-                    "reversal": reversal,
-                    "quality": float(quality),
+                    "earnings_yield": float(earnings_yield),
+                    "annual_volatility_120d": annual_volatility,
+                    "return_20d": return_20d,
                     "gain_5d": gain_5d,
                 }
             )
 
         if candidates:
-            pb_scores = _percentile(
-                [float(row["pb"]) for row in candidates], lower_is_better=True
+            # 先剔除横截面最小 30% 市值，避免把“偏小”误做成微盘暴露。
+            exclusion_count = int(
+                len(candidates) * self.config.stock_market_cap_bottom_exclusion
+            )
+            excluded_codes = {
+                str(row["code"])
+                for row in sorted(
+                    candidates,
+                    key=lambda row: (
+                        float(row["market_cap"]),
+                        str(row["code"]),
+                    ),
+                )[:exclusion_count]
+            }
+            if excluded_codes:
+                candidates = [
+                    row for row in candidates if str(row["code"]) not in excluded_codes
+                ]
+                filter_counts["bottom_market_cap_30pct"] += len(excluded_codes)
+
+        if candidates:
+            earnings_yield_scores = _percentile(
+                [float(row["earnings_yield"]) for row in candidates],
+                lower_is_better=False,
             )
             size_scores = _percentile(
                 [float(row["market_cap"]) for row in candidates],
                 lower_is_better=True,
             )
-            reversal_scores = _percentile(
-                [float(row["reversal"]) for row in candidates],
+            low_volatility_scores = _percentile(
+                [float(row["annual_volatility_120d"]) for row in candidates],
                 lower_is_better=True,
             )
-            quality_scores = _percentile(
-                [float(row["quality"]) for row in candidates],
-                lower_is_better=False,
+            earnings_weight, size_weight, volatility_weight = (
+                self.config.stock_score_weights
             )
             for index, row in enumerate(candidates):
                 row["score"] = (
-                    0.30 * pb_scores[index]
-                    + 0.25 * size_scores[index]
-                    + 0.25 * reversal_scores[index]
-                    + 0.20 * quality_scores[index]
+                    earnings_weight * earnings_yield_scores[index]
+                    + size_weight * size_scores[index]
+                    + volatility_weight * low_volatility_scores[index]
                 )
             candidates.sort(
                 key=lambda row: (float(row["score"]), str(row["code"])),
@@ -626,28 +687,42 @@ class RobustV2Strategy:
         remaining_total = self.config.max_total_position - sum(
             position.target_weight for position in positions
         )
-        stock_budget = min(
-            self.config.stock_target, self.config.max_single_stock, remaining_total
-        )
+        remaining_stock = min(self.config.stock_target, remaining_total)
         stock_scan = stock_scan_result or self.scan_stocks(
             stock_history, snapshot, account_value, name_map
         )
         stock_rows = stock_scan.candidates
-        if self.config.enable_stock_enhancement and stock_budget > 0 and stock_rows:
-            row = stock_rows[0]
-            if float(row["price"]) * 100 <= account_value * stock_budget:
+        if self.config.enable_stock_enhancement and remaining_stock > 0:
+            selected_stock_count = 0
+            for row in stock_rows:
+                if selected_stock_count >= self.config.max_stock_count:
+                    break
+                weight = min(
+                    self.config.max_single_stock,
+                    remaining_stock,
+                    remaining_total,
+                )
+                if weight <= 0:
+                    break
+                if float(row["price"]) * 100 > account_value * weight:
+                    continue
                 positions.append(
                     TargetPosition(
                         code=str(row["code"]),
                         name=str(row["name"]),
                         asset_type="stock",
-                        target_weight=round(stock_budget, 6),
+                        target_weight=round(weight, 6),
                         reason=(
-                            "MAINBOARD_VALUE_REVERSAL "
-                            f"pb={row['pb']:.2f} reversal={row['reversal']:+.2%} score={row['score']:.3f}"
+                            "MAINBOARD_EP_SIZE_LOW_VOL "
+                            f"ep={row['earnings_yield']:.2%} "
+                            f"vol120={row['annual_volatility_120d']:.2%} "
+                            f"score={row['score']:.3f}"
                         ),
                     )
                 )
+                remaining_stock -= weight
+                remaining_total -= weight
+                selected_stock_count += 1
 
         exposure = sum(position.target_weight for position in positions)
         fallback = ""

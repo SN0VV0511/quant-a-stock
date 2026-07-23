@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import signal
+import threading
 import time
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+import robust_runner as runner_module
 from robust_runner import (
     DataCompletenessError,
     LeaseHeartbeat,
@@ -16,12 +20,19 @@ from robust_runner import (
     RobustV2Runner,
     SignalData,
     _latest_completed_trade_date,
+    _parse_observation_end_date,
     load_runtime_config,
+    run_daemon,
 )
 from strategies.robust_v2 import RobustV2Config, build_market_data_hash
 from trading.brokers import SQLitePaperBrokerAdapter
 from trading.ledger import PaperLedger
-from trading.models import MarketSnapshot, OrderIntent
+from trading.models import (
+    MarketSnapshot,
+    OrderIntent,
+    TargetPortfolio,
+    TargetPosition,
+)
 
 
 def _etf_history(code: str, slope: float) -> pd.DataFrame:
@@ -66,11 +77,36 @@ class FakeUniverseLoader:
         """返回覆盖 ST、价格、流动性和数量上限的行情。"""
         assert len(codes) == 5
         return {
-            "sh600001": {"name": "高流动", "price": 10.0, "volume": 30_000_000},
-            "sh600002": {"name": "次高流动", "price": 8.0, "volume": 20_000_000},
-            "sh600003": {"name": "ST测试", "price": 10.0, "volume": 30_000_000},
-            "sh600004": {"name": "低价", "price": 2.0, "volume": 30_000_000},
-            "sh600005": {"name": "低流动", "price": 10.0, "volume": 1_000},
+            "sh600001": {
+                "name": "高流动",
+                "price": 10.0,
+                "volume": 30_000_000,
+                "source": "tencent",
+            },
+            "sh600002": {
+                "name": "次高流动",
+                "price": 8.0,
+                "volume": 20_000_000,
+                "source": "tencent",
+            },
+            "sh600003": {
+                "name": "ST测试",
+                "price": 10.0,
+                "volume": 30_000_000,
+                "source": "tencent",
+            },
+            "sh600004": {
+                "name": "低价",
+                "price": 2.0,
+                "volume": 30_000_000,
+                "source": "tencent",
+            },
+            "sh600005": {
+                "name": "低流动",
+                "price": 10.0,
+                "volume": 1_000,
+                "source": "tencent",
+            },
         }
 
 
@@ -275,6 +311,7 @@ def test_realtime_prefilter_reports_rejections_and_candidate_limit(
     assert universe == {
         "mainboard_count": 5,
         "realtime_quote_count": 5,
+        "tencent_quote_count": 5,
         "rough_candidate_count": 1,
     }
     assert counts == {
@@ -302,12 +339,200 @@ def test_formal_signal_rejects_incomplete_market_data(tmp_path: Path) -> None:
             universe={
                 "mainboard_count": 5,
                 "realtime_quote_count": 5,
+                "tencent_quote_count": 5,
                 "rough_candidate_count": 1,
                 "history_loaded_count": 1,
                 "universe_authoritative": 1,
             },
-            etf_history_count=10,
+            etf_history_count=5,
         )
+
+
+def test_formal_signal_rejects_when_stock_history_is_one_day_late(
+    tmp_path: Path,
+) -> None:
+    """ETF 已到 T 日时不能掩盖全部个股仍停留在 T-1。"""
+    service = RobustDataService(
+        FakeUniverseLoader(),  # type: ignore[arg-type]
+        tmp_path,
+        stock_candidate_limit=100,
+        min_mainboard_universe=100,
+        min_realtime_quote_coverage=0.9,
+        min_history_coverage=0.9,
+        min_etf_history_coverage=0.8,
+    )
+
+    with pytest.raises(DataCompletenessError, match="候选信号日行情覆盖率"):
+        service._require_complete_signal_data(
+            universe={
+                "mainboard_count": 100,
+                "realtime_quote_count": 100,
+                "tencent_quote_count": 100,
+                "rough_candidate_count": 100,
+                "history_loaded_count": 100,
+                "history_signal_date_count": 0,
+                "etf_signal_date_count": 5,
+                "universe_authoritative": 1,
+            },
+            etf_history_count=5,
+        )
+
+
+def test_formal_signal_rejects_zero_tencent_coverage_and_zero_candidates(
+    tmp_path: Path,
+) -> None:
+    """正式信号必须证明腾讯行情参与，且不能把零候选解释为 100% 覆盖。"""
+    service = RobustDataService(
+        FakeUniverseLoader(),  # type: ignore[arg-type]
+        tmp_path,
+        min_mainboard_universe=100,
+        min_realtime_quote_coverage=0.9,
+        min_history_coverage=0.9,
+        min_etf_history_coverage=0.8,
+    )
+    base = {
+        "mainboard_count": 100,
+        "realtime_quote_count": 100,
+        "rough_candidate_count": 1,
+        "history_loaded_count": 1,
+        "history_signal_date_count": 1,
+        "etf_signal_date_count": 5,
+        "universe_authoritative": 1,
+    }
+
+    with pytest.raises(DataCompletenessError, match="腾讯实时行情覆盖率"):
+        service._require_complete_signal_data(
+            universe={**base, "tencent_quote_count": 0},
+            etf_history_count=5,
+        )
+
+    with pytest.raises(DataCompletenessError, match="未产生任何个股候选"):
+        service._require_complete_signal_data(
+            universe={
+                **base,
+                "tencent_quote_count": 100,
+                "rough_candidate_count": 0,
+                "history_loaded_count": 0,
+                "history_signal_date_count": 0,
+            },
+            etf_history_count=5,
+        )
+
+
+def test_formal_signal_uses_five_broad_etfs_for_completeness(
+    tmp_path: Path,
+) -> None:
+    """行业 ETF 不能替代 robust_v2 的五只宽基完成数据验收。"""
+    service = RobustDataService(
+        FakeUniverseLoader(),  # type: ignore[arg-type]
+        tmp_path,
+        min_mainboard_universe=100,
+        min_realtime_quote_coverage=0.9,
+        min_history_coverage=0.9,
+        min_etf_history_coverage=0.8,
+    )
+
+    with pytest.raises(DataCompletenessError, match=r"宽基 ETF 历史行情仅 3/5"):
+        service._require_complete_signal_data(
+            universe={
+                "mainboard_count": 100,
+                "realtime_quote_count": 100,
+                "tencent_quote_count": 100,
+                "rough_candidate_count": 1,
+                "history_loaded_count": 1,
+                "history_signal_date_count": 1,
+                "etf_signal_date_count": 3,
+                "universe_authoritative": 1,
+            },
+            etf_history_count=3,
+        )
+
+
+def test_missing_position_quote_freezes_all_new_buys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """任一持仓缺少实时估值时，只能等待或减仓，不能先买入其他标的。"""
+    ledger = PaperLedger(
+        tmp_path / "paper_v2.db",
+        initial_cash=50_000,
+        strict_order_source=False,
+    )
+    broker = SQLitePaperBrokerAdapter(ledger=ledger)
+    broker.connect()
+    ledger.place_order(
+        OrderIntent(
+            account_id="paper_v2",
+            strategy_version="robust_v2",
+            signal_date="20260708",
+            code="600000",
+            action="buy",
+            price=10.0,
+            shares=1000,
+            name="浦发银行",
+            strategy="测试",
+            strategy_tag="robust_v2",
+            reason="TEST_POSITION",
+            date="20260708",
+        )
+    )
+    runner = RobustV2Runner(
+        broker,
+        FakeLoader(),  # type: ignore[arg-type]
+        RobustV2Config(enable_stock_enhancement=False, etf_min_avg_amount=0),
+        tmp_path,
+    )
+
+    class MissingPositionQuoteData(FakeDataService):
+        """只返回目标 ETF 行情，故意遗漏既有股票持仓。"""
+
+        def load_execution_data(self, codes: set[str], signal_date: str):
+            assert codes == {"510300", "600000"}
+            history = {"510300": self.history["510300"]}
+            quotes = {
+                "510300": {
+                    "price": float(self.history["510300"]["close"].iloc[-1]),
+                    "prev_close": float(self.history["510300"]["close"].iloc[-1]),
+                    "quote_time": "20260710094100",
+                    "captured_at": "2026-07-10 09:41:01",
+                    "source": "test",
+                    "is_suspended": False,
+                    "trade_status": 1,
+                }
+            }
+            return self.snapshot, history, quotes
+
+    runner.data = MissingPositionQuoteData()  # type: ignore[assignment]
+    target = TargetPortfolio(
+        account_id="paper_v2",
+        strategy_version="robust_v2",
+        signal_date="20260709",
+        positions=(
+            TargetPosition(
+                code="510300",
+                name="沪深300ETF",
+                target_weight=0.24,
+                reason="ETF_CORE_TREND",
+                asset_type="etf",
+            ),
+        ),
+        source_snapshot_hash="test-hash",
+        cash_weight=0.76,
+    )
+    signal_id = ledger.record_signal(target)
+    monkeypatch.setattr("robust_runner.previous_trading_day", lambda _date: "20260709")
+
+    outcome = runner.execute_pending_target(
+        "20260710",
+        current_time=datetime(2026, 7, 10, 9, 41, 30),
+    )
+
+    assert outcome.reports == ()
+    assert outcome.allocation is not None
+    assert "持仓实时估值不完整" in outcome.allocation.skipped["510300"]
+    assert ledger.query_signal_state(signal_id)["status"] == "retryable"
+    assert [order.code for order in ledger.query_orders()] == ["600000"]
+    broker.close()
 
 
 def test_preview_scan_uses_latest_completed_close(monkeypatch) -> None:
@@ -321,15 +546,29 @@ def test_preview_scan_uses_latest_completed_close(monkeypatch) -> None:
     assert _latest_completed_trade_date(datetime(2026, 7, 13, 15, 6)) == "20260713"
 
 
+def test_observation_end_date_is_strict_and_keeps_end_day_active() -> None:
+    """观察期结束日必须可验证，且停止边界应落在结束日次日。"""
+    end_date = _parse_observation_end_date("20260823")
+
+    assert end_date is not None
+    assert datetime(2026, 8, 23, 23, 59).date() <= end_date
+    assert datetime(2026, 8, 24, 0, 0).date() > end_date
+    assert _parse_observation_end_date(None) is None
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        _parse_observation_end_date("2026-08-23")
+
+
 def test_runtime_loads_walk_forward_selection_and_etf_fallback(tmp_path: Path) -> None:
-    """守护入口应使用样本外结果，并在失败标记下关闭个股增强。"""
+    """守护入口应加载有效维度、忽略旧维度并支持 ETF 回退。"""
     path = tmp_path / "selected.json"
     path.write_text(
         """{
   "selected_params": {
-    "enable_etf_trend_filter": true,
-    "stock_reversal_days": 20,
-    "rebalance_days": 10,
+    "enable_etf_trend_filter": false,
+    "stock_reversal_days": 999,
+    "etf_min_20d_return": 0.0,
+    "stock_min_earnings_yield": 0.04,
+    "rebalance_days": 20,
     "stock_stop_pct": 0.09,
     "max_total_position": 0.60
   },
@@ -341,9 +580,44 @@ def test_runtime_loads_walk_forward_selection_and_etf_fallback(tmp_path: Path) -
 
     config = load_runtime_config(path)
 
+    assert config.etf_min_20d_return == 0.0
+    assert config.stock_min_earnings_yield == 0.04
     assert config.max_total_position == 0.60
-    assert config.rebalance_days == 10
+    assert config.rebalance_days == 20
+    assert config.stock_stop_pct == 0.09
+    assert config.enable_etf_trend_filter is True
+    assert config.stock_reversal_days == 20
     assert config.enable_stock_enhancement is False
+
+
+def test_runtime_keeps_stable_fields_from_legacy_selection(tmp_path: Path) -> None:
+    """旧选择文件没有新维度时，仍应保留仓位、周期和止损参数。"""
+    path = tmp_path / "legacy-selected.json"
+    path.write_text(
+        """{
+  "selected_params": {
+    "enable_etf_trend_filter": false,
+    "stock_reversal_days": 10,
+    "rebalance_days": 10,
+    "stock_stop_pct": 0.07,
+    "max_total_position": 0.70
+  },
+  "fallback_to_etf": false
+}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.etf_min_20d_return == -0.05
+    assert config.stock_min_earnings_yield == 0.02
+    assert config.max_total_position == 0.70
+    assert config.rebalance_days == 10
+    assert config.stock_stop_pct == 0.07
+    assert config.enable_etf_trend_filter is True
+    assert config.stock_reversal_days == 20
+    assert config.enable_stock_enhancement is True
 
 
 def test_lease_heartbeat_runs_during_long_market_data_task() -> None:
@@ -372,6 +646,103 @@ def test_lease_heartbeat_runs_during_long_market_data_task() -> None:
     heartbeat.stop()
 
     assert ledger.calls >= 2
+
+
+def test_daemon_sigterm_interrupts_poll_wait_and_releases_lease(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """SIGTERM 必须立即唤醒轮询，并在 launchd 超时前完成账本清理。"""
+
+    class FakeLedger:
+        """记录守护进程生命周期调用的最小账本替身。"""
+
+        path = tmp_path / "paper.db"
+
+        def __init__(self) -> None:
+            self.finished_status = ""
+            self.released = False
+
+        def acquire_lease(self, _holder_id: str, _ttl_seconds: int) -> None:
+            """模拟成功取得唯一写租约。"""
+
+        def start_run(self, **_kwargs: object) -> SimpleNamespace:
+            """返回可供 finish_run 使用的运行标识。"""
+            return SimpleNamespace(run_id="run-1")
+
+        def finish_run(self, _run_id: str, *, status: str) -> None:
+            """记录最终运行状态。"""
+            self.finished_status = status
+
+        def release_lease(self, _holder_id: str) -> None:
+            """记录租约已释放。"""
+            self.released = True
+
+    class FakeHeartbeat:
+        """避免测试启动真实后台线程。"""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            """模拟续租线程启动。"""
+
+        def stop(self) -> None:
+            """模拟续租线程停止。"""
+
+        def raise_if_failed(self) -> None:
+            """模拟续租健康。"""
+
+    handlers: dict[int, object] = {}
+    handler_ready = threading.Event()
+
+    def fake_signal(signum: int, handler: object) -> object:
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        if signum == signal.SIGTERM and callable(handler):
+            handler_ready.set()
+        return previous
+
+    monkeypatch.setattr(runner_module, "LeaseHeartbeat", FakeHeartbeat)
+    monkeypatch.setattr(runner_module, "validate_startup", lambda _config: None)
+    monkeypatch.setattr(
+        runner_module,
+        "_startup_log",
+        lambda _broker, _ledger, _config: ("commit", "config"),
+    )
+    monkeypatch.setattr(runner_module, "_is_trading_day", lambda *_args: False)
+    monkeypatch.setattr(runner_module.signal, "signal", fake_signal)
+
+    trigger_errors: list[str] = []
+
+    def trigger_sigterm() -> None:
+        if not handler_ready.wait(timeout=1):
+            trigger_errors.append("SIGTERM handler was not installed")
+            return
+        handler = handlers[signal.SIGTERM]
+        if not callable(handler):
+            trigger_errors.append("SIGTERM handler is not callable")
+            return
+        handler(signal.SIGTERM, None)
+
+    trigger = threading.Thread(target=trigger_sigterm)
+    trigger.start()
+    ledger = FakeLedger()
+    runner = SimpleNamespace(
+        config=SimpleNamespace(strategy_version="robust_v2"),
+        ledger=ledger,
+        broker=object(),
+    )
+
+    started = time.monotonic()
+    result = run_daemon(runner, poll_seconds=60)  # type: ignore[arg-type]
+    elapsed = time.monotonic() - started
+    trigger.join(timeout=1)
+
+    assert trigger_errors == []
+    assert elapsed < 2
+    assert result == 0
+    assert ledger.finished_status == "completed"
+    assert ledger.released is True
 
 
 def test_robust_runner_blocks_new_buys_after_drawdown_trigger(tmp_path: Path) -> None:

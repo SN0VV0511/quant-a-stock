@@ -25,8 +25,8 @@ from trading.schedule import backtest_rebalance_due
 class RobustParameterSet:
     """受限搜索空间中的一组参数。"""
 
-    enable_etf_trend_filter: bool
-    stock_reversal_days: int
+    etf_min_20d_return: float
+    stock_min_earnings_yield: float
     rebalance_days: int
     stock_stop_pct: float
     max_total_position: float
@@ -34,8 +34,8 @@ class RobustParameterSet:
     def to_config(self, *, enable_stock_enhancement: bool = True) -> RobustV2Config:
         """转换为策略配置。"""
         return RobustV2Config(
-            enable_etf_trend_filter=self.enable_etf_trend_filter,
-            stock_reversal_days=self.stock_reversal_days,
+            etf_min_20d_return=self.etf_min_20d_return,
+            stock_min_earnings_yield=self.stock_min_earnings_yield,
             rebalance_days=self.rebalance_days,
             stock_stop_pct=self.stock_stop_pct,
             max_total_position=self.max_total_position,
@@ -99,9 +99,9 @@ def parameter_grid() -> tuple[RobustParameterSet, ...]:
     rows = tuple(
         RobustParameterSet(*values)
         for values in itertools.product(
-            (True, False),
+            (-0.05, 0.0),
+            (0.02, 0.04),
             (10, 20),
-            (5, 10),
             (0.07, 0.09),
             (0.70, 0.80),
         )
@@ -180,6 +180,62 @@ def _price(
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _latest_valid_close(
+    history: Mapping[str, pd.DataFrame],
+    code: str,
+    date: str,
+) -> float:
+    """读取不晚于指定日期的最后一个有效收盘价。"""
+    frame = history.get(code)
+    if frame is None or "close" not in frame.columns:
+        return 0.0
+    rows = frame.loc[frame["date"] <= date]
+    if rows.empty:
+        return 0.0
+    closes = pd.to_numeric(rows["close"], errors="coerce")
+    valid = closes.loc[closes.notna() & (closes > 0)]
+    return float(valid.iloc[-1]) if not valid.empty else 0.0
+
+
+def _is_true_flag(value: Any) -> bool:
+    """兼容布尔、数值和常见字符串形式的真值标志。"""
+    if value is None or pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "是",
+            "停牌",
+            "suspended",
+        }
+    return bool(value)
+
+
+def _is_tradable_on(
+    history: Mapping[str, pd.DataFrame],
+    code: str,
+    date: str,
+) -> bool:
+    """判断证券当日是否有行情且未被标记为停牌。"""
+    frame = history.get(code)
+    if frame is None:
+        return False
+    row = _row_for(frame, date)
+    if row is None:
+        return False
+    trade_status = row.get("tradestatus", 1)
+    try:
+        if not pd.isna(trade_status) and float(trade_status) == 0:
+            return False
+    except (TypeError, ValueError):
+        if str(trade_status).strip() == "0":
+            return False
+    return not _is_true_flag(row.get("is_suspended", False))
 
 
 def _point_in_time_codes(
@@ -293,12 +349,18 @@ class RobustPortfolioBacktester:
                     open_prices,
                     date,
                     tradable_codes={
-                        code for code, price in open_prices.items() if price > 0
+                        code
+                        for code, price in open_prices.items()
+                        if price > 0 and _is_tradable_on(self.all_history, code, date)
                     },
                 )
                 for order in allocation.orders:
                     previous_close = (
-                        _price(self.all_history, order.code, previous_date, "close")
+                        _latest_valid_close(
+                            self.all_history,
+                            order.code,
+                            previous_date,
+                        )
                         if previous_date
                         else 0.0
                     )
@@ -408,6 +470,8 @@ class RobustPortfolioBacktester:
             # 灾难止损使用日内低点触发，成交价按跳空开盘或止损线中更差者处理。
             for code in list(positions):
                 position = positions[code]
+                if not _is_tradable_on(self.all_history, code, date):
+                    continue
                 sellable = sum(
                     int(lot["shares"])
                     for lot in position["lots"]
@@ -428,6 +492,19 @@ class RobustPortfolioBacktester:
                 execution_price = (
                     min(open_price, stop_price) if open_price > 0 else stop_price
                 )
+                previous_close = (
+                    _latest_valid_close(self.all_history, code, previous_date)
+                    if previous_date
+                    else 0.0
+                )
+                _, can_sell, _ = rules.check_price_limit(
+                    code,
+                    open_price,
+                    previous_close,
+                    str(position["name"]),
+                )
+                if not can_sell:
+                    continue
                 shares = sellable
                 amount = execution_price * shares
                 costs = rules.calc_total_cost(amount, "sell", code=code)
@@ -457,10 +534,16 @@ class RobustPortfolioBacktester:
                     )
                 )
 
-            close_prices = {
-                code: _price(self.all_history, code, date, "close")
-                for code in positions
-            }
+            close_prices: dict[str, float] = {}
+            stale_valuation_codes: list[str] = []
+            for code, position in positions.items():
+                close_price = _price(self.all_history, code, date, "close")
+                if close_price <= 0:
+                    stale_valuation_codes.append(code)
+                    close_price = _latest_valid_close(self.all_history, code, date)
+                    if close_price <= 0:
+                        close_price = float(position["avg_cost"])
+                close_prices[code] = close_price
             total_value = cash + sum(
                 close_prices.get(code, 0) * int(position["shares"])
                 for code, position in positions.items()
@@ -471,6 +554,8 @@ class RobustPortfolioBacktester:
                     "total_value": round(total_value, 2),
                     "cash": round(cash, 2),
                     "position_count": len(positions),
+                    "stale_valuation_codes": sorted(stale_valuation_codes),
+                    "has_valuation_data_gap": bool(stale_valuation_codes),
                 }
             )
 
@@ -729,11 +814,11 @@ class RobustWalkForwardSelector:
             passed[0].params
             if passed
             else RobustParameterSet(
-                enable_etf_trend_filter=True,
-                stock_reversal_days=20,
-                rebalance_days=5,
+                etf_min_20d_return=0.0,
+                stock_min_earnings_yield=0.04,
+                rebalance_days=20,
                 stock_stop_pct=0.09,
-                max_total_position=0.60,
+                max_total_position=0.70,
             )
         )
         locked = self.backtester.run(
@@ -751,11 +836,11 @@ class RobustWalkForwardSelector:
         )
         pure_etf = self.backtester.run(
             RobustParameterSet(
-                enable_etf_trend_filter=True,
-                stock_reversal_days=20,
+                etf_min_20d_return=selected.etf_min_20d_return,
+                stock_min_earnings_yield=selected.stock_min_earnings_yield,
                 rebalance_days=selected.rebalance_days,
                 stock_stop_pct=selected.stock_stop_pct,
-                max_total_position=0.60,
+                max_total_position=selected.max_total_position,
             ),
             test_start,
             test_end,

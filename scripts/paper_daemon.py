@@ -1,8 +1,8 @@
-"""虚拟盘观察期守护脚本。
+"""虚拟盘观察期兼容守护脚本。
 
-该脚本用于一个月观察期的无人值守运行：在交易日 09:00-15:00 时间窗内启动
-`live_runner.py --broker paper`，收盘后执行健康检查和复盘摘要。它不引入额外调度
-依赖，适合先用终端、tmux、launchd 或 cron 托管。
+该脚本保留旧调度参数和 ``--dry-run`` / JSON 接口，但账户写入口统一委托给
+``robust_runner.py daemon``。旧 Combo/RPS 的 broker、盯盘、扫描和候选数量参数
+仅为命令行兼容而保留，不再传入 robust_v2。
 """
 
 from __future__ import annotations
@@ -23,20 +23,22 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from data.holidays import is_trading_day as is_calendar_trading_day
-from config.time_utils import now_local
-from scripts.backtest_cache import ensure_backtest_cache
-from scripts.monthly_review import build_review
-from scripts.paper_healthcheck import run_healthcheck
+from data.holidays import is_trading_day as is_calendar_trading_day  # noqa: E402
+from config.time_utils import now_local  # noqa: E402
+from scripts.backtest_cache import ensure_backtest_cache  # noqa: E402
+from scripts.monthly_review import build_review  # noqa: E402
+from scripts.paper_healthcheck import run_healthcheck  # noqa: E402
 
 
 LOGGER = logging.getLogger("paper_daemon")
-SessionState = Literal["before_session", "in_session", "after_session", "non_trading_day"]
+SessionState = Literal[
+    "before_session", "in_session", "after_session", "non_trading_day"
+]
 
 
 @dataclass(frozen=True)
 class DaemonConfig:
-    """守护进程配置。"""
+    """守护进程配置；旧实时扫描字段仅用于兼容既有调用方。"""
 
     root_dir: Path
     broker: str = "paper"
@@ -48,6 +50,7 @@ class DaemonConfig:
     dry_run: bool = False
     ignore_calendar: bool = False
     review_days: int = 30
+    observation_end_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +100,9 @@ def decide_next_action(
         )
 
     if now.time() < pre_market:
-        start_at = now.replace(hour=pre_market.hour, minute=pre_market.minute, second=0, microsecond=0)
+        start_at = now.replace(
+            hour=pre_market.hour, minute=pre_market.minute, second=0, microsecond=0
+        )
         wait_seconds = max(1, int((start_at - now).total_seconds()))
         return DaemonDecision(
             state="before_session",
@@ -123,21 +128,20 @@ def decide_next_action(
 
 
 def build_live_command(config: DaemonConfig) -> list[str]:
-    """构建 live_runner 命令。"""
+    """构建唯一允许写虚拟盘账户的 robust_v2 守护命令。"""
     command = [
         sys.executable,
-        str(config.root_dir / "live_runner.py"),
-        "--broker",
-        config.broker,
-        "--watch-interval",
-        str(config.watch_interval),
-        "--scan-interval",
-        str(config.scan_interval),
-        "--top-n",
-        str(config.top_n),
+        str(config.root_dir / "robust_runner.py"),
+        "daemon",
+        "--ledger",
+        str(config.root_dir / "data" / "paper_v2.db"),
     ]
     if config.ignore_calendar:
         command.append("--ignore-calendar")
+    if config.once:
+        command.append("--once")
+    if config.observation_end_date:
+        command.extend(["--observation-end-date", config.observation_end_date])
     return command
 
 
@@ -189,7 +193,9 @@ def run_daemon(
         now = now_provider()
         date_str = now.strftime("%Y%m%d")
         trading_day = is_trading_day(date_str, config.ignore_calendar)
-        decision = decide_next_action(now, trading_day, pre_market, market_close, config.poll_seconds)
+        decision = decide_next_action(
+            now, trading_day, pre_market, market_close, config.poll_seconds
+        )
         LOGGER.info(
             "调度检查: date=%s state=%s run=%s reason=%s",
             date_str,
@@ -214,24 +220,68 @@ def _parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="A 股虚拟盘观察期守护脚本")
     parser.add_argument("--root", default=ROOT_DIR, help="项目根目录")
-    parser.add_argument("--broker", default="paper", choices=["paper"], help="观察期只允许虚拟盘")
-    parser.add_argument("--watch-interval", type=int, default=4, help="盯盘刷新秒数")
-    parser.add_argument("--scan-interval", type=int, default=600, help="扫描间隔秒数")
-    parser.add_argument("--top-n", type=int, default=20, help="候选股数量")
-    parser.add_argument("--pre-market", type=_parse_hhmm, default=dt_time(9, 0), help="盘前启动时间 HH:MM")
-    parser.add_argument("--market-close", type=_parse_hhmm, default=dt_time(15, 0), help="收盘时间 HH:MM")
-    parser.add_argument("--poll-seconds", type=int, default=300, help="非运行窗口轮询秒数")
+    parser.add_argument(
+        "--broker",
+        default="paper",
+        choices=["paper"],
+        help="旧兼容参数，robust_v2 固定使用 paper_v2",
+    )
+    parser.add_argument(
+        "--watch-interval",
+        type=int,
+        default=4,
+        help="旧兼容参数，robust_v2 忽略",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=int,
+        default=600,
+        help="旧兼容参数，robust_v2 忽略",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=20,
+        help="旧兼容参数，robust_v2 忽略",
+    )
+    parser.add_argument(
+        "--pre-market",
+        type=_parse_hhmm,
+        default=dt_time(9, 0),
+        help="盘前启动时间 HH:MM",
+    )
+    parser.add_argument(
+        "--market-close",
+        type=_parse_hhmm,
+        default=dt_time(15, 0),
+        help="收盘时间 HH:MM",
+    )
+    parser.add_argument(
+        "--poll-seconds", type=int, default=300, help="非运行窗口轮询秒数"
+    )
     parser.add_argument("--review-days", type=int, default=30, help="收盘后复盘天数")
     parser.add_argument("--once", action="store_true", help="只做一次调度判断")
-    parser.add_argument("--dry-run", action="store_true", help="只打印调度和命令，不启动 live_runner")
-    parser.add_argument("--ignore-calendar", action="store_true", help="忽略交易日历，便于联调")
-    parser.add_argument("--json", action="store_true", help="输出一次 dry-run 调度 JSON")
+    parser.add_argument(
+        "--observation-end-date",
+        help="虚拟盘观察期结束日 YYYYMMDD，透传给 robust_runner",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="只打印调度和命令，不启动 live_runner"
+    )
+    parser.add_argument(
+        "--ignore-calendar", action="store_true", help="忽略交易日历，便于联调"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="输出一次 dry-run 调度 JSON"
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     """命令行入口。"""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    )
     args = _parse_args()
     config = DaemonConfig(
         root_dir=Path(args.root).resolve(),
@@ -244,6 +294,7 @@ def main() -> int:
         dry_run=args.dry_run,
         ignore_calendar=args.ignore_calendar,
         review_days=args.review_days,
+        observation_end_date=args.observation_end_date,
     )
 
     if args.json:
@@ -260,7 +311,9 @@ def main() -> int:
             "decision": asdict(decision),
             "live_command": build_live_command(config),
         }
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n")
+        sys.stdout.write(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
+        )
         return 0
 
     return run_daemon(config, args.pre_market, args.market_close)

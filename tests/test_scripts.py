@@ -1,6 +1,7 @@
 """运行观察期脚本测试。"""
 
 import json
+import sys
 from pathlib import Path
 
 from scripts.monthly_review import build_review
@@ -427,8 +428,8 @@ def test_paper_daemon_decides_session_states(tmp_path) -> None:
     assert closed.state == "non_trading_day"
 
 
-def test_paper_daemon_builds_live_command(tmp_path) -> None:
-    """守护脚本应构建虚拟盘 live_runner 命令。"""
+def test_paper_daemon_only_builds_robust_runner_command(tmp_path) -> None:
+    """兼容守护脚本只能委托 robust_v2，不能重新启用旧账户写入口。"""
     config = DaemonConfig(
         root_dir=tmp_path,
         watch_interval=7,
@@ -439,13 +440,31 @@ def test_paper_daemon_builds_live_command(tmp_path) -> None:
 
     command = build_live_command(config)
 
-    assert str(tmp_path / "live_runner.py") in command
-    assert "--broker" in command
-    assert "paper" in command
-    assert "--watch-interval" in command
-    assert "7" in command
-    assert "--scan-interval" in command
-    assert "900" in command
+    assert command[:3] == [
+        sys.executable,
+        str(tmp_path / "robust_runner.py"),
+        "daemon",
+    ]
+    assert command[3:5] == [
+        "--ledger",
+        str(tmp_path / "data" / "paper_v2.db"),
+    ]
+    assert not any("live_runner.py" in argument for argument in command)
+    assert "--broker" not in command
+    assert "paper" not in command
+    assert "--watch-interval" not in command
+
+    bounded = build_live_command(
+        DaemonConfig(
+            root_dir=tmp_path,
+            once=True,
+            observation_end_date="20260823",
+        )
+    )
+    assert "--once" in bounded
+    assert bounded[-2:] == ["--observation-end-date", "20260823"]
+    assert "--scan-interval" not in command
+    assert "--top-n" not in command
     assert "--ignore-calendar" in command
 
 

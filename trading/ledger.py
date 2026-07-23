@@ -35,7 +35,7 @@ from trading.models import (
     TargetPosition,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class LeaseUnavailableError(RuntimeError):
@@ -103,6 +103,7 @@ class PaperLedger:
         self.rules = rules or TradingRules()
         self._connection: sqlite3.Connection | None = None
         self._lock = threading.RLock()
+        self._lease_holder_id: str | None = None
         self.current_run_id: str | None = None
 
     @property
@@ -178,12 +179,32 @@ class PaperLedger:
         return target
 
     @contextlib.contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        """使用立即事务串行化账户写操作。"""
+    def _transaction(
+        self,
+        *,
+        enforce_lease: bool = True,
+    ) -> Iterator[sqlite3.Connection]:
+        """串行化写操作；已取得租约的实例必须持有当前有效 fencing 身份。"""
         with self._lock:
             connection = self._require_connection()
             connection.execute("BEGIN IMMEDIATE")
             try:
+                if enforce_lease and self._lease_holder_id is not None:
+                    lease = connection.execute(
+                        """
+                        SELECT holder_id, expires_at FROM leases
+                        WHERE account_id = ?
+                        """,
+                        (self.account_id,),
+                    ).fetchone()
+                    if (
+                        lease is None
+                        or str(lease["holder_id"]) != self._lease_holder_id
+                        or float(lease["expires_at"]) <= now_local().timestamp()
+                    ):
+                        raise LeaseUnavailableError(
+                            "当前实例的写租约已失效或已被其他实例接管"
+                        )
                 yield connection
             except Exception:
                 connection.rollback()
@@ -362,6 +383,7 @@ class PaperLedger:
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 started_at TEXT,
                 completed_at TEXT,
+                next_retry_at TEXT,
                 last_error TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(account_id, job_name, job_date)
             );
@@ -411,6 +433,12 @@ class PaperLedger:
         connection.execute(
             "UPDATE signals SET status = 'completed' WHERE executed_at IS NOT NULL"
         )
+        daily_job_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(daily_jobs)").fetchall()
+        }
+        if "next_retry_at" not in daily_job_columns:
+            connection.execute("ALTER TABLE daily_jobs ADD COLUMN next_retry_at TEXT")
 
     def start_run(
         self,
@@ -450,10 +478,11 @@ class PaperLedger:
             connection.execute(
                 """
                 UPDATE daily_jobs
-                SET status = 'failed', last_error = '上次运行中断，允许重新执行'
+                SET status = 'failed', next_retry_at = ?,
+                    last_error = '上次运行中断，允许重新执行'
                 WHERE account_id = ? AND status = 'running'
                 """,
-                (self.account_id,),
+                (started_at, self.account_id),
             )
             connection.execute(
                 """
@@ -516,7 +545,7 @@ class PaperLedger:
             raise ValueError("租约有效期必须大于 0")
         current, timestamp = self._timestamp(now)
         current_text = current.strftime("%Y-%m-%d %H:%M:%S")
-        with self._transaction() as connection:
+        with self._transaction(enforce_lease=False) as connection:
             row = connection.execute(
                 "SELECT holder_id, expires_at FROM leases WHERE account_id = ?",
                 (self.account_id,),
@@ -547,6 +576,7 @@ class PaperLedger:
                     timestamp + ttl_seconds,
                 ),
             )
+        self._lease_holder_id = holder_id
 
     def heartbeat_lease(
         self,
@@ -579,41 +609,58 @@ class PaperLedger:
 
     def release_lease(self, holder_id: str) -> bool:
         """仅由持有者释放写租约。"""
-        with self._transaction() as connection:
+        with self._transaction(enforce_lease=False) as connection:
             cursor = connection.execute(
                 "DELETE FROM leases WHERE account_id = ? AND holder_id = ?",
                 (self.account_id, holder_id),
             )
-            return cursor.rowcount == 1
+            released = cursor.rowcount == 1
+        if self._lease_holder_id == holder_id:
+            self._lease_holder_id = None
+        return released
 
-    def claim_daily_job(self, job_name: str, job_date: str) -> bool:
+    def claim_daily_job(
+        self,
+        job_name: str,
+        job_date: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
         """原子领取每日幂等任务；已完成任务不会重复执行。"""
         if not job_name.strip():
             raise ValueError("每日任务名称不能为空")
         if len(job_date) != 8 or not job_date.isdigit():
             raise ValueError(f"每日任务日期无效: {job_date}")
-        started_at = format_local()
+        current = now or now_local()
+        started_at = current.strftime("%Y-%m-%d %H:%M:%S")
         with self._transaction() as connection:
             row = connection.execute(
                 """
-                SELECT status FROM daily_jobs
+                SELECT status, next_retry_at FROM daily_jobs
                 WHERE account_id = ? AND job_name = ? AND job_date = ?
                 """,
                 (self.account_id, job_name, job_date),
             ).fetchone()
             if row is not None and row["status"] in {"running", "completed"}:
                 return False
+            if (
+                row is not None
+                and row["next_retry_at"] is not None
+                and str(row["next_retry_at"]) > started_at
+            ):
+                return False
             connection.execute(
                 """
                 INSERT INTO daily_jobs(
                     account_id, job_name, job_date, status, attempt_count,
-                    started_at, completed_at, last_error
-                ) VALUES (?, ?, ?, 'running', 1, ?, NULL, '')
+                    started_at, completed_at, next_retry_at, last_error
+                ) VALUES (?, ?, ?, 'running', 1, ?, NULL, NULL, '')
                 ON CONFLICT(account_id, job_name, job_date) DO UPDATE SET
                     status = 'running',
                     attempt_count = daily_jobs.attempt_count + 1,
                     started_at = excluded.started_at,
                     completed_at = NULL,
+                    next_retry_at = NULL,
                     last_error = ''
                 """,
                 (self.account_id, job_name, job_date, started_at),
@@ -626,21 +673,34 @@ class PaperLedger:
         job_date: str,
         *,
         error: str = "",
+        retry_after_seconds: int = 0,
+        now: datetime | None = None,
     ) -> None:
-        """完成或释放每日任务；失败任务允许下一轮重试。"""
+        """完成每日任务；失败时按配置的有限退避释放重试。"""
+        if retry_after_seconds < 0:
+            raise ValueError("每日任务重试等待秒数不能为负")
+        current = now or now_local()
         status = "failed" if error else "completed"
-        completed_at = None if error else format_local()
+        completed_at = None if error else current.strftime("%Y-%m-%d %H:%M:%S")
+        next_retry_at = (
+            (current + timedelta(seconds=retry_after_seconds)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            if error and retry_after_seconds > 0
+            else None
+        )
         with self._transaction() as connection:
             cursor = connection.execute(
                 """
                 UPDATE daily_jobs
-                SET status = ?, completed_at = ?, last_error = ?
+                SET status = ?, completed_at = ?, next_retry_at = ?, last_error = ?
                 WHERE account_id = ? AND job_name = ? AND job_date = ?
                   AND status = 'running'
                 """,
                 (
                     status,
                     completed_at,
+                    next_retry_at,
                     error,
                     self.account_id,
                     job_name,
@@ -649,6 +709,18 @@ class PaperLedger:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"每日任务不在运行状态: {job_name}/{job_date}")
+
+    def daily_job_completed(self, job_name: str, job_date: str) -> bool:
+        """查询每日任务是否已完成，供依赖任务避免在上游故障时重复请求。"""
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT status FROM daily_jobs
+            WHERE account_id = ? AND job_name = ? AND job_date = ?
+            """,
+            (self.account_id, job_name, job_date),
+        ).fetchone()
+        return row is not None and str(row["status"]) == "completed"
 
     def record_signal(self, target: TargetPortfolio, run_id: str | None = None) -> str:
         """幂等记录收盘目标组合；同日不同目标直接失败。"""

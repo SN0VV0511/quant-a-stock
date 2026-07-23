@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 from data import bs_worker
-from data.ak_loader import AKDataLoader
+from data.ak_loader import AKDataLoader, _history_batch_timeout
 
 
 def _rows(close: str) -> list[list[str]]:
@@ -86,6 +86,19 @@ def test_batch_history_reuses_worker_login_and_skips_cached_codes(
         "sh.600002",
     )
     assert calls[0][1]["timeout"] == 30
+
+
+def test_batch_history_timeout_has_global_tail_latency_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """大批次不能按逐股超时线性放大到数分钟。"""
+    monkeypatch.setattr(
+        "data.ak_loader._BS_HISTORY_BATCH_TIMEOUT_CAP_SECONDS",
+        60,
+    )
+
+    assert _history_batch_timeout(2, 8) == 30
+    assert _history_batch_timeout(25, 8) == 60
 
 
 def test_batch_extended_history_reuses_one_worker_session(
@@ -200,11 +213,11 @@ def test_worker_batch_logs_in_once_for_multiple_stocks(
     assert set(result["results"]) == {"sh.600000", "sh.600001", "sh.600002"}
 
 
-def test_batch_history_uses_recent_stale_cache_without_network(
+def test_batch_history_refresh_failure_falls_back_to_stale_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """盘中全盘扫描应复用 7 天内旧缓存，避免同步刷新数千只股票。"""
+    """基础历史旧缓存应触发刷新，并只在远端失败时作为回退。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
     cached = pd.DataFrame(
         {
@@ -225,15 +238,150 @@ def test_batch_history_uses_recent_stale_cache_without_network(
         json.dumps({"ts": time.time() - 86_400}),
         encoding="utf-8",
     )
+    calls: list[tuple[object, ...]] = []
 
-    def _fail_remote(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("7 天内旧缓存不应触发同步 BaoStock 下载")
+    def _fail_remote(*args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append(args)
+        return {
+            "results": {
+                "sh.600000": {"error_code": "1", "rows": []},
+            }
+        }
 
     monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _fail_remote)
 
     result = loader.get_batch_history(["600000"], days=260)
 
     assert set(result) == {"600000"}
+    assert len(calls) == 1
+    assert calls[0][0] == "query_history_batch"
+    assert result["600000"]["close"].iloc[-1] == pytest.approx(10.5)
+    persisted = pd.read_pickle(tmp_path / "hist_600000_260.pkl")
+    assert persisted["close"].iloc[-1] == pytest.approx(10.5)
+
+
+def test_batch_history_refresh_success_replaces_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """基础历史远端刷新成功时应返回并持久化新行情。"""
+    loader = AKDataLoader(cache_dir=str(tmp_path))
+    cached = pd.DataFrame(
+        {
+            "date": ["2026-06-12"],
+            "open": [10.0],
+            "high": [11.0],
+            "low": [9.0],
+            "close": [10.5],
+            "volume": [1000.0],
+            "amount": [10000.0],
+            "preclose": [9.8],
+            "pctChg": [1.2],
+        }
+    )
+    loader._write_cache("hist_600000_260", cached)
+    meta_path = tmp_path / "hist_600000_260.pkl.meta"
+    meta_path.write_text(
+        json.dumps({"ts": time.time() - 86_400}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[object, ...]] = []
+
+    def _refresh_remote(*args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append(args)
+        return {
+            "results": {
+                "sh.600000": {"error_code": "0", "rows": _rows("12")},
+            }
+        }
+
+    monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _refresh_remote)
+
+    result = loader.get_batch_history(["600000"], days=260)
+
+    assert len(calls) == 1
+    assert result["600000"]["close"].iloc[-1] == pytest.approx(12.0)
+    persisted = pd.read_pickle(tmp_path / "hist_600000_260.pkl")
+    assert persisted["close"].iloc[-1] == pytest.approx(12.0)
+
+
+def test_batch_extended_history_refresh_failure_falls_back_to_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """扩展历史旧缓存也应刷新，失败时保留估值等旧字段。"""
+    loader = AKDataLoader(cache_dir=str(tmp_path))
+    cached = pd.DataFrame(
+        {
+            "date": ["2026-06-12"],
+            "close": [10.5],
+            "pb": [1.2],
+        }
+    )
+    loader._write_cache("histext_600000_260", cached)
+    meta_path = tmp_path / "histext_600000_260.pkl.meta"
+    meta_path.write_text(
+        json.dumps({"ts": time.time() - 86_400}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[object, ...]] = []
+
+    def _fail_remote(*args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append(args)
+        return {
+            "results": {
+                "sh.600000": {"error_code": "1", "rows": []},
+            }
+        }
+
+    monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _fail_remote)
+
+    result = loader.get_batch_history_ext(["600000"], days=260)
+
+    assert len(calls) == 1
+    assert calls[0][0] == "query_history_ext_batch"
+    assert result["600000"]["pb"].iloc[-1] == pytest.approx(1.2)
+    persisted = pd.read_pickle(tmp_path / "histext_600000_260.pkl")
+    assert persisted["pb"].iloc[-1] == pytest.approx(1.2)
+
+
+def test_batch_extended_history_refresh_success_replaces_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """扩展历史远端刷新成功时应返回并持久化新数据。"""
+    loader = AKDataLoader(cache_dir=str(tmp_path))
+    cached = pd.DataFrame(
+        {
+            "date": ["2026-06-12"],
+            "close": [10.5],
+            "pb": [1.2],
+        }
+    )
+    loader._write_cache("histext_600000_260", cached)
+    meta_path = tmp_path / "histext_600000_260.pkl.meta"
+    meta_path.write_text(
+        json.dumps({"ts": time.time() - 86_400}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[object, ...]] = []
+
+    def _refresh_remote(*args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append(args)
+        return {
+            "results": {
+                "sh.600000": {"error_code": "0", "rows": _ext_rows("13")},
+            }
+        }
+
+    monkeypatch.setattr("data.ak_loader._run_bs_with_subprocess", _refresh_remote)
+
+    result = loader.get_batch_history_ext(["600000"], days=260)
+
+    assert len(calls) == 1
+    assert result["600000"]["close"].iloc[-1] == pytest.approx(13.0)
+    persisted = pd.read_pickle(tmp_path / "histext_600000_260.pkl")
+    assert persisted["close"].iloc[-1] == pytest.approx(13.0)
 
 
 def test_batch_history_reuses_longer_compatible_cache(

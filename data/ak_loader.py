@@ -62,9 +62,23 @@ socket.setdefaulttimeout(30)
 _BS_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bs_worker.py")
 _BS_SUBPROCESS_TIMEOUT_SECONDS = 15
 _BS_UNIVERSE_TIMEOUT_SECONDS = 5
+_BS_RETRY_COOLDOWN_SECONDS = max(
+    1,
+    int(os.getenv("BAOSTOCK_RETRY_COOLDOWN_SECONDS", "300")),
+)
 _TENCENT_BATCH_SIZE = 100
 _TENCENT_MAX_WORKERS = 6
 _TENCENT_REQUEST_TIMEOUT_SECONDS = 5
+_BS_HISTORY_BATCH_TIMEOUT_CAP_SECONDS = max(
+    30,
+    int(os.getenv("BAOSTOCK_HISTORY_BATCH_TIMEOUT_CAP_SECONDS", "45")),
+)
+
+
+def _history_batch_timeout(batch_size: int, timeout_per_stock: int) -> int:
+    """限制单批历史下载尾延迟，避免一只卡点拖住整次收盘扫描。"""
+    estimated = max(30, batch_size * max(1, timeout_per_stock))
+    return min(estimated, _BS_HISTORY_BATCH_TIMEOUT_CAP_SECONDS)
 
 
 def _reap_process(proc: subprocess.Popen[bytes], command: str) -> None:
@@ -536,6 +550,46 @@ class AKDataLoader:
         self._bs_lock = threading.Lock()
         self._bs_last_verified = 0  # timestamp of last successful verification
         self._bs_verify_interval = 300  # re-verify at most every 5 minutes
+        self._bs_unavailable_since: float | None = None
+
+    def _bs_attempt_allowed_locked(self, now: float) -> bool:
+        """在持有 ``_bs_lock`` 时判断熔断状态，并在冷却结束后半开恢复。"""
+        if self._bs_available:
+            return True
+
+        if self._bs_unavailable_since is None:
+            self._bs_unavailable_since = now
+            return False
+        elapsed = max(0.0, now - self._bs_unavailable_since)
+        if elapsed < _BS_RETRY_COOLDOWN_SECONDS:
+            return False
+
+        self._bs_available = True
+        self._bs_logged_in = False
+        self._bs_last_verified = 0
+        self._bs_unavailable_since = None
+        logger.info(
+            "BaoStock 熔断冷却已结束（%ds），允许重新尝试",
+            _BS_RETRY_COOLDOWN_SECONDS,
+        )
+        return True
+
+    def _bs_attempt_allowed(self) -> bool:
+        """线程安全地检查 BaoStock 当前是否允许发起远端请求。"""
+        with self._bs_lock:
+            return self._bs_attempt_allowed_locked(time.time())
+
+    def _mark_bs_unavailable(self) -> None:
+        """线程安全地熔断 BaoStock，并记录本轮有限冷却的起点。"""
+        with self._bs_lock:
+            self._mark_bs_unavailable_locked(time.time())
+
+    def _mark_bs_unavailable_locked(self, now: float) -> None:
+        """在持有 ``_bs_lock`` 时进入有限冷却，避免递归获取普通锁。"""
+        self._bs_available = False
+        self._bs_logged_in = False
+        self._bs_last_verified = 0
+        self._bs_unavailable_since = now
 
     def _login(self):
         _require_baostock()
@@ -558,11 +612,18 @@ class AKDataLoader:
         子进程查询,从而保留 ``get_batch_history`` 的并发能力。
         """
         with self._bs_lock:
-            if not self._bs_available:
-                raise ConnectionError("BaoStock 已标记为不可用,跳过登录")
+            now = time.time()
+            if not self._bs_attempt_allowed_locked(now):
+                retry_after = (
+                    (self._bs_unavailable_since or now)
+                    + _BS_RETRY_COOLDOWN_SECONDS
+                    - now
+                )
+                raise ConnectionError(
+                    f"BaoStock 熔断冷却中，约 {max(1, int(retry_after))} 秒后重试"
+                )
             _require_baostock()
             # Skip re-verification if recently verified
-            now = time.time()
             if (
                 self._bs_logged_in
                 and (now - self._bs_last_verified) < self._bs_verify_interval
@@ -581,6 +642,7 @@ class AKDataLoader:
                 if result is not None and result.get("error_code") == "0":
                     self._bs_logged_in = True
                     self._bs_last_verified = time.time()
+                    self._bs_unavailable_since = None
                     return
                 wait = 2 * (attempt + 1)
                 logger.warning(
@@ -589,9 +651,10 @@ class AKDataLoader:
                 self._bs_logged_in = False
                 if attempt < 2:
                     time.sleep(wait)
-            self._bs_available = False
+            self._mark_bs_unavailable_locked(time.time())
             logger.error(
-                "BaoStock 登录重试 3 次均失败,标记为不可用,后续调用将跳过 BaoStock"
+                "BaoStock 登录重试 3 次均失败，熔断 %ds 后允许重试",
+                _BS_RETRY_COOLDOWN_SECONDS,
             )
             raise ConnectionError("BaoStock 登录重试 3 次均失败")
 
@@ -814,7 +877,7 @@ class AKDataLoader:
 
         # 尝试今天及前 5 天，BaoStock 盘中可能没数据
         rows: list[list[str]] = []
-        if self._bs_available:
+        if self._bs_attempt_allowed():
             for offset in range(6):
                 day = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
                 result = _run_bs_with_subprocess(
@@ -826,7 +889,7 @@ class AKDataLoader:
                     logger.error(
                         "BaoStock query_all_stock(%s) 超时或异常，立即熔断", day
                     )
-                    self._bs_available = False
+                    self._mark_bs_unavailable()
                     break
                 if result.get("error_code") != "0":
                     logger.warning(
@@ -1034,7 +1097,7 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
-        if not self._bs_available:
+        if not self._bs_attempt_allowed():
             return None
 
         end = datetime.now().strftime("%Y-%m-%d")
@@ -1099,6 +1162,7 @@ class AKDataLoader:
                 target_codes.append(normalized)
 
         result: dict[str, pd.DataFrame] = {}
+        stale_fallbacks: dict[str, pd.DataFrame] = {}
         missing: list[tuple[str, str]] = []
         stale_cache_count = 0
         compatible_cache_count = 0
@@ -1127,22 +1191,39 @@ class AKDataLoader:
 
         for index, code in enumerate(target_codes, start=1):
             cache_key = f"hist_{code}_{days}"
-            cached = self._read_cache(
+            fresh = self._read_cache(
                 cache_key,
                 max_age=BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
             )
-            if cached is None:
-                cached = self._read_cache(
+            if fresh is not None and fresh.empty:
+                fresh = None
+            stale = None
+            if fresh is None:
+                stale = self._read_cache(
                     cache_key,
                     max_age=BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
                 )
-                if cached is not None:
+                if stale is not None and stale.empty:
+                    stale = None
+                if stale is not None:
                     stale_cache_count += 1
-            if cached is None:
-                candidates = sorted(
-                    compatible_cache_keys.get(code, []),
-                    reverse=True,
-                )
+            candidates = sorted(
+                compatible_cache_keys.get(code, []),
+                reverse=True,
+            )
+            if fresh is None:
+                for _cached_days, candidate_key in candidates:
+                    if candidate_key == cache_key:
+                        continue
+                    candidate = self._read_cache(
+                        candidate_key,
+                        max_age=BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
+                    )
+                    if candidate is not None and not candidate.empty:
+                        fresh = candidate
+                        compatible_cache_count += 1
+                        break
+            if fresh is None and stale is None:
                 for _cached_days, candidate_key in candidates:
                     if candidate_key == cache_key:
                         continue
@@ -1151,12 +1232,15 @@ class AKDataLoader:
                         max_age=BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
                     )
                     if candidate is not None and not candidate.empty:
-                        cached = candidate
+                        stale = candidate
+                        stale_cache_count += 1
                         compatible_cache_count += 1
                         break
-            if cached is not None and not cached.empty:
-                result[code] = cached
+            if fresh is not None and not fresh.empty:
+                result[code] = fresh
             else:
+                if stale is not None and not stale.empty:
+                    stale_fallbacks[code] = stale
                 missing.append((code, to_baostock_code(code)))
             if index % 500 == 0:
                 logger.info(
@@ -1175,7 +1259,10 @@ class AKDataLoader:
             len(missing),
             time.monotonic() - started_at,
         )
-        if not missing or not self._bs_available:
+        if not missing:
+            return result
+        if not self._bs_attempt_allowed():
+            result.update(stale_fallbacks)
             return result
 
         end = datetime.now().strftime("%Y-%m-%d")
@@ -1203,7 +1290,10 @@ class AKDataLoader:
             future_map = {}
             for batch_index, batch in enumerate(batches, start=1):
                 bs_codes = [bs_code for _code, bs_code in batch]
-                batch_timeout = max(30, len(batch) * max(1, timeout_per_stock))
+                batch_timeout = _history_batch_timeout(
+                    len(batch),
+                    timeout_per_stock,
+                )
                 future = executor.submit(
                     _run_bs_with_subprocess,
                     "query_history_batch",
@@ -1256,6 +1346,8 @@ class AKDataLoader:
                     time.monotonic() - started_at,
                 )
 
+        for code, frame in stale_fallbacks.items():
+            result.setdefault(code, frame)
         logger.info(
             "批量历史数据完成: %d/%d 只成功，远端失败 %d 只，总耗时 %.2fs",
             len(result),
@@ -1294,7 +1386,7 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
-        if not self._bs_available:
+        if not self._bs_attempt_allowed():
             return None
 
         end = datetime.now().strftime("%Y-%m-%d")
@@ -1345,21 +1437,29 @@ class AKDataLoader:
                 target.append(code)
 
         result: dict[str, pd.DataFrame] = {}
+        stale_fallbacks: dict[str, pd.DataFrame] = {}
         missing: list[tuple[str, str]] = []
         for code in target:
             cache_key = f"histext_{code}_{days}"
-            cached = self._read_cache(
+            fresh = self._read_cache(
                 cache_key,
                 max_age=BAOSTOCK_HISTORY_CACHE_TTL_SECONDS,
             )
-            if cached is None:
-                cached = self._read_cache(
+            if fresh is not None and fresh.empty:
+                fresh = None
+            stale = None
+            if fresh is None:
+                stale = self._read_cache(
                     cache_key,
                     max_age=BAOSTOCK_HISTORY_STALE_MAX_AGE_SECONDS,
                 )
-            if cached is not None and not cached.empty:
-                result[code] = cached
+                if stale is not None and stale.empty:
+                    stale = None
+            if fresh is not None and not fresh.empty:
+                result[code] = fresh
             else:
+                if stale is not None and not stale.empty:
+                    stale_fallbacks[code] = stale
                 missing.append((code, to_baostock_code(code)))
 
         logger.info(
@@ -1368,7 +1468,10 @@ class AKDataLoader:
             len(result),
             len(missing),
         )
-        if not missing or not self._bs_available:
+        if not missing:
+            return result
+        if not self._bs_attempt_allowed():
+            result.update(stale_fallbacks)
             return result
 
         end = datetime.now().strftime("%Y-%m-%d")
@@ -1387,7 +1490,10 @@ class AKDataLoader:
         ) as executor:
             future_map = {}
             for batch_index, batch in enumerate(batches, start=1):
-                batch_timeout = max(30, len(batch) * max(1, timeout_per_stock))
+                batch_timeout = _history_batch_timeout(
+                    len(batch),
+                    timeout_per_stock,
+                )
                 future = executor.submit(
                     _run_bs_with_subprocess,
                     "query_history_ext_batch",
@@ -1439,6 +1545,8 @@ class AKDataLoader:
                     len(failures),
                     time.monotonic() - started_at,
                 )
+        for code, frame in stale_fallbacks.items():
+            result.setdefault(code, frame)
         logger.info(
             "扩展历史完成: %d/%d 只成功，远端失败 %d 只，总耗时 %.2fs",
             len(result),
@@ -1486,7 +1594,7 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
-        if not self._bs_available:
+        if not self._bs_attempt_allowed():
             return None
 
         try:

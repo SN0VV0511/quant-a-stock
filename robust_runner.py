@@ -16,7 +16,6 @@ import socket
 import subprocess
 import tempfile
 import threading
-import time
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
@@ -32,7 +31,6 @@ from config.settings import (
     ALLOW_CHINEXT_STOCKS,
     ALLOW_MAIN_BOARD_STOCKS,
     ALLOW_STAR_MARKET_STOCKS,
-    DEFAULT_RPS_ETF_POOL,
     DAILY_LOSS_THRESHOLD,
     ENFORCE_T1,
     INITIAL_CAPITAL,
@@ -41,6 +39,8 @@ from config.settings import (
     ROBUST_V2_ACCOUNT_ID,
     ROBUST_V2_BACKUP_DIR,
     ROBUST_V2_BACKUP_RETENTION_DAYS,
+    ROBUST_V2_BROAD_ETF_CODES,
+    ROBUST_V2_DAILY_JOB_RETRY_SECONDS,
     ROBUST_V2_LEASE_TTL_SECONDS,
     ROBUST_V2_LEDGER_PATH,
     ROBUST_V2_MAX_EXECUTION_QUOTE_AGE_SECONDS,
@@ -197,6 +197,18 @@ def _latest_dates(history_map: Mapping[str, pd.DataFrame], cutoff: str) -> list[
     return sorted(dates)
 
 
+def _history_contains_date(frame: pd.DataFrame, trade_date: str) -> bool:
+    """判断单个行情表是否真实包含目标交易日。"""
+    if frame is None or frame.empty:
+        return False
+    if "date" in frame.columns:
+        normalized = frame["date"].astype(str).str.replace("-", "", regex=False).str[:8]
+        return bool((normalized == trade_date).any())
+    if isinstance(frame.index, pd.DatetimeIndex):
+        return trade_date in set(frame.index.strftime("%Y%m%d"))
+    return False
+
+
 def _previous_date(
     history_map: Mapping[str, pd.DataFrame], trade_date: str
 ) -> str | None:
@@ -261,7 +273,9 @@ def validate_startup(config: RobustV2Config) -> None:
             "账户声明有双创权限，但 robust_v2 仍不会直接买入 300/301/688 股票"
         )
     unsupported = [
-        code for code in DEFAULT_RPS_ETF_POOL if not is_supported_trading_target(code)
+        code
+        for code in ROBUST_V2_BROAD_ETF_CODES
+        if not is_supported_trading_target(code)
     ]
     if unsupported:
         raise RuntimeError(f"ETF 能力预检失败: {unsupported}")
@@ -284,8 +298,8 @@ def load_runtime_config(
         if not isinstance(selected, dict):
             raise ValueError("selected_params 必须是对象")
         allowed = {
-            "enable_etf_trend_filter",
-            "stock_reversal_days",
+            "etf_min_20d_return",
+            "stock_min_earnings_yield",
             "rebalance_days",
             "stock_stop_pct",
             "max_total_position",
@@ -390,6 +404,10 @@ class RobustDataService:
         universe = {
             "mainboard_count": len(stocks),
             "realtime_quote_count": len(quotes),
+            "tencent_quote_count": sum(
+                str(quote.get("source", "")).lower() == "tencent"
+                for quote in quotes.values()
+            ),
             "rough_candidate_count": len(selected),
         }
         universe_info_getter = getattr(self.loader, "get_stock_universe_info", None)
@@ -415,8 +433,15 @@ class RobustDataService:
         """数据不足时拒绝生成正式目标，避免把数据故障伪装成空候选。"""
         mainboard_count = int(universe.get("mainboard_count", 0))
         quote_count = int(universe.get("realtime_quote_count", 0))
+        tencent_quote_count = int(universe.get("tencent_quote_count", 0))
         rough_count = int(universe.get("rough_candidate_count", 0))
         history_count = int(universe.get("history_loaded_count", 0))
+        signal_date_history_count = int(
+            universe.get("history_signal_date_count", history_count)
+        )
+        signal_date_etf_count = int(
+            universe.get("etf_signal_date_count", etf_history_count)
+        )
         if int(universe.get("universe_authoritative", 1)) != 1:
             raise DataCompletenessError("股票池来源不可证明完整，拒绝生成正式信号")
         if mainboard_count < self.min_mainboard_universe:
@@ -430,20 +455,45 @@ class RobustDataService:
                 f"实时行情覆盖率 {quote_coverage:.2%} 低于下限 "
                 f"{self.min_realtime_quote_coverage:.2%}"
             )
-        history_coverage = history_count / rough_count if rough_count else 1.0
+        tencent_coverage = (
+            tencent_quote_count / mainboard_count if mainboard_count else 0.0
+        )
+        if tencent_coverage < self.min_realtime_quote_coverage:
+            raise DataCompletenessError(
+                f"腾讯实时行情覆盖率 {tencent_coverage:.2%} 低于下限 "
+                f"{self.min_realtime_quote_coverage:.2%}"
+            )
+        if rough_count <= 0:
+            raise DataCompletenessError("实时粗筛未产生任何个股候选，拒绝生成正式信号")
+        history_coverage = history_count / rough_count
         if history_coverage < self.min_history_coverage:
             raise DataCompletenessError(
                 f"候选历史行情覆盖率 {history_coverage:.2%} 低于下限 "
                 f"{self.min_history_coverage:.2%}"
             )
+        signal_date_coverage = signal_date_history_count / rough_count
+        if signal_date_coverage < self.min_history_coverage:
+            raise DataCompletenessError(
+                f"候选信号日行情覆盖率 {signal_date_coverage:.2%} 低于下限 "
+                f"{self.min_history_coverage:.2%}"
+            )
         required_etfs = max(
             1,
-            int(len(DEFAULT_RPS_ETF_POOL) * self.min_etf_history_coverage + 0.999999),
+            int(
+                len(ROBUST_V2_BROAD_ETF_CODES) * self.min_etf_history_coverage
+                + 0.999999
+            ),
         )
         if etf_history_count < required_etfs:
             raise DataCompletenessError(
-                f"ETF 历史行情仅 {etf_history_count}/{len(DEFAULT_RPS_ETF_POOL)}，"
+                f"宽基 ETF 历史行情仅 {etf_history_count}/"
+                f"{len(ROBUST_V2_BROAD_ETF_CODES)}，"
                 f"至少需要 {required_etfs} 只"
+            )
+        if signal_date_etf_count < required_etfs:
+            raise DataCompletenessError(
+                f"宽基 ETF 信号日行情仅 {signal_date_etf_count}/"
+                f"{len(ROBUST_V2_BROAD_ETF_CODES)}，至少需要 {required_etfs} 只"
             )
 
     def _persist_universe(
@@ -498,7 +548,7 @@ class RobustDataService:
 
     def load_signal_data(self, trade_date: str, account_value: float) -> SignalData:
         """加载收盘选仓数据并生成可审计快照。"""
-        etf_codes = list(DEFAULT_RPS_ETF_POOL)
+        etf_codes = sorted(ROBUST_V2_BROAD_ETF_CODES)
         etf_history = self.loader.get_batch_etf_history(
             etf_codes, days=420, adjust="qfq"
         )
@@ -511,6 +561,13 @@ class RobustDataService:
             max_batch=self.stock_candidate_limit,
         )
         universe["history_loaded_count"] = len(stock_history)
+        universe["history_signal_date_count"] = sum(
+            _history_contains_date(frame, trade_date)
+            for frame in stock_history.values()
+        )
+        universe["etf_signal_date_count"] = sum(
+            _history_contains_date(frame, trade_date) for frame in etf_history.values()
+        )
         self._require_complete_signal_data(
             universe=universe,
             etf_history_count=len(etf_history),
@@ -593,6 +650,31 @@ def _last_trading_day_of_week(day: date_type, ignore_calendar: bool = False) -> 
             return False
         cursor += timedelta(days=1)
     return True
+
+
+def _last_trading_day_of_month(day: date_type, ignore_calendar: bool = False) -> bool:
+    """判断当天是否为当月最后一个交易日。"""
+    cursor = day + timedelta(days=1)
+    while cursor.month == day.month:
+        if ignore_calendar:
+            if cursor.weekday() < 5:
+                return False
+        elif calendar_is_trading_day(cursor.strftime("%Y%m%d")):
+            return False
+        cursor += timedelta(days=1)
+    return True
+
+
+def _is_rebalance_period_end(
+    day: date_type,
+    rebalance_days: int,
+    *,
+    ignore_calendar: bool = False,
+) -> bool:
+    """按配置选择周末或月末收盘边界。"""
+    if rebalance_days == 20:
+        return _last_trading_day_of_month(day, ignore_calendar)
+    return _last_trading_day_of_week(day, ignore_calendar)
 
 
 class RobustV2Runner:
@@ -694,9 +776,13 @@ class RobustV2Runner:
     def is_rebalance_due(
         self, trade_date: str, *, ignore_calendar: bool = False
     ) -> bool:
-        """按周/双周判断收盘目标是否到期。"""
+        """按周、双周或月度周期判断收盘目标是否到期。"""
         current = datetime.strptime(trade_date, "%Y%m%d").date()
-        if not _last_trading_day_of_week(current, ignore_calendar):
+        if not _is_rebalance_period_end(
+            current,
+            self.config.rebalance_days,
+            ignore_calendar=ignore_calendar,
+        ):
             return False
         latest = self.ledger.latest_signal_date(self.config.strategy_version)
         if latest is None:
@@ -721,7 +807,10 @@ class RobustV2Runner:
             date_text = candidate.strftime("%Y%m%d")
             if not _is_trading_day(date_text, ignore_calendar=False):
                 continue
-            if not _last_trading_day_of_week(candidate):
+            if not _is_rebalance_period_end(
+                candidate,
+                self.config.rebalance_days,
+            ):
                 continue
             if rebalance_interval_elapsed(
                 date_text,
@@ -892,7 +981,7 @@ class RobustV2Runner:
     def generate_close_target(
         self, trade_date: str, *, force: bool = False
     ) -> TargetPortfolio | None:
-        """在周度收盘生成目标组合并持久化，不直接下单。"""
+        """在配置周期的收盘生成目标组合并持久化，不直接下单。"""
         if not force and not self.is_rebalance_due(trade_date):
             LOGGER.info("%s 非 robust_v2 调仓收盘，跳过目标生成", trade_date)
             return None
@@ -1000,6 +1089,15 @@ class RobustV2Runner:
                 if normalized_security_code(code) in contexts
             }
             alignment = validate_realtime_alignment(snapshot, history, healthy_quotes)
+            aligned_codes = {
+                normalized_security_code(code) for code in alignment.valid_codes
+            }
+            incomplete_position_quotes = sorted(
+                code
+                for code in positions
+                if normalized_security_code(code) not in contexts
+                or normalized_security_code(code) not in aligned_codes
+            )
             prices = {
                 context.code: context.current_price for context in contexts.values()
             }
@@ -1007,6 +1105,10 @@ class RobustV2Runner:
                 prices,
                 execution_date=execution_date,
             )
+            if incomplete_position_quotes:
+                buy_risk_block = "持仓实时估值不完整，暂停所有新买入: " + ",".join(
+                    incomplete_position_quotes
+                )
             allocation = self.allocator.allocate(
                 target,
                 cash=self.broker.query_cash(),
@@ -1018,6 +1120,15 @@ class RobustV2Runner:
             checked_orders: list[OrderIntent] = []
             market_skipped: dict[str, str] = {}
             risk_skipped: dict[str, str] = {}
+            if buy_risk_block:
+                current_codes = {normalized_security_code(code) for code in positions}
+                risk_skipped.update(
+                    {
+                        position.code: buy_risk_block
+                        for position in target.positions
+                        if normalized_security_code(position.code) not in current_codes
+                    }
+                )
             for order in allocation.orders:
                 if order.action == "buy" and buy_risk_block:
                     risk_skipped[order.code] = buy_risk_block
@@ -1278,6 +1389,16 @@ def _latest_completed_trade_date(reference: datetime | None = None) -> str:
     raise RuntimeError("无法确定最近一个已完成收盘的交易日")
 
 
+def _parse_observation_end_date(value: str | None) -> date_type | None:
+    """解析虚拟盘观察期结束日；结束日当天仍保持运行。"""
+    if value is None or not value.strip():
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError("观察期结束日必须为有效的 YYYYMMDD") from exc
+
+
 def _startup_log(
     broker: BrokerAdapter,
     ledger: PaperLedger,
@@ -1309,19 +1430,33 @@ def run_daemon(
     once: bool = False,
     ignore_calendar: bool = False,
     poll_seconds: int = ROBUST_V2_MONITOR_INTERVAL_SECONDS,
+    observation_end_date: str | None = None,
 ) -> int:
     """运行持有 SQLite 写租约的唯一低频守护实例。"""
     if poll_seconds <= 0 or poll_seconds > 60:
         raise ValueError("轮询间隔必须位于 1-60 秒")
+    observation_end = _parse_observation_end_date(observation_end_date)
+    if observation_end is not None and now_local().date() > observation_end:
+        LOGGER.info("虚拟盘观察期已于 %s 结束，不再启动守护实例", observation_end)
+        return 0
     validate_startup(runner.config)
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: Any) -> None:
+        stop_event.set()
+
+    previous_sigterm = signal.signal(signal.SIGTERM, _stop)
+    previous_sigint = signal.signal(signal.SIGINT, _stop)
     holder_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-    runner.ledger.acquire_lease(holder_id, ROBUST_V2_LEASE_TTL_SECONDS)
-    heartbeat = LeaseHeartbeat(
-        runner.ledger,
-        holder_id,
-        ROBUST_V2_LEASE_TTL_SECONDS,
-    )
+    lease_acquired = False
     try:
+        runner.ledger.acquire_lease(holder_id, ROBUST_V2_LEASE_TTL_SECONDS)
+        lease_acquired = True
+        heartbeat = LeaseHeartbeat(
+            runner.ledger,
+            holder_id,
+            ROBUST_V2_LEASE_TTL_SECONDS,
+        )
         commit, digest = _startup_log(runner.broker, runner.ledger, runner.config)
         run = runner.ledger.start_run(
             strategy_version=runner.config.strategy_version,
@@ -1332,22 +1467,22 @@ def run_daemon(
         )
         heartbeat.start()
     except Exception:
-        runner.ledger.release_lease(holder_id)
+        if lease_acquired:
+            runner.ledger.release_lease(holder_id)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
         raise
-    stopping = False
-
-    def _stop(_signum: int, _frame: Any) -> None:
-        nonlocal stopping
-        stopping = True
-
-    previous_sigterm = signal.signal(signal.SIGTERM, _stop)
-    previous_sigint = signal.signal(signal.SIGINT, _stop)
     status = "completed"
     last_idle_state = ""
     try:
-        while not stopping:
+        while not stop_event.is_set():
             heartbeat.raise_if_failed()
             now = now_local()
+            if observation_end is not None and now.date() > observation_end:
+                LOGGER.info(
+                    "虚拟盘观察期已于 %s 结束，正常停止守护实例", observation_end
+                )
+                break
             trade_date = now.strftime("%Y%m%d")
             if not _is_trading_day(trade_date, ignore_calendar):
                 idle_state = f"non_trading:{trade_date}"
@@ -1382,6 +1517,7 @@ def run_daemon(
                             "close_cycle",
                             trade_date,
                             error=str(exc),
+                            retry_after_seconds=ROBUST_V2_DAILY_JOB_RETRY_SECONDS,
                         )
                         LOGGER.exception(
                             "收盘任务失败，本日下一轮将重试: date=%s",
@@ -1390,7 +1526,9 @@ def run_daemon(
                     else:
                         runner.ledger.finish_daily_job("close_cycle", trade_date)
                         LOGGER.info("收盘日报: %s", path)
-                if runner.ledger.claim_daily_job("daily_candidate_scan", trade_date):
+                if runner.ledger.daily_job_completed(
+                    "close_cycle", trade_date
+                ) and runner.ledger.claim_daily_job("daily_candidate_scan", trade_date):
                     try:
                         scan = runner.ensure_daily_candidate_scan(trade_date)
                     except Exception as exc:
@@ -1398,6 +1536,7 @@ def run_daemon(
                             "daily_candidate_scan",
                             trade_date,
                             error=str(exc),
+                            retry_after_seconds=ROBUST_V2_DAILY_JOB_RETRY_SECONDS,
                         )
                         LOGGER.exception(
                             "每日候选观察扫描失败，本日下一轮将重试: date=%s",
@@ -1426,7 +1565,7 @@ def run_daemon(
             heartbeat.raise_if_failed()
             if once:
                 break
-            time.sleep(poll_seconds)
+            stop_event.wait(poll_seconds)
     except Exception:
         status = "failed"
         LOGGER.exception("robust_v2 守护实例异常退出")
@@ -1475,6 +1614,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--poll-seconds", type=int, default=ROBUST_V2_MONITOR_INTERVAL_SECONDS
     )
+    parser.add_argument(
+        "--observation-end-date",
+        help="虚拟盘观察期结束日 YYYYMMDD；结束日次日守护进程正常退出",
+    )
     return parser.parse_args()
 
 
@@ -1509,6 +1652,7 @@ def main() -> int:
                 once=args.once,
                 ignore_calendar=args.ignore_calendar,
                 poll_seconds=args.poll_seconds,
+                observation_end_date=args.observation_end_date,
             )
         commit, digest = _startup_log(broker, runner.ledger, config)
         if args.command == "status":

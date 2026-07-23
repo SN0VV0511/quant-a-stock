@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from config.settings import MIN_ETF_ORDER_AMOUNT, MIN_STOCK_ORDER_AMOUNT
+from config.settings import (
+    MIN_ETF_ORDER_AMOUNT,
+    ROBUST_V2_BROAD_ETF_CODES,
+    ROBUST_V2_MIN_STOCK_ORDER_AMOUNT,
+)
 from rules.engine import TradingRules
 from trading.instruments import get_instrument_profile, normalized_security_code
 from trading.models import OrderIntent, TargetPortfolio, TargetPosition
@@ -32,7 +36,7 @@ class PortfolioAllocator:
         self,
         rules: TradingRules | None = None,
         rebalance_band: float = 0.02,
-        min_stock_order: float = MIN_STOCK_ORDER_AMOUNT,
+        min_stock_order: float = ROBUST_V2_MIN_STOCK_ORDER_AMOUNT,
         min_etf_order: float = MIN_ETF_ORDER_AMOUNT,
     ) -> None:
         if not 0 <= rebalance_band <= 0.1:
@@ -83,14 +87,17 @@ class PortfolioAllocator:
         ]
         if target.exposure > 0.8 + 1e-9 or target.cash_weight < 0.2 - 1e-9:
             raise ValueError("目标组合违反 80% 总仓位或 20% 现金下限")
-        if len(etfs) > 2 or len(stocks) > 1:
-            raise ValueError("目标组合最多允许 2 只 ETF 和 1 只股票")
+        if len(etfs) > 2 or len(stocks) > 2:
+            raise ValueError("目标组合最多允许 2 只 ETF 和 2 只股票")
         for position in etfs:
-            if position.target_weight > 0.3 + 1e-9:
-                raise ValueError(f"ETF {position.code} 超过 30% 单票上限")
+            raw_code = normalized_security_code(position.code)
+            if raw_code not in ROBUST_V2_BROAD_ETF_CODES:
+                raise ValueError(f"robust_v2 禁止买入非宽基 ETF: {position.code}")
+            if position.target_weight > 0.24 + 1e-9:
+                raise ValueError(f"ETF {position.code} 超过 24% 单票上限")
         for position in stocks:
-            if position.target_weight > 0.2 + 1e-9:
-                raise ValueError(f"股票 {position.code} 超过 20% 单票上限")
+            if position.target_weight > 0.16 + 1e-9:
+                raise ValueError(f"股票 {position.code} 超过 16% 单票上限")
             if get_instrument_profile(position.code).board != "mainboard":
                 raise ValueError(f"robust_v2 禁止买入非主板股票: {position.code}")
 

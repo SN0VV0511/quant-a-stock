@@ -108,7 +108,7 @@ class TradingRules:
 
     @staticmethod
     def calc_stamp_tax(amount):
-        """计算印花税：仅卖出收取，千分之五
+        """计算印花税：仅卖出收取，万分之五（0.05%）
 
         Args:
             amount: 卖出金额

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.xueds.quant-a-stock.paper-v2</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/xueds/Python/quant-a-stock/start_live.sh</string>
+    <string>--ledger</string>
+    <string>/Users/xueds/Python/quant-a-stock/data/paper_v2.db</string>
+    <string>--poll-seconds</string>
+    <string>60</string>
+    <string>--observation-end-date</string>
+    <string>20260823</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/xueds/Python/quant-a-stock</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHON_BIN</key>
+    <string>/Users/xueds/.global-env/bin/python3</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>BROKER_MODE</key>
+    <string>paper_v2</string>
+    <key>INITIAL_CAPITAL</key>
+    <string>50000</string>
+    <key>ENFORCE_T1</key>
+    <string>true</string>
+    <key>LIVE_TRADING_ENABLED</key>
+    <string>false</string>
+    <key>ROBUST_V2_REBALANCE_DAYS</key>
+    <string>20</string>
+    <key>ROBUST_V2_MIN_STOCK_ORDER_AMOUNT</key>
+    <string>4000</string>
+    <key>ROBUST_V2_DAILY_JOB_RETRY_SECONDS</key>
+    <string>900</string>
+    <key>BAOSTOCK_HISTORY_BATCH_TIMEOUT_CAP_SECONDS</key>
+    <string>45</string>
+    <key>BAOSTOCK_RETRY_COOLDOWN_SECONDS</key>
+    <string>300</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Umask</key>
+  <integer>18</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/xueds/Python/quant-a-stock/logs/robust_v2.launchd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/xueds/Python/quant-a-stock/logs/robust_v2.launchd.stderr.log</string>
+</dict>
+</plist>
