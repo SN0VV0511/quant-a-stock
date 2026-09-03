@@ -51,6 +51,7 @@ from config.settings import (
     ROBUST_V2_MONITOR_INTERVAL_SECONDS,
     ROBUST_V2_SELECTED_CONFIG_PATH,
     ROBUST_V2_SIGNAL_RETRY_SECONDS,
+    ROBUST_V2_SIGNAL_STRUCTURAL_MAX_ATTEMPTS,
     ROBUST_V2_STOCK_CANDIDATE_LIMIT,
     ROBUST_V2_STRATEGY_VERSION,
     get_stock_board,
@@ -568,10 +569,22 @@ class RobustDataService:
         universe["etf_signal_date_count"] = sum(
             _history_contains_date(frame, trade_date) for frame in etf_history.values()
         )
-        self._require_complete_signal_data(
-            universe=universe,
-            etf_history_count=len(etf_history),
-        )
+        try:
+            self._require_complete_signal_data(
+                universe=universe,
+                etf_history_count=len(etf_history),
+            )
+        except DataCompletenessError as exc:
+            # 日K源全部失败时把各源失败原因并入消息，便于定位反爬/网络故障。
+            summary_getter = getattr(
+                self.loader, "kline_source_failure_summary", None
+            )
+            summary = summary_getter() if callable(summary_getter) else ""
+            if summary:
+                raise DataCompletenessError(
+                    f"{exc}；日K数据源尝试明细: {summary}"
+                ) from exc
+            raise
         all_history = {**etf_history, **stock_history}
         dates = _latest_dates(all_history, trade_date)
         latest_date = dates[-1] if dates else None
@@ -692,7 +705,11 @@ class RobustV2Runner:
         self.broker = broker
         self.loader = loader
         self.strategy = RobustV2Strategy(self.config)
-        self.allocator = PortfolioAllocator()
+        # 执行边界校验的数量上限必须与策略配置同源，避免策略放宽后被硬编码拦下。
+        self.allocator = PortfolioAllocator(
+            max_etf_count=self.config.max_etf_count,
+            max_stock_count=self.config.max_stock_count,
+        )
         self.data = RobustDataService(
             loader,
             root_dir,
@@ -1220,6 +1237,29 @@ class RobustV2Runner:
                 "目标执行完成",
             )
         except Exception as exc:
+            # 验证类/结构性错误（如目标违反仓位约束）重试也不会自愈：
+            # 达到上限后标记 failed 并移出重试队列，避免同一信号无限重试。
+            if (
+                isinstance(exc, ValueError)
+                and claimed.attempt_count >= ROBUST_V2_SIGNAL_STRUCTURAL_MAX_ATTEMPTS
+            ):
+                reason = f"结构性错误连续 {claimed.attempt_count} 次执行失败: {exc}"
+                self.ledger.mark_signal_failed(signal_id, reason)
+                LOGGER.error(
+                    "目标组合结构性校验失败，已达到 %d 次上限，信号标记 failed "
+                    "并移出重试队列: signal=%s attempt=%d error=%s",
+                    ROBUST_V2_SIGNAL_STRUCTURAL_MAX_ATTEMPTS,
+                    signal_id,
+                    claimed.attempt_count,
+                    exc,
+                )
+                return ExecutionOutcome(
+                    signal_id,
+                    target,
+                    allocation,
+                    reports,
+                    f"目标组合结构性错误，已停止重试: {exc}",
+                )
             self.ledger.mark_signal_retryable(
                 signal_id,
                 str(exc),

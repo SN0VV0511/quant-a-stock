@@ -240,6 +240,106 @@ def test_transient_quote_failure_keeps_signal_and_retries_same_day(
     broker.close()
 
 
+def test_structural_validation_error_fails_signal_after_three_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """结构性校验错误最多执行 3 次，之后标记 failed 并移出待重试队列。"""
+    broker = SQLitePaperBrokerAdapter(
+        ledger_path=str(tmp_path / "paper_v2.db"),
+        initial_cash=50_000,
+    )
+    broker.connect()
+    runner = RobustV2Runner(
+        broker,
+        FakeLoader(),  # type: ignore[arg-type]
+        RobustV2Config(enable_stock_enhancement=False, etf_min_avg_amount=0),
+        tmp_path,
+    )
+    runner.data = FakeDataService()  # type: ignore[assignment]
+    monkeypatch.setattr("robust_runner.previous_trading_day", lambda _date: "20260709")
+
+    def _structural_failure(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("目标组合最多允许 2 只股票")
+
+    monkeypatch.setattr(runner.allocator, "allocate", _structural_failure)
+    target = runner.generate_close_target("20260709", force=True)
+    assert target is not None
+
+    # 每次重试间隔超过 ROBUST_V2_SIGNAL_RETRY_SECONDS(60s)，保证可以重新领取。
+    first = runner.execute_pending_target(
+        "20260710", current_time=datetime(2026, 7, 10, 9, 40, 0)
+    )
+    signal_id = first.signal_id
+    assert signal_id is not None
+    state = runner.ledger.query_signal_state(signal_id)
+    assert state["status"] == "retryable"
+    assert "最多允许 2 只股票" in state["last_error"]
+
+    second = runner.execute_pending_target(
+        "20260710", current_time=datetime(2026, 7, 10, 9, 42, 0)
+    )
+    assert "已安排重试" in second.message
+    assert runner.ledger.query_signal_state(signal_id)["status"] == "retryable"
+
+    third = runner.execute_pending_target(
+        "20260710", current_time=datetime(2026, 7, 10, 9, 44, 0)
+    )
+    assert "已停止重试" in third.message
+    state = runner.ledger.query_signal_state(signal_id)
+    assert state["status"] == "failed"
+    assert state["attempt_count"] == 3
+    assert "结构性错误" in state["last_error"]
+    assert "最多允许 2 只股票" in state["last_error"]
+    assert state["next_retry_at"] is None
+
+    # failed 信号不再进入待执行队列，后续轮次直接空转。
+    idle = runner.execute_pending_target(
+        "20260710", current_time=datetime(2026, 7, 10, 9, 46, 0)
+    )
+    assert idle.signal_id is None
+    assert idle.message == "没有待执行目标"
+    broker.close()
+
+
+def test_transient_runtime_error_keeps_retrying_beyond_three_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """瞬时错误(网络/行情缺失)不得触发 failed，重试逻辑保持不变。"""
+    broker = SQLitePaperBrokerAdapter(
+        ledger_path=str(tmp_path / "paper_v2.db"),
+        initial_cash=50_000,
+    )
+    broker.connect()
+    runner = RobustV2Runner(
+        broker,
+        FakeLoader(),  # type: ignore[arg-type]
+        RobustV2Config(enable_stock_enhancement=False, etf_min_avg_amount=0),
+        tmp_path,
+    )
+    runner.data = FakeDataService()  # type: ignore[assignment]
+    monkeypatch.setattr("robust_runner.previous_trading_day", lambda _date: "20260709")
+
+    def _transient_failure(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("行情暂缺: 信号日行情 0/5")
+
+    monkeypatch.setattr(runner.allocator, "allocate", _transient_failure)
+    target = runner.generate_close_target("20260709", force=True)
+    assert target is not None
+
+    for attempt in range(1, 5):
+        outcome = runner.execute_pending_target(
+            "20260710",
+            current_time=datetime(2026, 7, 10, 9, 40 + attempt * 2, 0),
+        )
+        assert "已安排重试" in outcome.message
+        state = runner.ledger.query_signal_state(outcome.signal_id)
+        assert state["status"] == "retryable"
+        assert state["attempt_count"] == attempt
+    broker.close()
+
+
 def test_preview_scan_writes_snapshot_without_creating_actionable_signal(
     tmp_path: Path,
 ) -> None:
@@ -446,6 +546,40 @@ def test_formal_signal_uses_five_broad_etfs_for_completeness(
             },
             etf_history_count=3,
         )
+
+
+def test_formal_signal_error_lists_kline_source_failures(
+    tmp_path: Path,
+) -> None:
+    """日K源全部失败时，DataCompletenessError 消息应列出尝试过的源和失败原因。"""
+
+    class AllSourcesDownLoader(FakeUniverseLoader):
+        """模拟全部日K数据源失败且无历史缓存。"""
+
+        def get_batch_etf_history(self, codes, days=420, adjust="qfq"):
+            """ETF 历史全部获取失败。"""
+            return {}
+
+        def get_batch_history_ext(self, codes, days=420, max_batch=1):
+            """个股扩展历史全部获取失败。"""
+            return {}
+
+        def kline_source_failure_summary(self) -> str:
+            """返回各源失败摘要。"""
+            return (
+                "sina: 456 Client Error; tencent: ReadTimeout; eastmoney: 返回空数据"
+            )
+
+    service = RobustDataService(
+        AllSourcesDownLoader(),  # type: ignore[arg-type]
+        tmp_path,
+    )
+
+    with pytest.raises(
+        DataCompletenessError,
+        match=r"主板股票池仅 5 只.*日K数据源尝试明细: sina: 456 Client Error.*eastmoney: 返回空数据",
+    ):
+        service.load_signal_data("20260709", 50_000)
 
 
 def test_missing_position_quote_freezes_all_new_buys(

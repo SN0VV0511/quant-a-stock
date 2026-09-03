@@ -2,7 +2,7 @@
 沪深 A 股股票数据加载器
 - 股票列表: BaoStock（不可用时回退到缓存文件）
 - 实时行情: 腾讯接口（2026 年实时数据）
-- 历史数据: BaoStock
+- 历史数据: BaoStock，失败后按 新浪→腾讯→东财 顺序故障转移
 """
 
 from __future__ import annotations
@@ -415,63 +415,215 @@ def _history_ext_rows_to_dataframe(rows: list[list[str]]) -> pd.DataFrame | None
 
 
 # ---------------------------------------------------------------------------
-# 新浪/腾讯 fallback – AKShare 失败时的备用数据源
+# 日K多源故障转移 – 按 新浪→腾讯→东财 顺序请求，单源失败指数退避
 # ---------------------------------------------------------------------------
 
+# 单个日K数据源请求超时秒数。
+_KLINE_SOURCE_TIMEOUT_SECONDS = 3
+# 同一数据源连续失败时的退避上限秒数。
+_KLINE_SOURCE_BACKOFF_MAX_SECONDS = 60
+# 日K数据源固定故障转移顺序。
+_DAILY_KLINE_SOURCE_ORDER: tuple[str, ...] = ("sina", "tencent", "eastmoney")
 
-def _sina_symbol_for_etf(code: str) -> str:
-    """ETF 代码转换为新浪 symbol (sh510300 / sz159915)。"""
-    raw = code.strip().lower().replace(".", "")
+
+def _market_symbol(code: str) -> str:
+    """六位证券代码转换为带市场前缀代码 (sh600000 / sz000001 / sh510300)。"""
+    raw = str(code).strip().lower().replace(".", "")
     if raw.startswith(("sh", "sz")):
         raw = raw[2:]
-    # 5/6 开头→上交所, 1/2/3/4 开头→深交所
+    # 5/6 开头→上交所, 0/1/2/3/4 开头→深交所
     prefix = "sh" if raw[:1] in ("5", "6") else "sz"
     return f"{prefix}{raw}"
 
 
-def _fetch_etf_history_sina(
+def _kline_rows_to_frame(rows: list[list[object]], code: str) -> pd.DataFrame | None:
+    """把 [日期, 开盘, 收盘, 最高, 最低, 成交量] 行统一为新浪同格式日K。"""
+    if not rows:
+        return None
+    frame = pd.DataFrame(rows, columns=["date", "open", "close", "high", "low", "volume"])
+    for col in ("open", "close", "high", "low", "volume"):
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame["date"] = frame["date"].map(_normalize_compact_date)
+    frame["code"] = code
+    frame["name"] = code
+    frame["amount"] = 0
+    frame["pctChg"] = np.nan
+    frame = frame.dropna(subset=["date", "close"])
+    frame = frame[frame["close"] > 0]
+    if frame.empty:
+        return None
+    return (
+        frame.sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def _fetch_kline_sina(code: str, datalen: int = 120) -> pd.DataFrame | None:
+    """新浪 getKLineData 日K线（个股与 ETF 通用）。"""
+    if _requests_lib is None:
+        raise RuntimeError("requests 库不可用")
+    url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    params = {
+        "symbol": _market_symbol(code),
+        "scale": "240",
+        "ma": "no",
+        "datalen": str(datalen),
+    }
+    r = _requests_lib.get(url, params=params, timeout=_KLINE_SOURCE_TIMEOUT_SECONDS)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+    # 新浪返回字典列表: day/open/high/low/close/volume (全是字符串)
+    rows = [
+        [
+            item.get("day"),
+            item.get("open"),
+            item.get("close"),
+            item.get("high"),
+            item.get("low"),
+            item.get("volume"),
+        ]
+        for item in data
+        if isinstance(item, dict)
+    ]
+    return _kline_rows_to_frame(rows, code)
+
+
+def _fetch_kline_tencent(code: str, datalen: int = 120) -> pd.DataFrame | None:
+    """腾讯 fqkline 日K线（前复权，个股与 ETF 通用）。"""
+    if _requests_lib is None:
+        raise RuntimeError("requests 库不可用")
+    symbol = _market_symbol(code)
+    url = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
+    # param 格式: code,day,start,end,count,fq
+    r = _requests_lib.get(
+        url,
+        params={"param": f"{symbol},day,,,{datalen},qfq"},
+        timeout=_KLINE_SOURCE_TIMEOUT_SECONDS,
+    )
+    r.raise_for_status()
+    resp = r.json()
+    # 腾讯返回结构: {"data": {code: {"qfqday": [[日期,开盘,收盘,最高,最低,成交量], ...]}}}
+    code_data = resp.get("data", {}).get(symbol, {})
+    rows = code_data.get("qfqday") or code_data.get("day") or []
+    return _kline_rows_to_frame(
+        [row[:6] for row in rows if isinstance(row, list)], code
+    )
+
+
+def _fetch_kline_eastmoney(code: str, datalen: int = 120) -> pd.DataFrame | None:
+    """东方财富 push2his 日K线（前复权，个股与 ETF 通用）。"""
+    if _requests_lib is None:
+        raise RuntimeError("requests 库不可用")
+    symbol = _market_symbol(code)
+    secid = f"{'1' if symbol.startswith('sh') else '0'}.{symbol[2:]}"
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        # f51-f56 依次为 日期,开盘,收盘,最高,最低,成交量
+        "fields2": "f51,f52,f53,f54,f55,f56",
+        "klt": "101",
+        "fqt": "1",
+        "end": "20500101",
+        "lmt": str(datalen),
+    }
+    r = _requests_lib.get(url, params=params, timeout=_KLINE_SOURCE_TIMEOUT_SECONDS)
+    r.raise_for_status()
+    klines = (r.json().get("data") or {}).get("klines") or []
+    return _kline_rows_to_frame(
+        [str(line).split(",")[:6] for line in klines if line], code
+    )
+
+
+_KLINE_FETCHERS = {
+    "sina": _fetch_kline_sina,
+    "tencent": _fetch_kline_tencent,
+    "eastmoney": _fetch_kline_eastmoney,
+}
+
+
+class _KlineSourceCircuit:
+    """按日K数据源记录连续失败并计算指数退避窗口。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._consecutive_failures: dict[str, int] = {}
+        self._blocked_until: dict[str, float] = {}
+        self._last_reason: dict[str, str] = {}
+
+    def blocked_remaining(self, source: str, now: float) -> float:
+        """返回该源退避剩余秒数，0 表示可立即请求。"""
+        with self._lock:
+            return max(0.0, self._blocked_until.get(source, 0.0) - now)
+
+    def record_failure(self, source: str, reason: str, now: float) -> None:
+        """连续失败按 2 的幂退避，封顶 60 秒。"""
+        with self._lock:
+            failures = self._consecutive_failures.get(source, 0) + 1
+            self._consecutive_failures[source] = failures
+            self._blocked_until[source] = now + min(
+                _KLINE_SOURCE_BACKOFF_MAX_SECONDS, 2**failures
+            )
+            self._last_reason[source] = reason
+
+    def record_success(self, source: str) -> None:
+        """成功后清零该源的连续失败计数。"""
+        with self._lock:
+            self._consecutive_failures.pop(source, None)
+            self._blocked_until.pop(source, None)
+            self._last_reason.pop(source, None)
+
+    def failure_summary(self) -> str:
+        """按固定顺序汇总各源最近失败原因，供完整性错误消息引用。"""
+        with self._lock:
+            if not self._last_reason:
+                return ""
+            return "; ".join(
+                f"{source}: {self._last_reason[source]}"
+                for source in _DAILY_KLINE_SOURCE_ORDER
+                if source in self._last_reason
+            )
+
+
+def _fetch_daily_kline_failover(
     code: str,
     datalen: int = 120,
-) -> pd.DataFrame | None:
-    """通过新浪财经获取 ETF 日K线历史行情。"""
-    if _requests_lib is None:
-        return None
-    symbol = _sina_symbol_for_etf(code)
-    url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-    params = {"symbol": symbol, "scale": "240", "ma": "no", "datalen": str(datalen)}
-    for attempt in range(2):
+    circuit: _KlineSourceCircuit | None = None,
+) -> tuple[pd.DataFrame | None, dict[str, str]]:
+    """按 新浪→腾讯→东财 顺序获取日K，全部失败时返回 None 与各源原因。"""
+    guard = circuit if circuit is not None else _KLINE_CIRCUIT
+    attempted: dict[str, str] = {}
+    now = time.monotonic()
+    for source in _DAILY_KLINE_SOURCE_ORDER:
+        remaining = guard.blocked_remaining(source, now)
+        if remaining > 0:
+            attempted[source] = f"连续失败退避中(剩余 {remaining:.0f}s)"
+            continue
+        fetcher = _KLINE_FETCHERS.get(source)
+        if fetcher is None:
+            attempted[source] = "数据源未注册"
+            continue
         try:
-            r = _requests_lib.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if not data:
-                return None
-            df = pd.DataFrame(data)
-            # 新浪返回: day, open, high, low, close, volume (全是字符串)
-            df = df.rename(columns={"day": "date"})
-            for col in ("open", "high", "low", "close", "volume"):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["date"] = df["date"].map(_normalize_compact_date)
-            df["code"] = code
-            df["name"] = code
-            df["amount"] = 0
-            df["pctChg"] = np.nan
-            df = df.dropna(subset=["date", "close"])
-            df = df[df["close"] > 0]
-            df = (
-                df.sort_values("date")
-                .drop_duplicates("date", keep="last")
-                .reset_index(drop=True)
-            )
-            return df
+            frame = fetcher(code, datalen)
         except Exception as exc:
-            if attempt < 1:
-                time.sleep(1)
-                continue
-            logger.warning("新浪 ETF 历史行情获取失败 %s: %s", code, exc)
-            return None
-    return None
+            guard.record_failure(source, str(exc), now)
+            attempted[source] = str(exc)
+            logger.warning("日K数据源 %s 获取失败 %s: %s", source, code, exc)
+            continue
+        if frame is None or frame.empty:
+            guard.record_failure(source, "返回空数据", now)
+            attempted[source] = "返回空数据"
+            continue
+        guard.record_success(source)
+        return frame, attempted
+    return None, attempted
+
+
+_KLINE_CIRCUIT = _KlineSourceCircuit()
 
 
 def _fetch_industry_history_tencent(
@@ -551,6 +703,7 @@ class AKDataLoader:
         self._bs_last_verified = 0  # timestamp of last successful verification
         self._bs_verify_interval = 300  # re-verify at most every 5 minutes
         self._bs_unavailable_since: float | None = None
+        self._kline_circuit = _KlineSourceCircuit()
 
     def _bs_attempt_allowed_locked(self, now: float) -> bool:
         """在持有 ``_bs_lock`` 时判断熔断状态，并在冷却结束后半开恢复。"""
@@ -1080,8 +1233,27 @@ class AKDataLoader:
         logger.info("获取实时行情: %d 只，耗时 %.2fs", len(quotes), elapsed)
         return quotes
 
+    def fetch_daily_kline(self, code: str, days: int = 120) -> pd.DataFrame | None:
+        """多源日K获取入口：按 新浪→腾讯→东财 顺序故障转移。"""
+        frame, attempted = _fetch_daily_kline_failover(
+            str(code), datalen=days, circuit=self._kline_circuit
+        )
+        if frame is not None:
+            return frame
+        if attempted:
+            logger.warning(
+                "日K全部数据源失败 %s: %s",
+                code,
+                "; ".join(f"{source}: {reason}" for source, reason in attempted.items()),
+            )
+        return None
+
+    def kline_source_failure_summary(self) -> str:
+        """返回各日K源最近失败摘要，供数据完整性错误消息引用。"""
+        return self._kline_circuit.failure_summary()
+
     def get_stock_history(self, code, days=120):
-        """获取沪深 A 股个股历史数据（BaoStock），捕获连接异常后重连再重试。"""
+        """获取沪深 A 股个股历史数据（BaoStock），失败后按 新浪→腾讯→东财 故障转移。"""
         try:
             raw_code = normalize_a_share_code(str(code))
             bs_code = to_baostock_code(str(code))
@@ -1097,13 +1269,32 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
-        if not self._bs_attempt_allowed():
-            return None
+        df = None
+        if self._bs_attempt_allowed():
+            df = self._stock_history_from_baostock(code, bs_code, days)
+        if df is not None:
+            self._write_cache(cache_key, df)
+            return df
 
+        fallback = self.fetch_daily_kline(raw_code, days=days)
+        if fallback is not None:
+            logger.info(
+                "个股 %s 备用日K源成功，%d 条数据", raw_code, len(fallback)
+            )
+            self._write_cache(cache_key, fallback)
+            return fallback
+        return None
+
+    def _stock_history_from_baostock(self, code, bs_code, days):
+        """BaoStock 日K查询：捕获连接异常后重连再重试，最多 3 次。"""
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
 
-        self._ensure_login()
+        try:
+            self._ensure_login()
+        except ConnectionError as exc:
+            logger.warning("get_stock_history(%s) BaoStock 登录失败: %s", code, exc)
+            return None
 
         for attempt in range(3):
             result = _run_bs_with_subprocess("query_history", bs_code, start, end)
@@ -1127,12 +1318,7 @@ class AKDataLoader:
                 )
                 return None
 
-            df = _history_rows_to_dataframe(result.get("rows", []))
-            if df is None:
-                return None
-
-            self._write_cache(cache_key, df)
-            return df
+            return _history_rows_to_dataframe(result.get("rows", []))
 
         return None
 
@@ -1348,14 +1534,34 @@ class AKDataLoader:
 
         for code, frame in stale_fallbacks.items():
             result.setdefault(code, frame)
+        recovered = self._recover_history_from_http(failed_codes, days, "hist")
+        result.update(recovered)
         logger.info(
-            "批量历史数据完成: %d/%d 只成功，远端失败 %d 只，总耗时 %.2fs",
+            "批量历史数据完成: %d/%d 只成功，远端失败 %d 只(备用源补救 %d 只)，总耗时 %.2fs",
             len(result),
             len(target_codes),
             len(failed_codes),
+            len(recovered),
             time.monotonic() - started_at,
         )
         return result
+
+    def _recover_history_from_http(
+        self, codes: list[str], days: int, cache_prefix: str
+    ) -> dict[str, pd.DataFrame]:
+        """BaoStock 失败的代码改走 新浪→腾讯→东财 备用日K源并写入缓存。"""
+        recovered: dict[str, pd.DataFrame] = {}
+        for code in codes:
+            frame = self.fetch_daily_kline(code, days=days)
+            if frame is None:
+                continue
+            self._write_cache(f"{cache_prefix}_{code}_{days}", frame)
+            recovered[code] = frame
+        if recovered:
+            logger.info(
+                "历史行情备用日K源补救 %d/%d 只", len(recovered), len(codes)
+            )
+        return recovered
 
     def get_realtime_batch(self, codes):
         """批量获取实时价格（返回 code->price 字典）"""
@@ -1374,6 +1580,7 @@ class AKDataLoader:
         """获取个股扩展字段历史(含换手率/PB/ST/停牌),并附加 pb/mktcap/is_st/is_suspended 列。
 
         供小市值价值选股使用。流通市值 ≈ close * volume / (turn/100)。
+        BaoStock 失败后按 新浪→腾讯→东财 故障转移，备用源缺少换手/PB 等扩展字段。
         """
         try:
             raw_code = normalize_a_share_code(str(code))
@@ -1386,12 +1593,33 @@ class AKDataLoader:
         if cached is not None:
             return cached
 
-        if not self._bs_attempt_allowed():
-            return None
+        df = None
+        if self._bs_attempt_allowed():
+            df = self._stock_history_ext_from_baostock(code, bs_code, days)
+        if df is not None:
+            self._write_cache(cache_key, df)
+            return df
 
+        fallback = self.fetch_daily_kline(raw_code, days=days)
+        if fallback is not None:
+            logger.info(
+                "个股 %s 扩展历史改用备用日K源，%d 条数据(缺少换手/PB 字段)",
+                raw_code,
+                len(fallback),
+            )
+            self._write_cache(cache_key, fallback)
+            return fallback
+        return None
+
+    def _stock_history_ext_from_baostock(self, code, bs_code, days):
+        """BaoStock 扩展日K查询：连接异常重连一次，失败返回 None。"""
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=days + 40)).strftime("%Y-%m-%d")
-        self._ensure_login()
+        try:
+            self._ensure_login()
+        except ConnectionError as exc:
+            logger.warning("get_stock_history_ext(%s) BaoStock 登录失败: %s", code, exc)
+            return None
 
         for attempt in range(2):
             result = _run_bs_with_subprocess("query_history_ext", bs_code, start, end)
@@ -1408,12 +1636,7 @@ class AKDataLoader:
             if not isinstance(rows, list):
                 return None
             typed_rows = [row for row in rows if isinstance(row, list)]
-            df = _history_ext_rows_to_dataframe(typed_rows)
-            if df is None:
-                return None
-
-            self._write_cache(cache_key, df)
-            return df
+            return _history_ext_rows_to_dataframe(typed_rows)
         return None
 
     def get_batch_history_ext(
@@ -1547,11 +1770,14 @@ class AKDataLoader:
                 )
         for code, frame in stale_fallbacks.items():
             result.setdefault(code, frame)
+        recovered = self._recover_history_from_http(failures, days, "histext")
+        result.update(recovered)
         logger.info(
-            "扩展历史完成: %d/%d 只成功，远端失败 %d 只，总耗时 %.2fs",
+            "扩展历史完成: %d/%d 只成功，远端失败 %d 只(备用源补救 %d 只)，总耗时 %.2fs",
             len(result),
             len(target),
             len(failures),
+            len(recovered),
             time.monotonic() - started_at,
         )
         return result
@@ -1699,13 +1925,13 @@ class AKDataLoader:
                     time.sleep(delay)
                     continue
                 logger.warning("AKShare ETF 历史行情获取失败 %s: %s", code, exc)
-                # AKShare 失败，fallback 到新浪
-                logger.info("ETF %s 尝试新浪 fallback", code)
-                df = _fetch_etf_history_sina(raw_code, datalen=days)
-                if df is not None and not df.empty:
-                    logger.info("ETF %s 新浪 fallback 成功，%d 条数据", code, len(df))
-                    self._write_cache(cache_key, df)
-                    return df
+                # AKShare 失败，按 新浪→腾讯→东财 顺序尝试备用日K源
+                logger.info("ETF %s 尝试备用日K数据源(新浪→腾讯→东财)", code)
+                fallback = self.fetch_daily_kline(raw_code, days=days)
+                if fallback is not None and not fallback.empty:
+                    logger.info("ETF %s 备用日K源成功，%d 条数据", code, len(fallback))
+                    self._write_cache(cache_key, fallback)
+                    return fallback
                 return None
 
         if df.empty:

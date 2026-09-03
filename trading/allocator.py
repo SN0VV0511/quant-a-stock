@@ -38,13 +38,21 @@ class PortfolioAllocator:
         rebalance_band: float = 0.02,
         min_stock_order: float = ROBUST_V2_MIN_STOCK_ORDER_AMOUNT,
         min_etf_order: float = MIN_ETF_ORDER_AMOUNT,
+        max_etf_count: int | None = 2,
+        max_stock_count: int | None = 2,
     ) -> None:
         if not 0 <= rebalance_band <= 0.1:
             raise ValueError("调仓容忍带必须位于 [0, 0.1]")
+        if max_etf_count is not None and max_etf_count < 1:
+            raise ValueError("ETF 数量上限必须为正数或 None")
+        if max_stock_count is not None and max_stock_count < 1:
+            raise ValueError("个股数量上限必须为正数或 None")
         self.rules = rules or TradingRules()
         self.rebalance_band = rebalance_band
         self.min_stock_order = min_stock_order
         self.min_etf_order = min_etf_order
+        self.max_etf_count = max_etf_count
+        self.max_stock_count = max_stock_count
 
     @staticmethod
     def _normalize_positions(
@@ -76,9 +84,12 @@ class PortfolioAllocator:
             )
         return 0.0
 
-    @staticmethod
-    def _validate_target(target: TargetPortfolio) -> None:
-        """在执行边界再次校验 robust_v2 仓位约束。"""
+    def _validate_target(self, target: TargetPortfolio) -> None:
+        """在执行边界再次校验 robust_v2 仓位约束。
+
+        数量上限与策略配置对齐：``max_etf_count``/``max_stock_count`` 为 None 时
+        表示策略侧不限制该类持仓数量，此处不再额外收紧。
+        """
         etfs = [
             position for position in target.positions if position.asset_type == "etf"
         ]
@@ -87,8 +98,10 @@ class PortfolioAllocator:
         ]
         if target.exposure > 0.8 + 1e-9 or target.cash_weight < 0.2 - 1e-9:
             raise ValueError("目标组合违反 80% 总仓位或 20% 现金下限")
-        if len(etfs) > 2 or len(stocks) > 2:
-            raise ValueError("目标组合最多允许 2 只 ETF 和 2 只股票")
+        if self.max_etf_count is not None and len(etfs) > self.max_etf_count:
+            raise ValueError(f"目标组合最多允许 {self.max_etf_count} 只 ETF")
+        if self.max_stock_count is not None and len(stocks) > self.max_stock_count:
+            raise ValueError(f"目标组合最多允许 {self.max_stock_count} 只股票")
         for position in etfs:
             raw_code = normalized_security_code(position.code)
             if raw_code not in ROBUST_V2_BROAD_ETF_CODES:

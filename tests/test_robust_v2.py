@@ -498,3 +498,100 @@ def test_catastrophic_stop_matches_prefixed_position_and_raw_quote_code() -> Non
     assert len(orders) == 1
     assert orders[0].code == "sh600000"
     assert orders[0].reason == "CATASTROPHIC_STOP_LOSS"
+
+
+def _three_stock_target() -> TargetPortfolio:
+    """构造 1 只 ETF + 3 只股票、权重合计 72% 的目标组合。"""
+    return TargetPortfolio(
+        account_id="paper_v2",
+        strategy_version="robust_v2",
+        signal_date="20260709",
+        positions=(
+            TargetPosition(
+                code="510300",
+                target_weight=0.24,
+                reason="ETF_RISK_ADJUSTED",
+                asset_type="etf",
+            ),
+            TargetPosition(
+                code="600000",
+                target_weight=0.16,
+                reason="MAINBOARD_EP_SIZE_LOW_VOL",
+                asset_type="stock",
+            ),
+            TargetPosition(
+                code="600036",
+                target_weight=0.16,
+                reason="MAINBOARD_EP_SIZE_LOW_VOL",
+                asset_type="stock",
+            ),
+            TargetPosition(
+                code="601398",
+                target_weight=0.16,
+                reason="MAINBOARD_EP_SIZE_LOW_VOL",
+                asset_type="stock",
+            ),
+        ),
+        source_snapshot_hash="hash",
+        cash_weight=0.28,
+    )
+
+
+def test_allocator_count_limits_align_with_strategy_config() -> None:
+    """执行边界数量上限应从策略配置读取，max_stock_count=None 时不再限制。"""
+    target = _three_stock_target()
+    prices = {"510300": 4.0, "600000": 10.0, "600036": 35.0, "601398": 5.0}
+
+    # 默认上限(2 只)保持原校验语义。
+    with pytest.raises(ValueError, match=r"最多允许 2 只股票"):
+        PortfolioAllocator(rebalance_band=0).allocate(
+            target,
+            cash=50_000,
+            positions={},
+            prices=prices,
+            execution_date="20260710",
+        )
+
+    # 与策略侧 max_stock_count=None 对齐后，3 只股票的目标应可正常分配。
+    result = PortfolioAllocator(rebalance_band=0, max_stock_count=None).allocate(
+        target,
+        cash=50_000,
+        positions={},
+        prices=prices,
+        execution_date="20260710",
+    )
+
+    bought = {order.code for order in result.orders}
+    assert {"510300", "600000", "600036", "601398"} <= bought
+    assert result.projected_cash >= result.account_value * target.cash_weight - 1e-6
+
+    # ETF 数量上限同样可配置收紧。
+    two_etf_target = TargetPortfolio(
+        account_id="paper_v2",
+        strategy_version="robust_v2",
+        signal_date="20260709",
+        positions=(
+            TargetPosition(
+                code="510300",
+                target_weight=0.24,
+                reason="ETF_RISK_ADJUSTED",
+                asset_type="etf",
+            ),
+            TargetPosition(
+                code="510500",
+                target_weight=0.24,
+                reason="ETF_RISK_ADJUSTED",
+                asset_type="etf",
+            ),
+        ),
+        source_snapshot_hash="hash",
+        cash_weight=0.52,
+    )
+    with pytest.raises(ValueError, match=r"最多允许 1 只 ETF"):
+        PortfolioAllocator(rebalance_band=0, max_etf_count=1).allocate(
+            two_etf_target,
+            cash=50_000,
+            positions={},
+            prices={"510300": 4.0, "510500": 5.0},
+            execution_date="20260710",
+        )

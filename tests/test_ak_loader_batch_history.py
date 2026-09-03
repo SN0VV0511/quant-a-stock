@@ -136,6 +136,8 @@ def test_batch_history_splits_work_and_keeps_partial_success(
 ) -> None:
     """批次失败时应保留其他批次结果并完成返回。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
+    # 本测试只关注 BaoStock 批次语义，屏蔽 新浪→腾讯→东财 备用日K源。
+    monkeypatch.setattr(loader, "fetch_daily_kline", lambda *_a, **_k: None)
 
     def _run(*args: object, **_kwargs: object) -> dict[str, object] | None:
         bs_codes = args[3:]
@@ -219,6 +221,8 @@ def test_batch_history_refresh_failure_falls_back_to_stale_cache(
 ) -> None:
     """基础历史旧缓存应触发刷新，并只在远端失败时作为回退。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
+    # 屏蔽备用日K源，聚焦 BaoStock 刷新失败时的旧缓存回退。
+    monkeypatch.setattr(loader, "fetch_daily_kline", lambda *_a, **_k: None)
     cached = pd.DataFrame(
         {
             "date": ["2026-06-12"],
@@ -311,6 +315,8 @@ def test_batch_extended_history_refresh_failure_falls_back_to_stale_cache(
 ) -> None:
     """扩展历史旧缓存也应刷新，失败时保留估值等旧字段。"""
     loader = AKDataLoader(cache_dir=str(tmp_path))
+    # 屏蔽备用日K源，聚焦 BaoStock 刷新失败时的旧缓存回退。
+    monkeypatch.setattr(loader, "fetch_daily_kline", lambda *_a, **_k: None)
     cached = pd.DataFrame(
         {
             "date": ["2026-06-12"],

@@ -309,7 +309,12 @@ class RobustPortfolioBacktester:
         config = params.to_config(enable_stock_enhancement=enable_stock_enhancement)
         strategy = RobustV2Strategy(config)
         rules = StressTradingRules(slippage_multiplier)
-        allocator = PortfolioAllocator(rules=rules)
+        # 与实盘运行器保持同源：执行边界数量上限跟随策略配置。
+        allocator = PortfolioAllocator(
+            rules=rules,
+            max_etf_count=config.max_etf_count,
+            max_stock_count=config.max_stock_count,
+        )
         cash = self.initial_capital
         positions: dict[str, dict[str, Any]] = {}
         pending: TargetPortfolio | None = None

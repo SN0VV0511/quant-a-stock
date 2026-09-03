@@ -940,6 +940,22 @@ class PaperLedger:
             if cursor.rowcount != 1:
                 raise ValueError(f"信号不在可重试执行状态: {signal_id}")
 
+    def mark_signal_failed(self, signal_id: str, reason: str) -> None:
+        """结构性校验失败：终止重试、移出待执行队列并落盘原因。"""
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE signals
+                SET status = 'failed', executed_at = ?, next_retry_at = NULL,
+                    last_error = ?
+                WHERE signal_id = ? AND account_id = ? AND executed_at IS NULL
+                  AND status = 'executing'
+                """,
+                (format_local(), reason, signal_id, self.account_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"信号不在可终止执行状态: {signal_id}")
+
     def mark_signal_completed(self, signal_id: str, reason: str = "") -> None:
         """完成当前目标，并把同策略更旧的未处理目标标记为已取代。"""
         with self._transaction() as connection:

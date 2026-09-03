@@ -649,8 +649,16 @@ def test_paper_status_combines_service_health_review_and_logs(tmp_path) -> None:
     assert status.errors == []
 
 
-def test_paper_acceptance_passes_after_enough_snapshots(tmp_path) -> None:
+def test_paper_acceptance_passes_after_enough_snapshots(
+    tmp_path, monkeypatch
+) -> None:
     """观察期验收应在快照、日志、回撤均满足时通过。"""
+    # RPS_STATE_FILE 默认指向仓库真实状态文件，会让本测试依赖生产数据的新鲜度；
+    # 指回 tmp_path 内的夹具，保证测试与仓库当前 rps_state.json 状态无关。
+    monkeypatch.setattr(
+        "scripts.paper_acceptance.RPS_STATE_FILE",
+        str(tmp_path / "data" / "rps_state.json"),
+    )
     data_dir = tmp_path / "data"
     report_dir = tmp_path / "reports"
     data_dir.mkdir()
