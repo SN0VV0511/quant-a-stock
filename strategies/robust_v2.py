@@ -72,7 +72,7 @@ class RobustV2Config:
     max_single_etf: float = ROBUST_V2_MAX_SINGLE_ETF
     max_single_stock: float = ROBUST_V2_MAX_SINGLE_STOCK
     max_etf_count: int = 2
-    max_stock_count: int = 2
+    max_stock_count: int | None = None
     etf_lookbacks: tuple[int, int, int] = (20, 60, 120)
     etf_score_weights: tuple[float, float, float] = (0.10, 0.45, 0.45)
     etf_min_avg_amount: float = 50_000_000.0
@@ -88,7 +88,7 @@ class RobustV2Config:
     stock_min_pb: float = 0.5
     stock_max_pb: float = 8.0
     stock_min_market_cap: float = 3_000_000_000.0
-    stock_max_market_cap: float = 30_000_000_000.0
+    stock_max_market_cap: float = 50_000_000_000.0
     stock_market_cap_bottom_exclusion: float = 0.30
     stock_min_earnings_yield: float = 0.02
     stock_volatility_days: int = 120
@@ -97,8 +97,8 @@ class RobustV2Config:
     stock_trend_ma_days: int = 200
     stock_score_weights: tuple[float, float, float] = (0.45, 0.25, 0.30)
     stock_min_avg_amount: float = 100_000_000.0
-    stock_max_5d_gain: float = 0.08
-    stock_max_price_ma20: float = 1.08
+    stock_max_5d_gain: float = 0.15
+    stock_max_price_ma20: float = 1.15
     stock_stop_pct: float = ROBUST_V2_STOCK_STOP_PCT
     etf_stop_pct: float = ROBUST_V2_ETF_STOP_PCT
     rebalance_days: int = ROBUST_V2_REBALANCE_DAYS
@@ -112,12 +112,14 @@ class RobustV2Config:
             raise ValueError("robust_v2 现金下限不得低于 20%")
         if self.max_total_position + self.min_cash > 1 + 1e-9:
             raise ValueError("总仓位上限与现金下限之和不能超过 100%")
-        if self.etf_target > 0.48 or self.stock_target > 0.32:
-            raise ValueError("ETF/个股目标分别不得超过 48%/32%")
+        if self.etf_target > 0.48 or self.stock_target > 0.50:
+            raise ValueError("ETF/个股目标分别不得超过 48%/50%")
         if self.max_single_etf > 0.24 or self.max_single_stock > 0.16:
             raise ValueError("单只 ETF/股票上限分别不得超过 24%/16%")
-        if not 1 <= self.max_etf_count <= 2 or not 1 <= self.max_stock_count <= 2:
-            raise ValueError("ETF/股票数量上限必须位于 [1, 2]")
+        if not 1 <= self.max_etf_count <= 2:
+            raise ValueError("ETF 数量上限必须位于 [1, 2]")
+        if self.max_stock_count is not None and self.max_stock_count < 1:
+            raise ValueError("个股数量上限必须为正数或 None")
         if self.etf_lookbacks != (20, 60, 120):
             raise ValueError("ETF 回看周期固定为 20/60/120 日")
         if abs(sum(self.etf_score_weights) - 1) > 1e-9:
@@ -695,7 +697,10 @@ class RobustV2Strategy:
         if self.config.enable_stock_enhancement and remaining_stock > 0:
             selected_stock_count = 0
             for row in stock_rows:
-                if selected_stock_count >= self.config.max_stock_count:
+                if (
+                    self.config.max_stock_count is not None
+                    and selected_stock_count >= self.config.max_stock_count
+                ):
                     break
                 weight = min(
                     self.config.max_single_stock,
