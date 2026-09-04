@@ -21,7 +21,7 @@ services:
       - path: .env
         required: false
     environment:
-      ROBUST_V2_REBALANCE_DAYS: "5"
+      ROBUST_V2_REBALANCE_DAYS: "20"
     depends_on:
       paper-init:
         condition: service_completed_successfully
