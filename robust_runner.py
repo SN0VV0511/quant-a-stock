@@ -65,6 +65,13 @@ from data.holidays import (
     previous_trading_day,
 )
 from data.scan_store import ScanMode, StockScanSnapshot, StockScanStore
+from news_overlay import (
+    MIN_ACTION_CONFIDENCE,
+    NewsOverlay,
+    NewsVerdict,
+    load_news_overlay,
+    news_overlay_path,
+)
 from reports.ledger_report import build_daily_ledger_report, save_daily_ledger_report
 from strategies.robust_v2 import (
     STOCK_FILTER_LABELS,
@@ -98,6 +105,27 @@ STOCK_PREFILTER_LABELS: dict[str, str] = {
     "insufficient_liquidity": "粗筛实时成交额不足",
     "candidate_limit": "流动性排名超出 500 只上限",
 }
+# 新闻利好标的入选后的目标权重放大倍数,仍受单票与总仓位硬约束封顶。
+NEWS_BOOST_FACTOR = 1.25
+
+
+@dataclass(frozen=True)
+class NewsOverlayPlan:
+    """一次收盘目标生成时新闻研判覆盖层的可执行结论。"""
+
+    risk_sell_codes: frozenset[str]
+    boost_codes: frozenset[str]
+    verdicts: dict[str, NewsVerdict]
+    exit_orders: tuple[OrderIntent, ...]
+
+
+@dataclass
+class NewsMonitorState:
+    """单个交易日盘中监控的新闻研判文件状态。"""
+
+    mtime: float
+    processed: frozenset[str]
+    pending: tuple[NewsVerdict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -717,6 +745,8 @@ class RobustV2Runner:
         )
         self.root_dir = root_dir.resolve()
         self.scan_store = StockScanStore(self.root_dir / "data" / "scans")
+        # 新闻研判盘中监控状态按交易日隔离,mtime 变化时增量重载。
+        self._news_monitor_state: dict[str, NewsMonitorState] = {}
         broker_ledger = getattr(broker, "ledger", None)
         selected_ledger = ledger or broker_ledger
         if not isinstance(selected_ledger, PaperLedger):
@@ -995,6 +1025,329 @@ class RobustV2Runner:
             return None
         return self.preview_stock_scan(trade_date, mode="daily_observation")
 
+    @staticmethod
+    def _held_position_index(
+        positions: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, tuple[str, Mapping[str, Any]]]:
+        """按六位代码建立当前持仓索引。"""
+        held: dict[str, tuple[str, Mapping[str, Any]]] = {}
+        for code, position in positions.items():
+            try:
+                held[normalized_security_code(code)] = (code, position)
+            except ValueError:
+                continue
+        return held
+
+    def _news_exit_order(
+        self,
+        code: str,
+        position: Mapping[str, Any],
+        verdict: NewsVerdict,
+        trade_date: str,
+        *,
+        price: float,
+        shares: int,
+        source: str,
+        extra_metadata: Mapping[str, Any] | None = None,
+    ) -> OrderIntent:
+        """复用 OrderIntent 生成新闻风险强制卖出订单。"""
+        return OrderIntent(
+            account_id=self.config.account_id,
+            strategy_version=self.config.strategy_version,
+            signal_date=trade_date,
+            code=code,
+            action="sell",
+            price=price,
+            shares=shares,
+            name=str(position.get("name") or verdict.name or code),
+            strategy=self.strategy.name,
+            strategy_tag="robust_v2",
+            reason="NEWS_RISK_EXIT",
+            date=trade_date,
+            source=source,
+            metadata={
+                **(extra_metadata or {}),
+                "news_confidence": verdict.confidence,
+                "news_reason": verdict.reason,
+                "news_sources": list(verdict.sources),
+            },
+        )
+
+    def _plan_news_overlay(
+        self,
+        overlay: NewsOverlay | None,
+        *,
+        positions: Mapping[str, Mapping[str, Any]],
+        candidate_codes: tuple[str, ...],
+        trade_date: str,
+    ) -> NewsOverlayPlan:
+        """把当日研判转换为目标生成前的覆盖动作;白名单外标的一律忽略。"""
+        if overlay is None or not overlay.verdicts:
+            return NewsOverlayPlan(frozenset(), frozenset(), {}, ())
+        held = self._held_position_index(positions)
+        candidates: set[str] = set()
+        for code in candidate_codes:
+            try:
+                candidates.add(normalized_security_code(code))
+            except ValueError:
+                continue
+        whitelist = frozenset(held) | candidates
+        risk_sell: set[str] = set()
+        boost: set[str] = set()
+        verdicts: dict[str, NewsVerdict] = {}
+        exit_orders: list[OrderIntent] = []
+        for verdict in overlay.verdicts:
+            if verdict.code not in whitelist:
+                LOGGER.debug(
+                    "新闻研判忽略白名单外标的: code=%s action=%s confidence=%.2f "
+                    "reason=%s sources=%s",
+                    verdict.code,
+                    verdict.action,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+                continue
+            if verdict.action == "watch":
+                LOGGER.debug(
+                    "新闻研判仅观察不产生交易动作: code=%s confidence=%.2f "
+                    "reason=%s sources=%s",
+                    verdict.code,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+                continue
+            if verdict.confidence < MIN_ACTION_CONFIDENCE:
+                LOGGER.debug(
+                    "新闻研判置信度不足不产生交易动作: code=%s action=%s "
+                    "confidence=%.2f reason=%s sources=%s",
+                    verdict.code,
+                    verdict.action,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+                continue
+            if verdict.action == "risk_sell":
+                risk_sell.add(verdict.code)
+                verdicts[verdict.code] = verdict
+                LOGGER.info(
+                    "新闻风险研判生效: code=%s name=%s action=risk_sell "
+                    "confidence=%.2f reason=%s sources=%s",
+                    verdict.code,
+                    verdict.name,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+                entry = held.get(verdict.code)
+                if entry is None:
+                    continue
+                original_code, position = entry
+                sellable = int(
+                    position.get("sellable_qty", position.get("shares", 0)) or 0
+                )
+                price = float(position.get("current_price", 0) or 0)
+                if sellable <= 0 or price <= 0:
+                    LOGGER.info(
+                        "新闻风险卖出当日无可卖数量(T+1 锁定或缺有效价格)，"
+                        "已从目标剔除，待 T+1 统一执行: code=%s sellable=%d",
+                        original_code,
+                        sellable,
+                    )
+                    continue
+                exit_orders.append(
+                    self._news_exit_order(
+                        original_code,
+                        position,
+                        verdict,
+                        trade_date,
+                        price=price,
+                        shares=sellable,
+                        source="news_overlay",
+                    )
+                )
+                LOGGER.info(
+                    "新闻强制卖出订单已生成: code=%s shares=%d price=%.2f "
+                    "confidence=%.2f reason=%s sources=%s",
+                    original_code,
+                    sellable,
+                    price,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+            elif verdict.code in candidates:
+                boost.add(verdict.code)
+                verdicts[verdict.code] = verdict
+                LOGGER.info(
+                    "新闻利好研判生效: code=%s name=%s action=boost "
+                    "confidence=%.2f reason=%s sources=%s",
+                    verdict.code,
+                    verdict.name,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+            else:
+                LOGGER.debug(
+                    "新闻利好标的不在当日候选，不产生交易动作: code=%s "
+                    "confidence=%.2f reason=%s sources=%s",
+                    verdict.code,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+        return NewsOverlayPlan(
+            frozenset(risk_sell),
+            frozenset(boost),
+            verdicts,
+            tuple(exit_orders),
+        )
+
+    def _apply_news_overlay_to_scan(
+        self,
+        stock_scan: StockScanResult,
+        plan: NewsOverlayPlan,
+    ) -> StockScanResult:
+        """按研判重排候选:risk_sell 剔除、boost 置顶，其余相对顺序不变。"""
+        if not plan.risk_sell_codes and not plan.boost_codes:
+            return stock_scan
+        boosted: list[dict[str, Any]] = []
+        rest: list[dict[str, Any]] = []
+        excluded: list[str] = []
+        for row in stock_scan.candidates:
+            try:
+                raw = normalized_security_code(str(row["code"]))
+            except ValueError:
+                rest.append(row)
+                continue
+            if raw in plan.risk_sell_codes:
+                excluded.append(raw)
+                continue
+            (boosted if raw in plan.boost_codes else rest).append(row)
+        if excluded:
+            LOGGER.info("新闻风险研判已从当日候选剔除: %s", sorted(excluded))
+        if boosted:
+            LOGGER.info("新闻利好研判候选置顶: %s", sorted(plan.boost_codes))
+        return StockScanResult(
+            input_count=stock_scan.input_count,
+            candidates=tuple(boosted + rest),
+            filter_counts=dict(stock_scan.filter_counts),
+        )
+
+    def _apply_news_overlay_to_target(
+        self,
+        target: TargetPortfolio,
+        plan: NewsOverlayPlan,
+    ) -> TargetPortfolio:
+        """目标组合剔除风险标的，并对入选利好标的加权后封顶。"""
+        if not plan.risk_sell_codes and not plan.boost_codes:
+            return target
+        kept: list[TargetPosition] = []
+        dropped: list[str] = []
+        for position in target.positions:
+            if normalized_security_code(position.code) in plan.risk_sell_codes:
+                dropped.append(position.code)
+                continue
+            kept.append(position)
+        for code in dropped:
+            verdict = plan.verdicts.get(normalized_security_code(code))
+            LOGGER.info(
+                "新闻风险研判已从目标组合剔除: code=%s confidence=%s reason=%s",
+                code,
+                f"{verdict.confidence:.2f}" if verdict else "N/A",
+                verdict.reason if verdict else "N/A",
+            )
+        adjusted: list[TargetPosition] = []
+        for position in kept:
+            raw = normalized_security_code(position.code)
+            if raw not in plan.boost_codes or position.asset_type != "stock":
+                adjusted.append(position)
+                continue
+            others = sum(
+                item.target_weight for item in kept if item is not position
+            )
+            boosted = min(
+                position.target_weight * NEWS_BOOST_FACTOR,
+                self.config.max_single_stock,
+                self.config.max_total_position - others,
+            )
+            verdict = plan.verdicts.get(raw)
+            if boosted <= position.target_weight:
+                LOGGER.info(
+                    "新闻利好加权触及单票或总仓位上限，保持原权重: code=%s "
+                    "weight=%.2f%% confidence=%s reason=%s",
+                    position.code,
+                    position.target_weight * 100,
+                    f"{verdict.confidence:.2f}" if verdict else "N/A",
+                    verdict.reason if verdict else "N/A",
+                )
+                adjusted.append(position)
+                continue
+            LOGGER.info(
+                "新闻利好加权: code=%s weight=%.2f%%->%.2f%% confidence=%s "
+                "reason=%s sources=%s",
+                position.code,
+                position.target_weight * 100,
+                boosted * 100,
+                f"{verdict.confidence:.2f}" if verdict else "N/A",
+                verdict.reason if verdict else "N/A",
+                list(verdict.sources) if verdict else [],
+            )
+            adjusted.append(
+                replace(
+                    position,
+                    target_weight=round(boosted, 6),
+                    reason=f"{position.reason} NEWS_BOOST",
+                )
+            )
+        exposure = sum(position.target_weight for position in adjusted)
+        return replace(
+            target,
+            positions=tuple(adjusted),
+            cash_weight=round(1 - exposure, 6),
+        )
+
+    def _news_exit_verdicts(self, signal_date: str) -> dict[str, NewsVerdict]:
+        """读取信号日研判中可执行的风险卖出结论，供 T+1 执行时复用。"""
+        overlay = load_news_overlay(signal_date, self.root_dir)
+        if overlay is None:
+            return {}
+        return {
+            verdict.code: verdict
+            for verdict in overlay.verdicts
+            if verdict.action == "risk_sell" and verdict.is_actionable
+        }
+
+    def _retag_news_exit_order(
+        self, order: OrderIntent, exits: Mapping[str, NewsVerdict]
+    ) -> OrderIntent:
+        """把统一分配器生成的风险标的卖单改标为 NEWS_RISK_EXIT。"""
+        if order.action != "sell":
+            return order
+        verdict = exits.get(normalized_security_code(order.code))
+        if verdict is None:
+            return order
+        LOGGER.info(
+            "新闻风险卖出执行: code=%s confidence=%.2f reason=%s sources=%s",
+            order.code,
+            verdict.confidence,
+            verdict.reason,
+            list(verdict.sources),
+        )
+        return replace(
+            order,
+            reason="NEWS_RISK_EXIT",
+            metadata={
+                **order.metadata,
+                "news_confidence": verdict.confidence,
+                "news_reason": verdict.reason,
+                "news_sources": list(verdict.sources),
+            },
+        )
+
     def generate_close_target(
         self, trade_date: str, *, force: bool = False
     ) -> TargetPortfolio | None:
@@ -1010,15 +1363,32 @@ class RobustV2Runner:
             snapshot.total_value,
             signal_data.names,
         )
+        # 新闻研判覆盖层在策略选仓前后介入:先剔除/置顶候选，再修正目标权重。
+        overlay = load_news_overlay(trade_date, self.root_dir)
+        news_plan = self._plan_news_overlay(
+            overlay,
+            positions=self.broker.query_positions(),
+            candidate_codes=tuple(str(row["code"]) for row in stock_scan.candidates),
+            trade_date=trade_date,
+        )
         target = self.strategy.generate_target(
             signal_data.snapshot,
             signal_data.etf_history,
             signal_data.stock_history,
             snapshot.total_value,
             signal_data.names,
-            stock_scan_result=stock_scan,
+            stock_scan_result=self._apply_news_overlay_to_scan(stock_scan, news_plan),
         )
+        target = self._apply_news_overlay_to_target(target, news_plan)
         signal_id = self.ledger.record_signal(target)
+        if news_plan.exit_orders:
+            LOGGER.info(
+                "新闻风险卖出计划已并入 T+1 统一执行: %s",
+                [
+                    (order.code, order.shares, order.reason)
+                    for order in news_plan.exit_orders
+                ],
+            )
         selected_stocks = tuple(
             position.code
             for position in target.positions
@@ -1134,6 +1504,8 @@ class RobustV2Runner:
                 execution_date=execution_date,
                 tradable_codes=set(alignment.valid_codes),
             )
+            # 信号日研判中的风险卖出标的在 T+1 执行时改标为 NEWS_RISK_EXIT。
+            news_exits = self._news_exit_verdicts(target.signal_date)
             checked_orders: list[OrderIntent] = []
             market_skipped: dict[str, str] = {}
             risk_skipped: dict[str, str] = {}
@@ -1161,6 +1533,7 @@ class RobustV2Runner:
                 if not tradable:
                     market_skipped[order.code] = reason
                     continue
+                order = self._retag_news_exit_order(order, news_exits)
                 retry_key = hashlib.sha256(
                     (
                         f"{order.idempotency_key}|{execution_date}|"
@@ -1357,6 +1730,189 @@ class RobustV2Runner:
             )
         return tuple(self.broker.place_order(order) for order in checked_orders)
 
+    def _execute_news_risk_exits(
+        self,
+        verdicts: tuple[NewsVerdict, ...],
+        trade_date: str,
+        *,
+        current_time: datetime,
+    ) -> tuple[tuple[ExecutionReport, ...], frozenset[str], tuple[NewsVerdict, ...]]:
+        """对研判风险标的立即卖出;返回(成交回报, 已终结代码, 待重试研判)。
+
+        行情暂缺或跌停不可卖属盘中可恢复状态，保留待下一轮监控重试;
+        未持仓与 T+1 锁定视为已终结，不再重复触发。
+        """
+        positions = self.broker.query_positions()
+        held = self._held_position_index(positions)
+        resolved: set[str] = set()
+        retry: list[NewsVerdict] = []
+        targets: list[tuple[NewsVerdict, str, Mapping[str, Any]]] = []
+        for verdict in verdicts:
+            entry = held.get(verdict.code)
+            if entry is None:
+                LOGGER.debug(
+                    "新闻风险研判标的未持仓，盘中忽略: code=%s action=risk_sell "
+                    "confidence=%.2f reason=%s sources=%s",
+                    verdict.code,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+                resolved.add(verdict.code)
+                continue
+            targets.append((verdict, entry[0], entry[1]))
+        if not targets:
+            return (), frozenset(resolved), ()
+        codes = {code for _, code, _ in targets}
+        previous = (
+            datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=1)
+        ).strftime("%Y%m%d")
+        snapshot, _history, quotes = self.data.load_execution_data(codes, previous)
+        contexts, quote_rejected = self._validated_execution_quotes(
+            codes,
+            quotes,
+            execution_date=trade_date,
+            current_time=current_time,
+        )
+        if quote_rejected:
+            LOGGER.warning(
+                "新闻风险卖出实时行情暂不可用，本轮稍后重试: %s", quote_rejected
+            )
+        reports: list[ExecutionReport] = []
+        for verdict, code, position in targets:
+            sellable = int(
+                position.get("sellable_qty", position.get("shares", 0)) or 0
+            )
+            if sellable <= 0:
+                LOGGER.info(
+                    "新闻风险卖出受 T+1 限制当日无可卖数量，交给后续执行路径: "
+                    "code=%s confidence=%.2f reason=%s sources=%s",
+                    code,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+                resolved.add(verdict.code)
+                continue
+            context = contexts.get(verdict.code)
+            if context is None:
+                LOGGER.warning(
+                    "新闻风险卖出缺少有效实时行情，本轮稍后重试: code=%s "
+                    "confidence=%.2f reason=%s sources=%s",
+                    code,
+                    verdict.confidence,
+                    verdict.reason,
+                    list(verdict.sources),
+                )
+                retry.append(verdict)
+                continue
+            tradable, reason = order_is_tradable("sell", context)
+            if not tradable:
+                LOGGER.warning(
+                    "新闻风险卖出暂不可成交，本轮稍后重试: code=%s 原因=%s "
+                    "confidence=%.2f reason=%s",
+                    code,
+                    reason,
+                    verdict.confidence,
+                    verdict.reason,
+                )
+                retry.append(verdict)
+                continue
+            order = self._news_exit_order(
+                code,
+                position,
+                verdict,
+                trade_date,
+                price=context.current_price,
+                shares=sellable,
+                source="robust_v2_monitor",
+                extra_metadata={
+                    "data_health_checked": True,
+                    "alignment_snapshot_hash": snapshot.data_hash,
+                    "execution_quote": context.to_dict(),
+                },
+            )
+            report = self.broker.place_order(order)
+            reports.append(report)
+            resolved.add(verdict.code)
+            LOGGER.info(
+                "新闻风险卖出已提交: code=%s action=risk_sell confidence=%.2f "
+                "reason=%s sources=%s shares=%d price=%.2f status=%s message=%s",
+                code,
+                verdict.confidence,
+                verdict.reason,
+                list(verdict.sources),
+                order.shares,
+                order.price,
+                report.status,
+                report.message,
+            )
+        return tuple(reports), frozenset(resolved), tuple(retry)
+
+    def monitor_news_overlay(
+        self,
+        trade_date: str,
+        *,
+        current_time: datetime | None = None,
+    ) -> tuple[ExecutionReport, ...]:
+        """盘中监控研判文件 mtime，新出现的高置信风险持仓立即强制卖出。"""
+        path = news_overlay_path(trade_date, self.root_dir)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return ()
+        state = self._news_monitor_state.get(trade_date)
+        if state is not None and state.mtime == mtime and not state.pending:
+            return ()
+        pending: list[NewsVerdict] = list(state.pending) if state is not None else []
+        processed: set[str] = set(state.processed) if state is not None else set()
+        if state is None or state.mtime != mtime:
+            overlay = load_news_overlay(trade_date, self.root_dir)
+            if overlay is None:
+                LOGGER.warning(
+                    "新闻研判文件 mtime 已变化但解析失败，保留旧状态等待再次覆盖: %s",
+                    path,
+                )
+                return ()
+            known = processed | {verdict.code for verdict in pending}
+            fresh = [
+                verdict
+                for verdict in overlay.verdicts
+                if verdict.action == "risk_sell"
+                and verdict.is_actionable
+                and verdict.code not in known
+            ]
+            if fresh:
+                LOGGER.info(
+                    "新闻研判文件更新，新增风险卖出研判: %s",
+                    [
+                        (verdict.code, f"{verdict.confidence:.2f}")
+                        for verdict in fresh
+                    ],
+                )
+            pending.extend(fresh)
+        reports: tuple[ExecutionReport, ...] = ()
+        if pending:
+            reports, resolved, retry = self._execute_news_risk_exits(
+                tuple(pending),
+                trade_date,
+                current_time=current_time or now_local(),
+            )
+            processed |= resolved
+            pending = list(retry)
+        # 日期滚动后清理旧状态，避免长期运行状态膨胀。
+        self._news_monitor_state = {
+            key: value
+            for key, value in self._news_monitor_state.items()
+            if key >= trade_date
+        }
+        self._news_monitor_state[trade_date] = NewsMonitorState(
+            mtime=mtime,
+            processed=frozenset(processed),
+            pending=tuple(pending),
+        )
+        return reports
+
     def record_close_and_report(self, trade_date: str, data_version: str) -> Path:
         """记录唯一日净值并生成含成本、换手和版本号的日报。"""
         positions = self.broker.query_positions()
@@ -1533,6 +2089,7 @@ def run_daemon(
                 last_idle_state = ""
                 runner.execute_pending_target(trade_date, current_time=now)
                 runner.monitor_catastrophic_stops(trade_date, current_time=now)
+                runner.monitor_news_overlay(trade_date, current_time=now)
             elif now.time() >= dt_time(15, 5):
                 last_idle_state = "after_close"
                 if runner.ledger.claim_daily_job("close_cycle", trade_date):
@@ -1748,6 +2305,7 @@ def main() -> int:
                 runner.execute_pending_target(trade_date, current_time=command_now)
             elif args.command == "monitor":
                 runner.monitor_catastrophic_stops(trade_date, current_time=command_now)
+                runner.monitor_news_overlay(trade_date, current_time=command_now)
             elif args.command == "report":
                 latest = (
                     runner.ledger.latest_signal_hash(config.strategy_version)
