@@ -60,7 +60,7 @@ BENCHMARK_DIR = RESEARCH_ROOT / "benchmark"
 REPORT_PATH = ROOT_DIR / "reports" / "param_ab_20260904.json"
 
 BACKTEST_START = "20240101"
-BACKTEST_END = "20260904"
+BACKTEST_END = datetime.now().strftime("%Y%m%d")  # 滚动到当天,支持定期重跑
 # 预载历史起点。任务建议"预载多取 180 天",但策略要求 stock_min_history_days=250
 # 根 K 线与 MA200/ETF 200 日均线,180 个自然日只有约 120 个交易日,会让 2024
 # 上半年个股与 ETF sleeve 因"历史不足"系统性空仓、扭曲对照,因此取约 500 个
