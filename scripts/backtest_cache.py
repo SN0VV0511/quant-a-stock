@@ -30,6 +30,7 @@ from config.settings import (  # noqa: E402
 LOGGER = logging.getLogger("backtest_cache")
 _THREAD_LOCK = threading.Lock()
 _WORKER: threading.Thread | None = None
+_RETRY_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -220,6 +221,12 @@ def ensure_backtest_cache(
         return status
     if not force and status.available and not status.stale:
         return status
+    if not force:
+        try:
+            if time.time() - _error_path(root_dir).stat().st_mtime < _RETRY_SECONDS:
+                return status
+        except FileNotFoundError:
+            pass
 
     if async_run:
         global _WORKER

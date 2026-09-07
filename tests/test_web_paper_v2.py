@@ -3,9 +3,54 @@
 from __future__ import annotations
 
 import web.app as web_app
+import pytest
 from data.scan_store import StockScanSnapshot, StockScanStore
 from trading.ledger import PaperLedger
 from trading.models import OrderIntent
+
+
+@pytest.mark.parametrize("price", [None, 0, -1, "bad", float("nan"), float("inf")])
+def test_portfolio_missing_quote_preserves_ledger_valuation(monkeypatch, price) -> None:
+    """行情缺失或非法不能把持仓价值归零，也不能传播 NaN。"""
+    monkeypatch.setattr(web_app, "load_state", lambda: {
+        "cash": 40_000,
+        "positions": {"510300": {"shares": 2000, "avg_cost": 4.0, "current_price": 4.2}},
+    })
+    monkeypatch.setattr(web_app.AKDataLoader, "get_realtime_quotes", lambda *_: {
+        "510300": {"price": price},
+    })
+    result = object.__new__(web_app.QuantHandler)._api_portfolio()
+    assert result["total_value"] == 48_400
+    assert result["positions"][0]["price_source"] == "ledger"
+    assert result["quotes_degraded"] is True
+
+
+def test_portfolio_valid_quote_replaces_ledger_price(monkeypatch) -> None:
+    """有效报价应更新估值并带回数据时间。"""
+    monkeypatch.setattr(web_app, "load_state", lambda: {
+        "cash": 40_000,
+        "positions": {"510300": {"shares": 2000, "avg_cost": 4.0, "current_price": 4.2}},
+    })
+    monkeypatch.setattr(web_app.AKDataLoader, "get_realtime_quotes", lambda *_: {
+        "510300": {"price": 4.5, "quote_time": "20260904145959"},
+    })
+    result = object.__new__(web_app.QuantHandler)._api_portfolio()
+    assert result["total_value"] == 49_000
+    assert result["positions"][0]["price_source"] == "quote"
+    assert result["positions"][0]["quote_time"] == "20260904145959"
+    assert result["quotes_degraded"] is False
+
+
+@pytest.mark.parametrize("lines, expected", [("0", 1), ("-1", 1), ("bad", 100), ("999999", 1000)])
+def test_log_tail_limits_untrusted_line_count(tmp_path, monkeypatch, lines, expected) -> None:
+    """非法或超大行数不能造成崩溃或返回整份日志。"""
+    log = tmp_path / "live.log"
+    log.write_text("".join(f"line {i}\n" for i in range(1100)), encoding="utf-8")
+    monkeypatch.setattr(web_app, "LIVE_TODAY_LOG", str(log))
+    result = object.__new__(web_app.QuantHandler)._api_logs({"lines": [lines]})
+    assert len(result["logs"]) == expected
+    assert result["logs"][-1] == "line 1099"
+    assert result["total"] == 1100
 
 
 def _execution_metadata(date: str, price: float) -> dict[str, object]:

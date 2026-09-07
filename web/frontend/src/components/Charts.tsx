@@ -100,6 +100,7 @@ export function EquityCharts({ points, reducedMotion }: EquityChartsProps) {
     } else {
       equityChart.current.data.labels = labels;
       equityChart.current.data.datasets[0].data = values;
+      equityChart.current.options.animation = chartAnimation(reducedMotion);
       equityChart.current.update();
     }
 
@@ -125,6 +126,7 @@ export function EquityCharts({ points, reducedMotion }: EquityChartsProps) {
     } else {
       ddChart.current.data.labels = labels;
       ddChart.current.data.datasets[0].data = drawdowns;
+      ddChart.current.options.animation = chartAnimation(reducedMotion);
       ddChart.current.update();
     }
 
@@ -217,6 +219,7 @@ export function AllocationChart({ cash, positions, reducedMotion }: AllocationCh
           labels: { color: "#94a3b8", boxWidth: 8, boxHeight: 8 }
         }
       };
+      chartRef.current.options.animation = chartAnimation(reducedMotion);
       chartRef.current.update();
     }
 
@@ -254,6 +257,8 @@ export function EquitySparkline({ points, reducedMotion }: EquitySparklineProps)
 
   useEffect(() => {
     if (!canvasRef.current || !points.length) {
+      chartRef.current?.destroy();
+      chartRef.current = null;
       return undefined;
     }
 
@@ -306,6 +311,7 @@ export function EquitySparkline({ points, reducedMotion }: EquitySparklineProps)
       chartRef.current.data.datasets[0].data = values;
       const dataset = chartRef.current.data.datasets[0] as unknown as { pointRadius: number };
       dataset.pointRadius = points.length === 1 ? 2.5 : 0;
+      chartRef.current.options.animation = chartAnimation(reducedMotion);
       chartRef.current.update();
     }
 
@@ -377,6 +383,7 @@ export function RiskGauge({ score, reducedMotion }: RiskGaugeProps) {
     } else {
       chartRef.current.data.datasets[0].data = values;
       chartRef.current.data.datasets[0].backgroundColor = [color, "rgba(255, 255, 255, 0.1)"];
+      chartRef.current.options.animation = chartAnimation(reducedMotion);
       chartRef.current.update();
     }
 
@@ -396,7 +403,7 @@ export function RiskGauge({ score, reducedMotion }: RiskGaugeProps) {
       <div className="risk-gauge__value" aria-hidden="true">
         <strong>{safeScore.toFixed(1)}</strong>
         <span>/ 10</span>
-        <small>风险评分</small>
+        <small>规则参考评分</small>
       </div>
     </div>
   );
@@ -466,6 +473,7 @@ export function BacktestChart({ series, reducedMotion }: BacktestChartProps) {
     } else {
       chartRef.current.data.labels = labels;
       chartRef.current.data.datasets = datasets;
+      chartRef.current.options.animation = chartAnimation(reducedMotion);
       chartRef.current.update();
     }
 

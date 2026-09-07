@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   IconActivity as Activity,
@@ -17,9 +17,11 @@ import { api } from "./lib/api";
 import { formatCurrency, formatNumber, formatPercent, toneByValue } from "./lib/format";
 import { usePolling } from "./hooks/usePolling";
 import { useReducedMotion } from "./hooks/useReducedMotion";
+import { usePageVisible } from "./hooks/usePageVisible";
 import { AllocationChart, BacktestChart, EquityCharts } from "./components/Charts";
 import { HudCard } from "./components/HudCard";
-import { StrategyTheater, type WorkspaceSection } from "./components/StrategyTheater";
+import { OfficeDashboard } from "./components/OfficeDashboard";
+import type { WorkspaceSection } from "./components/office/types";
 import type { BacktestSeries, Candidate, CandidatesResponse, ObservationResponse, Position, ProfitRankItem, RpsOrder, RpsSignal, Trade } from "./types";
 
 function toneClass(value: number | null | undefined) {
@@ -27,11 +29,15 @@ function toneClass(value: number | null | undefined) {
 }
 
 function useClock() {
-  const [clock, setClock] = useState(() => new Date().toLocaleTimeString("zh-CN"));
+  const visible = usePageVisible();
+  const readClock = () => new Date().toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai" });
+  const [clock, setClock] = useState(readClock);
   useEffect(() => {
-    const timer = window.setInterval(() => setClock(new Date().toLocaleTimeString("zh-CN")), 1000);
+    if (!visible) return;
+    setClock(readClock());
+    const timer = window.setInterval(() => setClock(readClock()), 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [visible]);
   return clock;
 }
 
@@ -105,8 +111,8 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
             <UserLock size={22} />
           </span>
           <div>
-            <p className="eyebrow">SECURE TERMINAL</p>
-            <h1>量化盯盘系统</h1>
+            <p className="eyebrow">WELCOME TO THE OFFICE</p>
+            <h1>慢慢事务所</h1>
           </div>
         </div>
         <div className="segmented" role="tablist" aria-label="认证模式">
@@ -149,7 +155,7 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
                 </button>
               </div>
               <button className="primary-action" type="submit" disabled={submitting}>
-                {submitting ? "认证中..." : "进入终端"}
+                {submitting ? "认证中..." : "进入办公室"}
               </button>
             </motion.form>
           ) : (
@@ -237,14 +243,15 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
 
   const status = usePolling(api.status, 5000);
   const portfolio = usePolling(api.portfolio, 5000);
-  const trades = usePolling(useCallback(() => api.trades(selectedDate ?? undefined), [selectedDate]), 5000);
-  const candidates = usePolling(api.candidates, 5000);
-  const rps = usePolling(api.rps, 5000);
-  const profitRanking = usePolling(api.profitRanking, 30000);
-  const equity = usePolling(api.equity, 5000);
-  const logs = usePolling(useCallback(() => api.logs(logLines), [logLines]), 5000);
+  const trades = usePolling(api.trades, 10_000);
+  const filteredTrades = usePolling(useCallback(() => api.trades(selectedDate ?? undefined), [selectedDate]), 10_000, activeSection === "execution" && selectedDate !== null);
+  const candidates = usePolling(api.candidates, 15_000);
+  const rps = usePolling(api.rps, 30_000, activeSection === "factors" || activeSection === "theater");
+  const profitRanking = usePolling(api.profitRanking, 30_000, activeSection === "portfolio");
+  const equity = usePolling(api.equity, 30_000);
+  const logs = usePolling(useCallback(() => api.logs(logLines), [logLines]), 10_000, activeSection === "execution");
   const observation = usePolling(api.observation, 60000);
-  const backtest = usePolling(api.backtest, 60000);
+  const backtest = usePolling(api.backtest, 60_000, activeSection === "backtest");
 
   const logout = async () => {
     await api.logout();
@@ -267,10 +274,11 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
   };
 
   const portfolioData = portfolio.data;
-  const positionRatio = portfolioData?.position_ratio ?? 0;
-  const currentDrawdown = (equity.data?.points ?? []).at(-1)?.drawdown ?? 0;
+  const positionRatio = portfolioData?.position_ratio;
+  const currentDrawdown = (equity.data?.points ?? []).at(-1)?.drawdown;
   const allTrades = (trades.data?.trades ?? []).slice().reverse();
-  const visibleTrades = showRejected ? allTrades : allTrades.filter((trade) => trade.status !== "rejected");
+  const executionTrades = selectedDate ? (filteredTrades.data?.trades ?? []).filter((trade) => trade.date === selectedDate).slice().reverse() : allTrades;
+  const visibleTrades = showRejected ? executionTrades : executionTrades.filter((trade) => trade.status !== "rejected");
   const rpsOrders = rps.data?.orders ?? [];
   const activeOrders = rpsOrders.filter((order) => order.status !== "risk_rejected");
   const backtestSeries = backtest.data?.series ?? [];
@@ -287,20 +295,20 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
                 sub={`${formatPercent(portfolioData?.pnl_pct)} (${formatNumber(portfolioData?.pnl, 0)} 元)`}
                 tone={toneByValue(portfolioData?.pnl)}
               />
-              <KpiCard label="可用现金" value={formatCurrency(portfolioData?.cash, 0)} sub={`现金占比 ${((1 - positionRatio) * 100).toFixed(1)}%`} />
+              <KpiCard label="可用现金" value={formatCurrency(portfolioData?.cash, 0)} sub={portfolioData?.total_value ? `现金占比 ${(portfolioData.cash / portfolioData.total_value * 100).toFixed(1)}%` : "等待账户快照"} />
               <KpiCard
                 label="持仓仓位"
-                value={`${(positionRatio * 100).toFixed(1)}%`}
-                sub={`${portfolioData?.position_count ?? 0} 只持仓`}
-                tone={positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent"}
-                meter={{ value: positionRatio * 100, tone: positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent" }}
+                value={positionRatio === undefined ? "--" : `${(positionRatio * 100).toFixed(1)}%`}
+                sub={portfolioData?.position_count === undefined ? "等待持仓数据" : `${portfolioData.position_count} 只持仓`}
+                tone={positionRatio === undefined ? "neutral" : positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent"}
+                meter={positionRatio === undefined ? undefined : { value: positionRatio * 100, tone: positionRatio > 0.6 ? "negative" : positionRatio > 0.45 ? "warn" : "accent" }}
               />
               <KpiCard
                 label="当前回撤"
-                value={`${(currentDrawdown * 100).toFixed(2)}%`}
+                value={currentDrawdown === undefined ? "--" : `${(currentDrawdown * 100).toFixed(2)}%`}
                 sub="目标上限 10%"
-                tone={currentDrawdown > 0.06 ? "negative" : currentDrawdown > 0.03 ? "warn" : "neutral"}
-                meter={{
+                tone={currentDrawdown === undefined ? "neutral" : currentDrawdown > 0.06 ? "negative" : currentDrawdown > 0.03 ? "warn" : "neutral"}
+                meter={currentDrawdown === undefined ? undefined : {
                   value: (currentDrawdown / 0.1) * 100,
                   tone: currentDrawdown > 0.06 ? "negative" : currentDrawdown > 0.03 ? "warn" : "accent"
                 }}
@@ -399,7 +407,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
                   <BacktestTable series={backtestSeries} />
                 </div>
               ) : (
-                <EmptyState text={backtest.data?.generating ? "策略回测生成中，完成后自动显示。" : backtest.data?.error ? `策略回测生成失败：${backtest.data.error}` : "暂无回测结果，系统会在后台自动生成。"} />
+                <EmptyState text={backtest.data?.generating ? "策略回测生成中，完成后自动显示。" : backtest.data?.error ? `策略回测生成失败：${backtest.data.error}` : backtest.data?.auto_generate === false ? "暂无回测结果，自动生成已关闭；请手动生成回测后刷新。" : "暂无回测结果，系统会在后台自动生成。"} />
               )}
             </HudCard>
           </section>
@@ -409,9 +417,9 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
           <section className="workspace-grid">
             <HudCard title="运行状态" icon={<Activity size={18} />} meta={status.error ?? "实时"}>
               <div className="metric-stack">
-                <div className="kv-row"><span>策略进程</span><strong className={status.data?.live_runner ? "tone-positive" : "tone-negative"}>{status.data?.live_runner ? "运行中" : "已停止"}</strong></div>
-                <div className="kv-row"><span>Web 服务</span><strong className={status.data?.web_server === false ? "tone-negative" : "tone-positive"}>{status.data?.web_server === false ? "异常" : "正常"}</strong></div>
-                <div className="kv-row"><span>策略模式</span><strong>周度收盘选股</strong></div>
+                <div className="kv-row"><span>策略进程</span><strong className={status.data?.live_runner === undefined ? "tone-neutral" : status.data.live_runner ? "office-runtime-ok" : "office-runtime-off"}>{status.data?.live_runner === undefined ? "待确认" : status.data.live_runner ? "运行中" : "已停止"}</strong></div>
+                <div className="kv-row"><span>Web 服务</span><strong className={status.data?.web_server === undefined ? "tone-neutral" : status.data.web_server ? "office-runtime-ok" : "office-runtime-off"}>{status.data?.web_server === undefined ? "待确认" : status.data.web_server ? "正常" : "异常"}</strong></div>
+                <div className="kv-row"><span>策略模式</span><strong>{status.data?.scan_schedule || status.data?.strategy_mode || "等待计划"}</strong></div>
                 <div className="kv-row"><span>预览扫描</span><strong>{status.data?.scan_running ? "运行中" : "空闲"}</strong></div>
                 <div className="kv-row"><span>最近扫描</span><strong>{status.data?.latest_scan_at || "尚未扫描"}</strong></div>
                 <div className="kv-row"><span>下次扫描</span><strong>{status.data?.next_scan_at || status.data?.scan_schedule || "--"}</strong></div>
@@ -431,7 +439,7 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
   })();
 
   return (
-    <StrategyTheater
+    <OfficeDashboard
       activeSection={activeSection}
       onSectionChange={setActiveSection}
       onLogout={logout}
@@ -445,9 +453,10 @@ function DashboardView({ onLogout }: { onLogout: () => void }) {
       equity={equity.data?.points ?? []}
       observation={observation.data}
       reducedMotion={reducedMotion}
+      feedError={status.error || portfolio.error || candidates.error || equity.error || trades.error}
     >
       {workspaceContent}
-    </StrategyTheater>
+    </OfficeDashboard>
   );
 }
 
@@ -516,7 +525,7 @@ function CandidatePanel({
         <button className="chip active" type="button" disabled={running} onClick={() => void onTrigger()}>
           {running ? "扫描中..." : "安全预览扫描"}
         </button>
-        <span className="muted-note">{data?.schedule || "每周收盘扫描"}</span>
+        <span className="muted-note">{data?.schedule || "按策略计划扫描"}</span>
       </div>
       {message && <div className="muted-note" role="status">{message}</div>}
       {filters.length > 0 && (
@@ -547,11 +556,11 @@ function CandidateList({ items, emptyText = "等待扫描" }: { items: Candidate
           <span className="rank">#{item.rank}</span>
           <div className="row-main">
             <strong>{item.name}</strong>
-            <span>{item.code} · PB {formatNumber(item.pb, 2)} · 得分 {formatNumber(item.score, 4)}</span>
+            <span>{item.code} · PB参考 {formatNumber(item.pb, 2)} · 得分 {formatNumber(item.score, 4)}</span>
           </div>
           <div className="row-right">
             <strong>{item.current_price ? formatCurrency(item.current_price, 2) : "--"}</strong>
-            <span className={toneClass(item.reversal)}>{formatPercent(item.reversal)}</span>
+            <span className={toneClass(item.reversal)}>近期涨跌 {formatPercent(item.reversal)}</span>
             {item.selected && <span className="badge buy">拟选</span>}
           </div>
         </div>
@@ -628,7 +637,7 @@ function OrderRow({ order }: { order: RpsOrder }) {
   );
 }
 
-function PositionList({ items, cash, totalValue }: { items: Array<{ code: string; name: string; shares: number; avg_cost: number; current_price: number; profit_pct: number; value: number }>; cash: number; totalValue: number }) {
+function PositionList({ items, cash, totalValue }: { items: Position[]; cash: number; totalValue: number }) {
   if (!items.length) return <EmptyState text="暂无持仓" />;
   const totalPositionValue = items.reduce((sum, item) => sum + (item.value || 0), 0);
   const cashRatio = totalValue > 0 ? (cash / totalValue * 100).toFixed(1) : '0';
@@ -666,6 +675,8 @@ function PositionList({ items, cash, totalValue }: { items: Array<{ code: string
               </div>
               <div className="row-right">
                 <strong>{formatCurrency(item.current_price, 3)}</strong>
+                {item.price_source === "ledger" && <span className="price-source">账本估值 · 行情未更新</span>}
+                {item.price_source === "quote" && item.quote_time && <span className="muted">行情 {item.quote_time}</span>}
                 <span className={toneClass(item.profit_pct)}>{formatPercent(item.profit_pct)}</span>
                 <span className="muted" style={{ fontSize: '10px' }}>{weight}%</span>
               </div>
@@ -748,6 +759,10 @@ function TradeList({ trades }: { trades: Trade[] }) {
 }
 
 function LogPanel({ lines, autoScroll }: { lines: string[]; autoScroll: boolean }) {
+  const logRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (autoScroll && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [lines, autoScroll]);
   const classForLine = (line: string) => {
     if (line.includes("[ERROR]") || line.includes("失败")) return "negative";
     if (line.includes("[WARNING]") || line.includes("警告")) return "warn";
@@ -758,7 +773,7 @@ function LogPanel({ lines, autoScroll }: { lines: string[]; autoScroll: boolean 
   };
 
   return (
-    <div className="log-panel" role="log" aria-live="polite" data-autoscroll={autoScroll}>
+    <div className="log-panel" ref={logRef} role="log" aria-live="polite" data-autoscroll={autoScroll}>
       {lines.length ? (
         lines.map((line, index) => (
           <div className={`log-line tone-${classForLine(line)}`} key={`${index}-${line.slice(0, 24)}`}>
@@ -775,13 +790,14 @@ function LogPanel({ lines, autoScroll }: { lines: string[]; autoScroll: boolean 
 function ObservationPanel({ data, error }: { data: ObservationResponse | null; error: string | null }) {
   if (error) return <EmptyState text={error} />;
   const obs = data;
-  const healthOk = obs?.health?.ok !== false && !(obs?.health?.failures?.length);
+  const healthKnown = obs?.health?.ok !== undefined || Boolean(obs?.health?.failures?.length);
+  const healthOk = obs?.health?.ok === true && !obs.health.failures?.length;
   const acceptance = obs?.acceptance;
   const progress = Math.min(100, ((acceptance?.snapshot_days ?? 0) / (acceptance?.required_snapshot_days || 20)) * 100);
   return (
     <div className="metric-stack">
-      <div className="kv-row"><span>健康检查</span><strong className={healthOk ? "tone-positive" : "tone-negative"}>{healthOk ? "通过" : "有失败项"}</strong></div>
-      <div className="kv-row"><span>QMT 验收</span><strong className={acceptance?.ready_for_qmt_dry_run ? "tone-positive" : "tone-negative"}>{acceptance?.ready_for_qmt_dry_run ? "就绪" : "未就绪"}</strong></div>
+      <div className="kv-row"><span>健康检查</span><strong className={!healthKnown ? "tone-neutral" : healthOk ? "office-runtime-ok" : "office-runtime-off"}>{!healthKnown ? "待检查" : healthOk ? "通过" : "有失败项"}</strong></div>
+      <div className="kv-row"><span>QMT 验收</span><strong className={acceptance?.ready_for_qmt_dry_run === undefined ? "tone-neutral" : acceptance.ready_for_qmt_dry_run ? "office-runtime-ok" : "office-runtime-off"}>{acceptance?.ready_for_qmt_dry_run === undefined ? "待检查" : acceptance.ready_for_qmt_dry_run ? "就绪" : "未就绪"}</strong></div>
       <div className="progress-label">观察期进度 {acceptance?.snapshot_days ?? 0}/{acceptance?.required_snapshot_days ?? 20}</div>
       <div className="meter large"><span className="meter__fill tone-accent" style={{ width: `${progress}%` }} /></div>
       {obs?.review?.total_return !== undefined && (
@@ -840,14 +856,15 @@ function BacktestTable({ series }: { series: BacktestSeries[] }) {
 
 function healthMeta(data: unknown) {
   const obs = data as { health?: { ok?: boolean; failures?: string[] } } | null;
-  const ok = obs?.health?.ok !== false && !(obs?.health?.failures?.length);
-  return <span className={ok ? "tone-positive" : "tone-negative"}>{ok ? "健康" : "异常"}</span>;
+  const known = obs?.health?.ok !== undefined || Boolean(obs?.health?.failures?.length);
+  const ok = obs?.health?.ok === true && !obs.health.failures?.length;
+  return <span className={!known ? "" : ok ? "office-runtime-ok" : "office-runtime-off"}>{!known ? "待检查" : ok ? "健康" : "异常"}</span>;
 }
 
 function rpsStatus(data: unknown) {
   const rps = data as { status?: string; completed?: boolean } | null;
-  if (rps?.status === "ok" && rps.completed) return <span className="tone-positive">已完成</span>;
-  if (rps?.status === "error") return <span className="tone-negative">异常</span>;
+  if (rps?.status === "ok" && rps.completed) return <span className="office-runtime-ok">已完成</span>;
+  if (rps?.status === "error") return <span className="office-runtime-off">异常</span>;
   return rps?.status ?? "--";
 }
 

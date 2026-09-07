@@ -541,6 +541,27 @@ def test_backtest_cache_records_generation_error(monkeypatch, tmp_path) -> None:
     assert (tmp_path / "data" / "backtest_refresh_error.json").exists()
 
 
+def test_backtest_failure_waits_before_retry_and_force_bypasses(monkeypatch, tmp_path) -> None:
+    """缺少研究数据时轮询不能每分钟重启完整回测，显式强制仍可重试。"""
+    from types import SimpleNamespace
+    import os
+    import scripts.backtest_cache as cache
+
+    calls = []
+    monkeypatch.setattr(cache.subprocess, "run", lambda *a, **kw: (
+        calls.append(a) or SimpleNamespace(returncode=1, stdout="", stderr="missing data")
+    ))
+    ensure_backtest_cache(tmp_path, async_run=False)
+    ensure_backtest_cache(tmp_path, async_run=False)
+    assert len(calls) == 1
+    ensure_backtest_cache(tmp_path, async_run=False, force=True)
+    assert len(calls) == 2
+    error_path = tmp_path / "data" / "backtest_refresh_error.json"
+    os.utime(error_path, (0, 0))
+    ensure_backtest_cache(tmp_path, async_run=False)
+    assert len(calls) == 3
+
+
 def test_paper_service_status_without_pid(tmp_path) -> None:
     """后台服务无 PID 文件时应返回未运行。"""
     status = get_status(tmp_path)

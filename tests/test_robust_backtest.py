@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -13,6 +16,12 @@ from backtest.robust_v2 import (
     ValidationWindow,
     build_validation_windows,
     parameter_grid,
+)
+from scripts.robust_walk_forward import (
+    _index_return,
+    _load_history_directory,
+    _load_universe_snapshots,
+    run_selection,
 )
 from trading.models import MarketSnapshot, TargetPortfolio, TargetPosition
 
@@ -237,7 +246,7 @@ def test_t1_buy_does_not_fill_when_execution_day_is_suspended(
     assert result.daily_values[-1]["position_count"] == 0
 
 
-@pytest.mark.parametrize("blocked_reason", ("suspended", "limit_down_open"))
+@pytest.mark.parametrize("blocked_reason", ("suspended", "limit_down_open", "missing_open"))
 def test_catastrophic_stop_is_deferred_until_stock_can_trade(
     monkeypatch: pytest.MonkeyPatch,
     blocked_reason: str,
@@ -257,6 +266,8 @@ def test_catastrophic_stop_is_deferred_until_stock_can_trade(
     )
     if blocked_reason == "suspended":
         stock.loc[stock["date"] == blocked_date, "is_suspended"] = True
+    elif blocked_reason == "missing_open":
+        stock.loc[stock["date"] == blocked_date, "open"] = float("nan")
     stock.loc[stock["date"] == sell_date, ["open", "high", "low", "close"]] = (
         8.5,
         8.6,
@@ -341,3 +352,167 @@ def test_build_validation_windows_reserves_last_twelve_months() -> None:
     assert test_end == "20260630"
     months = (pd.Timestamp(test_end) - pd.Timestamp(test_start)).days
     assert 360 <= months <= 370
+
+
+@pytest.mark.parametrize("invalid_open", ("missing", None, float("nan"), float("inf")))
+def test_backtest_never_substitutes_close_for_missing_open(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_open: object,
+) -> None:
+    """缺失开盘价不能拿当日收盘价撮合，也不能让 NaN/Inf 进入账户。"""
+    _force_single_stock_target(monkeypatch)
+    etf = _history("510300", 0.0, periods=5)
+    stock = _history("600001", 0.0, periods=5)
+    if invalid_open == "missing":
+        stock = stock.drop(columns="open")
+    else:
+        stock.loc[stock.index[-1], "open"] = invalid_open
+    dates = etf["date"].tolist()
+    result = RobustPortfolioBacktester(
+        {"510300": etf}, {"600001": stock}, {dates[0]: {"600001"}}
+    ).run(RobustParameterSet(-0.05, 0.02, 10, 0.07, 0.80), dates[0], dates[-1])
+
+    assert result.trades == ()
+    assert result.daily_values[-1]["total_value"] == 50_000
+
+
+@pytest.mark.parametrize("invalid_close", (float("nan"), float("inf")))
+def test_nonfinite_close_preserves_last_valid_valuation(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_close: float,
+) -> None:
+    """缺失收盘数值与缺整根 K 线采用同一个估值降级路径。"""
+    _force_single_stock_target(monkeypatch)
+    etf = _history("510300", 0.0, periods=6)
+    stock = _history("600001", 0.0, periods=6)
+    stock.loc[stock.index[-1], "close"] = invalid_close
+    dates = etf["date"].tolist()
+    result = RobustPortfolioBacktester(
+        {"510300": etf}, {"600001": stock}, {dates[0]: {"600001"}}
+    ).run(RobustParameterSet(-0.05, 0.02, 10, 0.07, 0.80), dates[0], dates[-1])
+
+    assert (
+        result.daily_values[-1]["total_value"]
+        == result.daily_values[-2]["total_value"]
+    )
+    assert result.daily_values[-1]["stale_valuation_codes"] == ["600001"]
+
+
+def test_walk_forward_rejects_three_years_without_full_validation() -> None:
+    """24 月训练和 12 月锁定以外必须另有完整 6 月验证。"""
+    dates = pd.bdate_range("2020-01-02", "2023-02-01").strftime("%Y%m%d").tolist()
+
+    with pytest.raises(ValueError, match="24\\+6"):
+        build_validation_windows(dates)
+
+
+def test_walk_forward_does_not_truncate_final_validation_window() -> None:
+    """锁定测试前的不足 6 月尾窗不能参与参数排名。"""
+    dates = pd.bdate_range("2020-01-02", "2024-04-01").strftime("%Y%m%d").tolist()
+    windows, test_start, _ = build_validation_windows(dates)
+
+    assert all(
+        pd.Timestamp(window.validation_start) + pd.DateOffset(months=6)
+        <= pd.Timestamp(test_start)
+        for window in windows
+    )
+
+
+@pytest.mark.parametrize("bad_endpoint", ("missing", float("nan"), float("inf")))
+def test_backtest_rejects_incomplete_benchmark_window(bad_endpoint: object) -> None:
+    """基准存在文件但区间端点缺失时，不能静默绕过压力比较。"""
+    etf = _history("510300", 0.0, periods=5)
+    benchmark = etf[["date", "close"]].copy()
+    if bad_endpoint == "missing":
+        benchmark = benchmark.iloc[1:]
+    else:
+        benchmark.loc[0, "close"] = bad_endpoint
+    dates = etf["date"].tolist()
+    backtester = RobustPortfolioBacktester(
+        {"510300": etf}, {}, {}, benchmark_history=benchmark
+    )
+
+    with pytest.raises(ValueError, match="基准"):
+        backtester.run(
+            RobustParameterSet(-0.05, 0.02, 10, 0.07, 0.80), dates[0], dates[-1]
+        )
+    assert _index_return(benchmark, dates[0], dates[-1]) is None
+
+
+def test_dashboard_benchmark_return_uses_dates_not_csv_row_order() -> None:
+    """仪表盘对比与回测端按相同日期计算，兼容倒序行情文件。"""
+    benchmark = pd.DataFrame(
+        {"date": ["20240103", "20240102"], "close": [11.0, 10.0]}
+    )
+
+    assert _index_return(benchmark, "20240102", "20240103") == 0.1
+
+
+def test_universe_history_requires_at_least_42_months(tmp_path: Path) -> None:
+    """研究数据入口和 24+6+12 月划分使用一致的最低跨度。"""
+    for date in ("20200102", "20230201"):
+        (tmp_path / f"robust_v2_{date}.json").write_text(
+            json.dumps({"snapshot": {"trade_date": date}, "stocks": []}),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="42"):
+        _load_universe_snapshots(tmp_path)
+
+
+def test_selection_rejects_current_sample_missing_historical_members(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """当前存续股抽样即使搭配历史池快照，也不能冒充完整样本外研究。"""
+    monkeypatch.setattr(
+        "scripts.robust_walk_forward._load_history_directory",
+        lambda directory: {
+            "510300" if directory.name == "etf" else "600001": _history("test", 0.0)
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.robust_walk_forward._load_universe_snapshots",
+        lambda _directory: {"20200102": {"600001", "600002"}},
+    )
+
+    with pytest.raises(ValueError, match="历史股票池.*缺少"):
+        run_selection(tmp_path, output=tmp_path / "result.json")
+    assert not (tmp_path / "result.json").exists()
+
+
+@pytest.mark.parametrize("filename_code", ("600000", "sh600000", "sh.600000"))
+@pytest.mark.parametrize("snapshot_code", ("600000", "sh600000", "sh.600000"))
+def test_research_loaders_match_equivalent_security_codes(
+    tmp_path: Path,
+    filename_code: str,
+    snapshot_code: str,
+) -> None:
+    """文件名和历史池的代码格式不同，仍须匹配到同一只股票。"""
+    stock_dir = tmp_path / "stock"
+    stock_dir.mkdir()
+    _history("600000", 0.0, periods=2).to_csv(
+        stock_dir / f"{filename_code}.csv", index=False
+    )
+    universe_dir = tmp_path / "universe"
+    universe_dir.mkdir()
+    for date in ("20200102", "20240702"):
+        (universe_dir / f"robust_v2_{date}.json").write_text(
+            json.dumps({"stocks": [{"code": snapshot_code}]}), encoding="utf-8"
+        )
+
+    history = _load_history_directory(stock_dir)
+    universes = _load_universe_snapshots(universe_dir)
+
+    assert set(history) == {"600000"}
+    assert all(codes == {"600000"} for codes in universes.values())
+    assert not set().union(*universes.values()) - history.keys()
+
+
+def test_research_loader_rejects_ambiguous_alias_files(tmp_path: Path) -> None:
+    """归一化碰到同一证券的两份行情时，禁止静默覆盖。"""
+    for code in ("600000", "sh.600000"):
+        _history("600000", 0.0, periods=2).to_csv(tmp_path / f"{code}.csv", index=False)
+
+    with pytest.raises(ValueError, match="重复历史行情"):
+        _load_history_directory(tmp_path)

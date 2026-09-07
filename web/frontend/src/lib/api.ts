@@ -32,6 +32,7 @@ async function requestJson<T>(
 ): Promise<T> {
   const response = await fetch(path, {
     credentials: "same-origin",
+    signal: AbortSignal.timeout(20_000),
     ...init,
     headers: {
       "Content-Type": "application/json",

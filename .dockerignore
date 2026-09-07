@@ -2,6 +2,10 @@
 .github
 .claude
 .env
+.env.*
+!.env.example
+.venv
+data/.password_hash*
 .mypy_cache
 .pytest_cache
 .ruff_cache

@@ -92,7 +92,13 @@ from trading.market import (
     validate_execution_quote,
 )
 from trading.instruments import normalized_security_code
-from trading.models import ExecutionReport, MarketSnapshot, OrderIntent, TargetPortfolio
+from trading.models import (
+    ExecutionReport,
+    MarketSnapshot,
+    OrderIntent,
+    TargetPortfolio,
+    TargetPosition,
+)
 from trading.schedule import rebalance_interval_elapsed
 
 LOGGER = logging.getLogger("robust_runner")
@@ -1554,7 +1560,31 @@ class RobustV2Runner:
                         },
                     )
                 )
-            reports = tuple(self.broker.place_order(order) for order in checked_orders)
+            # 分配预算含预计卖出回款；必须等全部计划卖单实际足额成交后再买入。
+            pending_sales = {
+                normalized_security_code(order.code)
+                for order in allocation.orders
+                if order.action == "sell"
+            }
+            execution_reports: list[ExecutionReport] = []
+            for order in checked_orders:
+                if order.action == "buy" and pending_sales:
+                    market_skipped[order.code] = (
+                        "计划卖单未全部成交，暂停使用预计回款买入"
+                    )
+                    continue
+                report = self.broker.place_order(order)
+                execution_reports.append(report)
+                if order.action == "sell":
+                    if report.is_success and report.shares == order.shares:
+                        pending_sales.discard(normalized_security_code(order.code))
+                    else:
+                        market_skipped[order.code] = (
+                            f"卖单仅成交 {report.shares}/{order.shares}，等待剩余数量"
+                            if report.is_success
+                            else report.message or "卖单未全部成交"
+                        )
+            reports = tuple(execution_reports)
             transient = {
                 **quote_rejected,
                 **alignment.rejected,

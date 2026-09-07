@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import statistics
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
@@ -175,11 +176,12 @@ def _price(
     row = _row_for(frame, date)
     if row is None:
         return 0.0
-    value = row.get(column, row.get("close", 0))
     try:
-        return float(value or 0)
+        value = float(row.get(column, 0))
     except (TypeError, ValueError):
         return 0.0
+    # 开盘/日内价格缺失时不可用当日收盘价代替，否则撮合会读取未来数据。
+    return value if math.isfinite(value) and value > 0 else 0.0
 
 
 def _latest_valid_close(
@@ -195,7 +197,7 @@ def _latest_valid_close(
     if rows.empty:
         return 0.0
     closes = pd.to_numeric(rows["close"], errors="coerce")
-    valid = closes.loc[closes.notna() & (closes > 0)]
+    valid = closes.loc[closes.notna() & (closes > 0) & (closes < float("inf"))]
     return float(valid.iloc[-1]) if not valid.empty else 0.0
 
 
@@ -284,14 +286,12 @@ class RobustPortfolioBacktester:
         """计算锁定区间基准收益。"""
         if self.benchmark_history is None:
             return None
-        data = self.benchmark_history.loc[
-            (self.benchmark_history["date"] >= start_date)
-            & (self.benchmark_history["date"] <= end_date)
-        ]
-        close = pd.to_numeric(data["close"], errors="coerce").dropna()
-        if len(close) < 2 or float(close.iloc[0]) <= 0:
+        history = {"benchmark": self.benchmark_history}
+        start_close = _price(history, "benchmark", start_date, "close")
+        end_close = _price(history, "benchmark", end_date, "close")
+        if start_close <= 0 or end_close <= 0:
             return None
-        return float(close.iloc[-1] / close.iloc[0] - 1)
+        return end_close / start_close - 1
 
     def run(
         self,
@@ -306,6 +306,9 @@ class RobustPortfolioBacktester:
         dates = [date for date in self.trading_dates if start_date <= date <= end_date]
         if len(dates) < 2:
             raise ValueError(f"回测区间交易日不足: {start_date}-{end_date}")
+        benchmark_return = self._benchmark_return(dates[0], dates[-1])
+        if self.benchmark_history is not None and benchmark_return is None:
+            raise ValueError(f"基准缺少区间端点有效收盘价: {dates[0]}-{dates[-1]}")
         config = params.to_config(enable_stock_enhancement=enable_stock_enhancement)
         strategy = RobustV2Strategy(config)
         rules = StressTradingRules(slippage_multiplier)
@@ -492,11 +495,9 @@ class RobustPortfolioBacktester:
                     else config.stock_stop_pct
                 )
                 stop_price = float(position["avg_cost"]) * (1 - threshold)
-                if low <= 0 or low > stop_price:
+                if low <= 0 or open_price <= 0 or low > stop_price:
                     continue
-                execution_price = (
-                    min(open_price, stop_price) if open_price > 0 else stop_price
-                )
+                execution_price = min(open_price, stop_price)
                 previous_close = (
                     _latest_valid_close(self.all_history, code, previous_date)
                     if previous_date
@@ -609,7 +610,6 @@ class RobustPortfolioBacktester:
             float(metrics.get("turnover_rate", 0)) * 252 / max(trading_days, 1),
             4,
         )
-        benchmark_return = self._benchmark_return(start_date, end_date)
         metrics["benchmark_return"] = benchmark_return
         return BacktestResult(
             params=params,
@@ -698,6 +698,8 @@ def build_validation_windows(
         validation_end_target = (
             validation_start + pd.DateOffset(months=6) - pd.Timedelta(days=1)
         )
+        if validation_end_target >= test_start:
+            break
         validation_end_candidates = dates[
             (dates <= validation_end_target) & (dates < test_start)
         ]

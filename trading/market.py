@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, time as dt_time
+from math import isfinite
 from typing import Any, Literal, Mapping
 
 from rules.engine import TradingRules
@@ -117,8 +118,14 @@ def validate_execution_quote(
     """
     if max_age_seconds <= 0:
         raise ValueError("实时行情最大年龄必须大于 0")
-    price = float(quote.get("price", 0) or 0)
-    prev_close = float(quote.get("prev_close", 0) or 0)
+    try:
+        price = float(quote.get("price", 0) or 0)
+        prev_close = float(quote.get("prev_close", 0) or 0)
+        trade_status = int(quote.get("trade_status", 1) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return QuoteValidationResult(None, "实时价格、前收盘或交易状态格式无效")
+    if not isfinite(price) or not isfinite(prev_close):
+        return QuoteValidationResult(None, "实时价格或前收盘无效")
     quote_at = _parse_quote_time(quote.get("quote_time"))
     if quote_at is None:
         return QuoteValidationResult(None, "行情缺少可验证的交易所时间戳")
@@ -137,10 +144,7 @@ def validate_execution_quote(
             None,
             f"行情已陈旧 {age_seconds:.0f} 秒，超过 {max_age_seconds} 秒",
         )
-    suspended = (
-        bool(quote.get("is_suspended", False))
-        or int(quote.get("trade_status", 1) or 0) == 0
-    )
+    suspended = bool(quote.get("is_suspended", False)) or trade_status == 0
     if suspended:
         return QuoteValidationResult(None, "标的当前停牌或无有效成交")
     if price <= 0 or prev_close <= 0:

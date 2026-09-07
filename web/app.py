@@ -16,8 +16,10 @@ import time
 import logging
 import threading
 import mimetypes
+import math
 import sqlite3
 import subprocess
+from collections import deque
 from dataclasses import asdict
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -376,6 +378,15 @@ def normalize_code(code):
     except ValueError:
         logger.warning("仪表盘忽略无法归一化的非沪深 A 股代码: %s", code)
         return str(code).strip().lower()
+
+
+def _positive_price(value: Any) -> float:
+    """行情边界只接受有限正数，缺失或非法值交由调用方回退。"""
+    try:
+        price = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return price if math.isfinite(price) and price > 0 else 0.0
 
 
 def get_realtime_prices(codes):
@@ -853,7 +864,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             logger.warning("持仓实时行情加载失败，回退账本最后价格: %s", exc)
 
         prices = {
-            code: float(quotes.get(normalize_code(code), {}).get("price", 0) or 0)
+            code: _positive_price(quotes.get(normalize_code(code), {}).get("price"))
             for code in codes
         }
         name_map = {
@@ -867,7 +878,10 @@ class QuantHandler(SimpleHTTPRequestHandler):
         positions_value = 0
         position_list = []
         for code, pos in positions.items():
-            current = prices.get(code, pos.get("current_price", pos.get("cost", 0)))
+            quote_price = prices.get(code, 0)
+            current = quote_price or _positive_price(
+                pos.get("current_price", pos.get("avg_cost", pos.get("cost", 0)))
+            )
             shares = pos.get("shares", 0)
             avg_cost = pos.get("avg_cost", pos.get("cost", 0))
             value = shares * current
@@ -880,6 +894,9 @@ class QuantHandler(SimpleHTTPRequestHandler):
                     "shares": shares,
                     "avg_cost": round(avg_cost, 3),
                     "current_price": round(current, 3),
+                    "price_source": "quote" if quote_price else "ledger",
+                    "quote_time": str(quotes.get(normalize_code(code), {}).get("quote_time", ""))
+                    if quote_price else "",
                     "value": round(value, 2),
                     "profit": round((current - avg_cost) * shares, 2),
                     "profit_pct": round(pnl, 4),
@@ -900,6 +917,7 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl / INITIAL_CAPITAL, 4),
             "positions": position_list,
+            "quotes_degraded": any(p["price_source"] == "ledger" for p in position_list),
             "updated_at": state.get("updated_at", ""),
         }
 
@@ -1086,12 +1104,15 @@ class QuantHandler(SimpleHTTPRequestHandler):
             "selected_codes": scan.get("selected_codes", []),
             "next_scheduled_scan_at": scan.get("next_scheduled_scan_at", ""),
             "error": scan.get("error", ""),
-            "schedule": "每个交易日 15:05 更新候选；周度调仓日才生成正式信号",
+            "schedule": "每个交易日 15:05 更新候选；按策略配置在周期末生成正式信号",
         }
 
     def _api_logs(self, params):
         """读取日志文件（支持 tail）"""
-        lines_count = int(params.get("lines", [100])[0])
+        try:
+            lines_count = max(1, min(1000, int(params.get("lines", [100])[0])))
+        except (TypeError, ValueError):
+            lines_count = 100
         log_file = params.get("file", ["live_today"])[0]
 
         if log_file == "live":
@@ -1104,18 +1125,17 @@ class QuantHandler(SimpleHTTPRequestHandler):
 
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
-            # 返回最后 N 行
-            tail_lines = all_lines[-lines_count:]
+                # 保留总行数契约，但内存只保存请求范围内的尾部行。
+                tail = deque(enumerate(f, start=1), maxlen=lines_count)
             # 解析日志格式
             parsed = []
-            for line in tail_lines:
+            for _, line in tail:
                 line = line.rstrip()
                 if not line:
                     continue
                 parsed.append(line)
-            return {"logs": parsed, "file": log_file, "total": len(all_lines)}
-        except Exception as e:
+            return {"logs": parsed, "file": log_file, "total": tail[-1][0] if tail else 0}
+        except OSError as e:
             return {"logs": [f"读取失败: {e}"], "file": log_file}
 
     def _api_status(self) -> dict[str, Any]:
@@ -1130,25 +1150,24 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if os.path.exists(LIVE_TODAY_LOG):
             try:
                 with open(LIVE_TODAY_LOG, "r", encoding="utf-8", errors="replace") as f:
-                    for line in reversed(f.readlines()):
+                    for line in f:
                         if "[INFO]" in line:
                             parts = line.split(" [INFO] ")
                             if parts:
                                 last_log_time = parts[0].strip()
-                            break
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.warning("读取最后日志时间失败: %s", exc)
 
         return {
             "live_runner": live_running,
             "web_server": web_running,
-            "strategy_mode": "weekly_close_target",
+            "strategy_mode": "periodic_close_target",
             "scan_running": _preview_scan_running(),
             "scan_status": scan.get("status", "never_run"),
             "latest_scan_at": scan.get("generated_at", ""),
             "latest_scan_trade_date": scan.get("trade_date", ""),
             "next_scan_at": scan.get("next_scheduled_scan_at", ""),
-            "scan_schedule": "每日 15:05 候选观察；周度调仓生成正式信号",
+            "scan_schedule": "每日 15:05 候选观察；按策略配置在周期末生成正式信号",
             "daemon_heartbeat_at": lease.get("heartbeat_at", ""),
             "last_log_time": last_log_time,
             "now": format_local(),

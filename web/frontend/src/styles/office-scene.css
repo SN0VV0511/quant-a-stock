@@ -1,0 +1,15 @@
+.office-scene, .office-canvas-mount { position: absolute; inset: 0; width: 100%; height: 100%; }
+.office-canvas-mount canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; outline: none; }
+.office-world-labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.office-person-label { position: absolute; top: 0; left: 0; visibility: hidden; pointer-events: auto; display: flex; align-items: center; gap: 6px; padding: 7px 10px; border: 1px solid #ffffffb8; border-radius: 7px; color: #264235; background: #fffaf0ed; box-shadow: 0 3px 10px #273c2e12; font: 600 11px "Avenir Next", "PingFang SC", sans-serif; white-space: nowrap; }
+.office-person-label::after { content: ""; position: absolute; top: 100%; left: 50%; width: 1px; height: 12px; background: #8c9b85; }
+.office-person-label i { width: 6px; height: 6px; border-radius: 50%; }
+.office-person-label small { display: none; color: #7d897b; font-size: 9px; font-weight: 400; }
+.office-person-label[data-selected="true"] small { display: inline; }
+.office-person-label:hover, .office-person-label[data-selected="true"] { border-color: #cf9955; box-shadow: 0 0 0 3px #d9b77628; }
+.office-person-label:focus-visible { outline: 3px solid #427d66; outline-offset: 3px; }
+.office-person-label__bubble:not(:empty) { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); padding: 8px 11px; border-radius: 9px 9px 9px 1px; color: #56725d; background: #ffffffeb; box-shadow: 0 3px 12px #20362a0f; font-size: 10px; font-weight: 400; }
+.office-webgl-fallback { position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); width: min(80%, 400px); padding: 28px; text-align: center; color: #345444; background: #fffaf1; border: 1px solid #d4d8c6; border-radius: 18px; }
+.office-webgl-fallback strong { font-size: 22px; }
+.office-webgl-fallback p { font-size: 13px; line-height: 1.8; }
+@media(max-width: 760px) { .office-person-label { padding: 6px 8px; font-size: 10px; } .office-person-label small { display: none; } .office-person-label__bubble:not(:empty) { font-size: 9px; } }

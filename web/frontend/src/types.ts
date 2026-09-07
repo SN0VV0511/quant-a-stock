@@ -29,6 +29,8 @@ export interface Position {
   value: number;
   profit: number;
   profit_pct: number;
+  price_source?: "quote" | "ledger";
+  quote_time?: string;
 }
 
 export interface PortfolioResponse {
@@ -41,6 +43,7 @@ export interface PortfolioResponse {
   pnl_pct: number;
   positions: Position[];
   updated_at: string;
+  quotes_degraded?: boolean;
 }
 
 export interface Trade {
@@ -198,6 +201,7 @@ export interface BacktestSeries {
 }
 
 export interface BacktestResponse {
+  auto_generate?: boolean;
   available?: boolean;
   generating?: boolean;
   stale?: boolean;

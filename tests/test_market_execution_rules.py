@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from trading.market import (
     classify_trading_session,
     is_strategy_execution_session,
@@ -82,3 +84,21 @@ def test_execution_quote_applies_limit_up_and_limit_down_by_direction() -> None:
     assert limit_down.context is not None
     assert order_is_tradable("sell", limit_down.context)[0] is False
     assert order_is_tradable("buy", limit_down.context)[0] is True
+
+
+@pytest.mark.parametrize("field", ["price", "prev_close", "trade_status"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), "bad"])
+def test_execution_quote_rejects_invalid_numeric_fields(
+    field: str, value: object
+) -> None:
+    """单条脏行情应被拒绝，不能通过交易校验或中断整批风控。"""
+    result = validate_execution_quote(
+        "600000",
+        _quote(**{field: value}),
+        execution_date="20260714",
+        now=datetime(2026, 7, 14, 9, 36, 30),
+        max_age_seconds=120,
+    )
+    assert not result.accepted
+    assert result.retryable
+    assert "无效" in result.reason

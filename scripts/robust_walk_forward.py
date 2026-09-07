@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import tempfile
 from datetime import datetime
@@ -27,6 +28,7 @@ from backtest.robust_v2 import (  # noqa: E402
     RobustWalkForwardSelector,
     selection_to_dict,
 )
+from trading.instruments import normalized_security_code  # noqa: E402
 
 LOGGER = logging.getLogger("robust_walk_forward")
 
@@ -64,7 +66,10 @@ def _load_history_directory(directory: Path) -> dict[str, pd.DataFrame]:
     for path in sorted(directory.iterdir()):
         if path.suffix.lower() not in {".csv", ".pkl", ".pickle"}:
             continue
-        result[path.stem] = _load_frame(path)
+        code = normalized_security_code(path.stem)
+        if code in result:
+            raise ValueError(f"证券 {code} 存在重复历史行情文件: {path.name}")
+        result[code] = _load_frame(path)
     if not result:
         raise ValueError(f"历史行情目录为空: {directory}")
     return result
@@ -81,7 +86,7 @@ def _load_universe_snapshots(directory: Path) -> dict[str, set[str]]:
         date = str(snapshot.get("trade_date") or path.stem.rsplit("_", 1)[-1])
         stocks = payload.get("stocks", [])
         result[date] = {
-            str(stock["code"])
+            normalized_security_code(str(stock["code"]))
             for stock in stocks
             if isinstance(stock, dict) and stock.get("code")
         }
@@ -89,9 +94,11 @@ def _load_universe_snapshots(directory: Path) -> dict[str, set[str]]:
         raise ValueError("没有可用的 point-in-time 股票池版本")
     dates = sorted(result)
     span_days = (pd.Timestamp(dates[-1]) - pd.Timestamp(dates[0])).days
-    if span_days < 365 * 3:
+    if pd.Timestamp(dates[-1]) + pd.Timedelta(days=1) < (
+        pd.Timestamp(dates[0]) + pd.DateOffset(months=42)
+    ):
         raise ValueError(
-            f"股票池版本仅覆盖 {span_days} 天，至少需要约 3 年以执行 24+6+12 月验证"
+            f"股票池版本仅覆盖 {span_days} 天，至少需要 42 个月以执行 24+6+12 月验证"
         )
     return result
 
@@ -104,11 +111,12 @@ def _index_return(
         return None
     data = frame.copy()
     data["date"] = data["date"].astype(str).str.replace("-", "", regex=False).str[:8]
+    data = data.drop_duplicates("date", keep="last").set_index("date")
     close = pd.to_numeric(
-        data.loc[(data["date"] >= start_date) & (data["date"] <= end_date), "close"],
+        data.reindex([start_date, end_date])["close"],
         errors="coerce",
-    ).dropna()
-    if len(close) < 2 or float(close.iloc[0]) <= 0:
+    )
+    if not all(math.isfinite(value) and value > 0 for value in close):
         return None
     return round(float(close.iloc[-1] / close.iloc[0] - 1), 6)
 
@@ -136,6 +144,12 @@ def run_selection(
     etfs = _load_history_directory(data_root / "etf")
     stocks = _load_history_directory(data_root / "stock")
     universes = _load_universe_snapshots(data_root / "universe")
+    missing_codes = set().union(*universes.values()) - stocks.keys()
+    if missing_codes:
+        raise ValueError(
+            f"历史股票池有 {len(missing_codes)} 个成员缺少行情，"
+            "不能用当前存续股样本生成正式样本外结果"
+        )
     hs300_path = data_root / "benchmark" / "000300.csv"
     zz500_path = data_root / "benchmark" / "000905.csv"
     hs300 = _load_frame(hs300_path) if hs300_path.exists() else None

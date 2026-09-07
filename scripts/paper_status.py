@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -48,7 +49,8 @@ def _tail_lines(path: Path, max_lines: int) -> list[str]:
     if max_lines <= 0 or not path.exists():
         return []
     try:
-        return path.read_text(encoding="utf-8").splitlines()[-max_lines:]
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return [line.rstrip("\r\n") for line in deque(stream, maxlen=max_lines)]
     except OSError as exc:
         return [f"读取日志失败: {path} - {exc}"]
 

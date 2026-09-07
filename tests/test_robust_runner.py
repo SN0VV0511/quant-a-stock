@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import signal
@@ -28,6 +29,7 @@ from strategies.robust_v2 import RobustV2Config, build_market_data_hash
 from trading.brokers import SQLitePaperBrokerAdapter
 from trading.ledger import PaperLedger
 from trading.models import (
+    ExecutionReport,
     MarketSnapshot,
     OrderIntent,
     TargetPortfolio,
@@ -666,6 +668,93 @@ def test_missing_position_quote_freezes_all_new_buys(
     assert "持仓实时估值不完整" in outcome.allocation.skipped["510300"]
     assert ledger.query_signal_state(signal_id)["status"] == "retryable"
     assert [order.code for order in ledger.query_orders()] == ["600000"]
+    broker.close()
+
+
+@pytest.mark.parametrize("sell_failure", ["limit_down", "rejected", "partial"])
+def test_unfilled_sales_do_not_fund_new_buys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sell_failure: str,
+) -> None:
+    """卖出受限、拒单或部分成交时，不能把预计回款用于买入。"""
+    ledger = PaperLedger(tmp_path / "paper_v2.db", strict_order_source=False)
+    broker = SQLitePaperBrokerAdapter(ledger=ledger)
+    broker.connect()
+    broker.place_order(
+        OrderIntent(
+            account_id="paper_v2",
+            strategy_version="robust_v2",
+            signal_date="20260708",
+            code="600000",
+            action="buy",
+            price=10.0,
+            shares=2000,
+            date="20260708",
+        )
+    )
+    runner = RobustV2Runner(broker, FakeLoader(), root_dir=tmp_path)  # type: ignore[arg-type]
+
+    class RotationData(FakeDataService):
+        def load_execution_data(self, codes: set[str], signal_date: str):
+            self.history["600000"] = _etf_history("600000", 0)
+            self.history["600000"]["close"] = 10.0
+            snapshot, history, quotes = super().load_execution_data(codes, signal_date)
+            if sell_failure == "limit_down":
+                quotes["600000"]["price"] = 9.0
+            return snapshot, history, quotes
+
+    data = RotationData()
+    runner.data = data  # type: ignore[assignment]
+    target = TargetPortfolio(
+        account_id="paper_v2",
+        strategy_version="robust_v2",
+        signal_date="20260709",
+        positions=(TargetPosition("510300", 0.24, "ETF_ROTATION", "etf"),),
+        source_snapshot_hash="rotation",
+        cash_weight=0.76,
+    )
+    signal_id = ledger.record_signal(target)
+    original_place_order = broker.place_order
+
+    def place_order(order: OrderIntent) -> ExecutionReport:
+        if order.action == "sell" and sell_failure == "rejected":
+            return ExecutionReport(
+                order_id="rejected-sell",
+                status="rejected",
+                code=order.code,
+                action="sell",
+                price=order.price,
+                actual_price=0,
+                shares=0,
+                amount=0,
+                message="卖出暂时失败",
+            )
+        if order.action == "sell" and sell_failure == "partial":
+            return original_place_order(replace(order, shares=100))
+        return original_place_order(order)
+
+    monkeypatch.setattr(broker, "place_order", place_order)
+    monkeypatch.setattr("robust_runner.previous_trading_day", lambda _date: "20260709")
+    first = runner.execute_pending_target(
+        "20260710",
+        current_time=datetime(2026, 7, 10, 9, 36, 30),
+    )
+
+    assert not any(report.action == "buy" for report in first.reports)
+    assert "510300" not in broker.query_positions()
+    assert ledger.query_signal_state(signal_id)["status"] == "retryable"
+
+    sell_failure = "recovered"
+    data.execution_quote_time = "20260710093800"
+    second = runner.execute_pending_target(
+        "20260710",
+        current_time=datetime(2026, 7, 10, 9, 38, 30),
+    )
+    assert [report.action for report in second.reports] == ["sell", "buy"]
+    assert all(report.is_success for report in second.reports)
+    assert "600000" not in broker.query_positions()
+    assert ledger.query_signal_state(signal_id)["status"] == "completed"
     broker.close()
 
 

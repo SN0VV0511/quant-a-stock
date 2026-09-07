@@ -4,6 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile.live
     command: ["python3", "scripts/paper_v2_init.py", "--confirm", "--json"]
+    mem_limit: 512m
+    cpus: 1.0
     env_file:
       - path: .env
         required: false
@@ -22,6 +24,13 @@ services:
         required: false
     environment:
       ROBUST_V2_REBALANCE_DAYS: "20"
+      BAOSTOCK_HISTORY_BATCH_WORKERS: ${BAOSTOCK_HISTORY_BATCH_WORKERS:-2}
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    mem_limit: 2304m
+    cpus: 2.5
+    pids_limit: 128
     depends_on:
       paper-init:
         condition: service_completed_successfully
@@ -43,6 +52,14 @@ services:
         required: false
     environment:
       DASHBOARD_COOKIE_SECURE: ${DASHBOARD_COOKIE_SECURE:-false}
+      BAOSTOCK_HISTORY_BATCH_WORKERS: ${BAOSTOCK_HISTORY_BATCH_WORKERS:-2}
+      BACKTEST_AUTO_GENERATE: ${BACKTEST_AUTO_GENERATE:-false}
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
     depends_on:
       paper-init:
         condition: service_completed_successfully

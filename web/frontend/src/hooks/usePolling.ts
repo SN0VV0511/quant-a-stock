@@ -16,44 +16,55 @@ export function usePolling<T>(loader: () => Promise<T>, intervalMs: number, enab
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
-  const mountedRef = useRef(true);
-
-  const refresh = useCallback(async () => {
-    try {
-      const next = await loader();
-      if (!mountedRef.current) {
-        return;
-      }
-      setData(next);
-      setError(null);
-      setUpdatedAt(Date.now());
-    } catch (err) {
-      if (!mountedRef.current) {
-        return;
-      }
-      setError(err instanceof Error ? err.message : "请求失败");
-    } finally {
-      if (mountedRef.current) {
-        setLoading(false);
-      }
-    }
-  }, [loader]);
+  const requestsRef = useRef(new Map<() => Promise<T>, Promise<T>>());
+  const refreshRef = useRef<() => Promise<void>>(async () => undefined);
+  const refresh = useCallback(() => refreshRef.current(), []);
 
   useEffect(() => {
-    mountedRef.current = true;
+    let active = enabled;
+    let pending: Promise<void> | null = null;
+    const load = (): Promise<void> => {
+      if (!active) return Promise.resolve();
+      if (pending) return pending;
+      // 切换面板或轮询周期时复用同一查询的在途请求。
+      const request = requestsRef.current.get(loader) ?? Promise.resolve().then(loader);
+      requestsRef.current.set(loader, request);
+      pending = (async () => {
+        try {
+          const next = await request;
+          if (!active) return;
+          setData(next);
+          setError(null);
+          setUpdatedAt(Date.now());
+        } catch (err) {
+          if (active) setError(err instanceof Error ? err.message : "请求失败");
+        } finally {
+          if (active) setLoading(false);
+          pending = null;
+          if (requestsRef.current.get(loader) === request) requestsRef.current.delete(loader);
+        }
+      })();
+      return pending;
+    };
+    refreshRef.current = load;
     if (!enabled) {
       setLoading(false);
-      return undefined;
+      return () => {
+        active = false;
+        refreshRef.current = async () => undefined;
+      };
     }
-    void refresh();
-    const timer = window.setInterval(() => {
-      void refresh();
-    }, intervalMs);
+    const refreshWhenVisible = () => { if (!document.hidden) void load(); };
+    refreshWhenVisible();
+    const timer = window.setInterval(refreshWhenVisible, intervalMs);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => {
-      mountedRef.current = false;
+      active = false;
+      refreshRef.current = async () => undefined;
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [enabled, intervalMs, refresh]);
+  }, [enabled, intervalMs, loader]);
 
   return { data, error, loading, updatedAt, refresh };
 }
