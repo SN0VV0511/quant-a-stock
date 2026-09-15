@@ -1754,6 +1754,35 @@ class PaperLedger:
             )
         return snapshot
 
+    def refresh_position_prices(self, prices: Mapping[str, float]) -> int:
+        """用收盘价回写持仓 last_price，保证日报/健康检查现价不停留在历史成交价。"""
+        updated = 0
+        captured_at = format_local()
+        with self._transaction() as transaction:
+            for code, price in prices.items():
+                try:
+                    valid_price = float(price)
+                except (TypeError, ValueError):
+                    continue
+                if valid_price <= 0:
+                    continue
+                cursor = transaction.execute(
+                    """
+                    UPDATE positions
+                    SET last_price = ?, updated_at = ?
+                    WHERE account_id = ? AND code = ? AND last_price != ?
+                    """,
+                    (
+                        valid_price,
+                        captured_at,
+                        self.account_id,
+                        code,
+                        valid_price,
+                    ),
+                )
+                updated += max(cursor.rowcount, 0)
+        return updated
+
     def build_review(
         self,
         start_date: str,

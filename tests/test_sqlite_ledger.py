@@ -372,3 +372,30 @@ def test_round_trip_realized_profit_includes_buy_and_sell_costs(tmp_path) -> Non
 
     assert sell.status == "filled"
     assert sell.profit == pytest.approx(ledger.query_cash() - 50_000, abs=0.01)
+
+
+def test_refresh_position_prices_updates_last_price(tmp_path) -> None:
+    """收盘价必须回写持仓现价，日报不再停留在历史成交价。"""
+    ledger = _ledger(tmp_path)
+    ledger.place_order(_order("600000", "buy", "20260908", price=15.36))
+
+    stale = ledger.query_snapshot({"600000": 15.36})
+    assert stale.positions[0]["current_price"] == 15.36
+
+    updated = ledger.refresh_position_prices({"600000": 14.84})
+    assert updated == 1
+
+    fresh = ledger.query_snapshot({"600000": 14.84})
+    assert fresh.positions[0]["current_price"] == 14.84
+
+
+def test_refresh_position_prices_skips_invalid_and_unchanged(tmp_path) -> None:
+    """非法价格与未变化价格不应产生写入。"""
+    ledger = _ledger(tmp_path)
+    ledger.place_order(_order("600000", "buy", "20260908", price=15.36))
+
+    before = ledger.query_snapshot({"600000": 15.36})
+    assert ledger.refresh_position_prices({"600000": 0, "600000": -5}) == 0
+    after = ledger.query_snapshot({"600000": 15.36})
+    assert after.positions[0]["current_price"] == before.positions[0]["current_price"]
+    assert after.total_value == before.total_value

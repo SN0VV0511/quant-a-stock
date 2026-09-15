@@ -1963,6 +1963,12 @@ class RobustV2Runner:
             strategy_version=self.config.strategy_version,
             benchmark_return=benchmark_return,
         )
+        try:
+            refreshed = self.ledger.refresh_position_prices(prices)
+            if refreshed:
+                LOGGER.info("已回写 %d 只持仓的收盘价", refreshed)
+        except Exception:
+            LOGGER.exception("回写持仓收盘价失败(不影响净值快照)")
         report = build_daily_ledger_report(
             self.ledger, trade_date, run_id=self.ledger.current_run_id
         )
