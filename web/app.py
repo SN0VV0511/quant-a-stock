@@ -673,6 +673,10 @@ class QuantHandler(SimpleHTTPRequestHandler):
         if path == "/healthz":
             return self._json_response({"ok": True, "service": "quant-dashboard"})
 
+        # 城市大屏公开只读快照(免认证,仅含展示字段,与城市落地页联动)
+        if path == "/api/public/positions":
+            return self._json_response(self._api_public_positions())
+
         # React/Vite 构建产物，登录页也需要加载 JS/CSS，因此静态资源不做鉴权。
         if path.startswith("/assets/"):
             return self._serve_static_asset(path)
@@ -848,6 +852,60 @@ class QuantHandler(SimpleHTTPRequestHandler):
         self.send_error(404)
 
     # ==================== API ====================
+
+    def _api_public_positions(self):
+        """城市大屏公开只读端点：实时聚合持仓快照(仅展示字段,免认证)。"""
+        state = load_state()
+        cash = state.get("cash", INITIAL_CAPITAL)
+        positions = state.get("positions", {})
+        codes = list(positions.keys())
+        quotes: dict[str, dict[str, Any]] = {}
+        try:
+            if codes:
+                loader = AKDataLoader()
+                raw_codes = [normalize_code(c) for c in codes]
+                quotes = loader.get_realtime_quotes(raw_codes)
+        except Exception as exc:
+            logger.warning("大屏实时行情加载失败，回退账本最后价格: %s", exc)
+
+        position_list = []
+        market_value = 0.0
+        for code, pos in positions.items():
+            quote_price = quotes.get(normalize_code(code), {}).get("price")
+            current = _positive_price(quote_price) or _positive_price(
+                pos.get("current_price", pos.get("avg_cost", pos.get("cost", 0)))
+            )
+            shares = pos.get("shares", 0)
+            avg_cost = pos.get("avg_cost", pos.get("cost", 0))
+            name = (
+                quotes.get(normalize_code(code), {}).get("name")
+                or pos.get("name")
+                or code
+            )
+            value = shares * current
+            market_value += value
+            position_list.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "shares": shares,
+                    "avgCost": round(avg_cost, 3),
+                    "price": round(current, 3),
+                    "marketValue": round(value),
+                    "pnlPct": round((current / avg_cost - 1) * 100, 2)
+                    if avg_cost > 0
+                    else 0,
+                }
+            )
+        position_list.sort(key=lambda item: item["marketValue"], reverse=True)
+        payload = {
+            "updatedAt": time.strftime("%m-%d %H:%M"),
+            "positions": position_list,
+            "marketValue": round(market_value),
+            "cash": round(cash),
+            "totalValue": round(market_value + cash),
+        }
+        return self._json_response(payload)
 
     def _api_portfolio(self):
         state = load_state()
