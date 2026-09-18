@@ -422,6 +422,8 @@ def _history_ext_rows_to_dataframe(rows: list[list[str]]) -> pd.DataFrame | None
 _KLINE_SOURCE_TIMEOUT_SECONDS = 3
 # 同一数据源连续失败时的退避上限秒数。
 _KLINE_SOURCE_BACKOFF_MAX_SECONDS = 60
+# 新浪456反爬封锁通常持续10-30分钟, 60秒重试只会持续撞墙(曾致24h 1205条456日志刷屏)
+_KLINE_SOURCE_BACKOFF_MAX_SECONDS_456 = 1800
 # 日K数据源固定故障转移顺序。
 _DAILY_KLINE_SOURCE_ORDER: tuple[str, ...] = ("sina", "tencent", "eastmoney")
 
@@ -565,9 +567,15 @@ class _KlineSourceCircuit:
         with self._lock:
             failures = self._consecutive_failures.get(source, 0) + 1
             self._consecutive_failures[source] = failures
-            self._blocked_until[source] = now + min(
-                _KLINE_SOURCE_BACKOFF_MAX_SECONDS, 2**failures
-            )
+            if "456" in reason:
+                # 反爬封锁: 起步10分钟, 指数增长封顶30分钟
+                backoff = min(
+                    _KLINE_SOURCE_BACKOFF_MAX_SECONDS_456,
+                    max(600, 2**failures * 15),
+                )
+            else:
+                backoff = min(_KLINE_SOURCE_BACKOFF_MAX_SECONDS, 2**failures)
+            self._blocked_until[source] = now + backoff
             self._last_reason[source] = reason
 
     def record_success(self, source: str) -> None:

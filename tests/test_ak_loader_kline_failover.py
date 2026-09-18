@@ -180,18 +180,39 @@ def test_kline_source_backoff_doubles_and_caps_at_sixty_seconds(
     now = 1_000.0
     monkeypatch.setattr(ak_loader.time, "monotonic", lambda: now)
 
-    circuit.record_failure("sina", "456 Client Error", now)
+    circuit.record_failure("sina", "Connection reset by peer", now)
     assert circuit.blocked_remaining("sina", now) == 2
-    circuit.record_failure("sina", "456 Client Error", now)
+    circuit.record_failure("sina", "Connection reset by peer", now)
     assert circuit.blocked_remaining("sina", now) == 4
-    circuit.record_failure("sina", "456 Client Error", now)
+    circuit.record_failure("sina", "Connection reset by peer", now)
     assert circuit.blocked_remaining("sina", now) == 8
 
     for _ in range(7):
-        circuit.record_failure("sina", "456 Client Error", now)
+        circuit.record_failure("sina", "Connection reset by peer", now)
     assert circuit.blocked_remaining("sina", now) == 60
 
     # 成功后清零退避。
+    circuit.record_success("sina")
+    assert circuit.blocked_remaining("sina", now) == 0
+
+
+def test_kline_456_backoff_min_ten_minutes_caps_thirty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """456反爬类失败应至少冷却10分钟, 封顶30分钟(避免持续撞墙刷日志)。"""
+    circuit = ak_loader._KlineSourceCircuit()
+    now = 2_000.0
+    monkeypatch.setattr(ak_loader.time, "monotonic", lambda: now)
+
+    circuit.record_failure("sina", "456 Client Error", now)
+    assert circuit.blocked_remaining("sina", now) == 600
+    circuit.record_failure("sina", "456 Client Error", now)
+    assert circuit.blocked_remaining("sina", now) == 600
+
+    for _ in range(10):
+        circuit.record_failure("sina", "456 Client Error", now)
+    assert circuit.blocked_remaining("sina", now) == 1800
+
     circuit.record_success("sina")
     assert circuit.blocked_remaining("sina", now) == 0
 
