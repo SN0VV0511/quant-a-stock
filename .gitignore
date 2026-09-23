@@ -47,3 +47,5 @@ reports/monthly_review_*.md
 web/frontend/node_modules/
 web/dist/
 *.tsbuildinfo
+paper_v2.db
+data/name_cache.json
