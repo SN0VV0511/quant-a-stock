@@ -571,3 +571,7 @@ ls data logs reports
 ## 风险声明
 
 本项目仅供学习、研究和工程验证使用，不构成投资建议。任何策略表现都不代表未来收益。真实交易前必须进行充分测试、人工复核和风险评估。
+
+## Licensing
+
+The original code in this repository that the maintainer is entitled to license is provided under the MIT License; see [LICENSE](LICENSE). Third-party components retain their own licenses and notices. Market data, data-provider access, and API usage remain subject to the respective providers' terms. This license does not grant rights to third-party market data or override provider restrictions.
